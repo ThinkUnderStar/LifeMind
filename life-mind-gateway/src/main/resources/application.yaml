@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: life-mind-gateway
+
+  cloud:
+    nacos:
+      server-addr: 127.0.0.1:18848
+      discovery:
+        group: GATEWAY_GROUP
+        ephemeral: false
+
+  config:
+    import:
+      - nacos:gateway.yaml?group=GATEWAY_CONFIG
+
+
+
