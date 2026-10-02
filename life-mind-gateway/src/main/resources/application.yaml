@@ -12,6 +12,10 @@ spring:
   config:
     import:
       - nacos:gateway.yaml?group=GATEWAY_CONFIG
+      - nacos:jwt_key.yaml?group=JWT_GROUP
+      - nacos:redis.yaml?group=REDIS_CONFIG
+
+
 
 
 
