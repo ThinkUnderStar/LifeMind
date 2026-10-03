@@ -1,12 +1,12 @@
 spring:
   application:
-    name: life-mind-gateway
+    name: life-mind-account
 
   cloud:
     nacos:
       server-addr: 127.0.0.1:18848
       discovery:
-        group: GATEWAY_GROUP
+        group: ACCOUNT_GROUP
         ephemeral: false
 
       config:
@@ -14,11 +14,7 @@ spring:
 
   config:
     import:
-      - nacos:gateway.yaml?group=GATEWAY_CONFIG
-      - nacos:jwt_key.yaml?group=JWT_GROUP
       - nacos:redis.yaml?group=REDIS_CONFIG
-
-
-
+      - nacos:account.yaml?group=ACCOUNT_CONFIG
 
 

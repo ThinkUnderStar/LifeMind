@@ -16,6 +16,12 @@ import thinkunderstar.lifemind.lifemindgateway.filter.JWTAuthFilter;
 public class SpringSecurityConfig {
     @Bean
     public SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http, JWTAuthFilter jWTAuthFilter) throws Exception {
+        http.authorizeExchange(exchange -> {
+            exchange
+                    .pathMatchers("/auth/login").permitAll()
+                    .pathMatchers("/**").authenticated();
+        });
+
         /**
          * 关闭框架自带的登录表单
          */
