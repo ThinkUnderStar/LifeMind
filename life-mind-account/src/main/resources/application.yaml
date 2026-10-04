@@ -6,7 +6,7 @@ spring:
     nacos:
       server-addr: 127.0.0.1:18848
       discovery:
-        group: ACCOUNT_GROUP
+        group: LIFE_MIND_GROUP
         ephemeral: false
 
       config:
@@ -14,7 +14,7 @@ spring:
 
   config:
     import:
-      - nacos:redis.yaml?group=REDIS_CONFIG
-      - nacos:account.yaml?group=ACCOUNT_CONFIG
+      - nacos:redis.yaml?group=LIFE_MIND_CONFIG
+      - nacos:account.yaml?group=LIFE_MIND_CONFIG
 
 
