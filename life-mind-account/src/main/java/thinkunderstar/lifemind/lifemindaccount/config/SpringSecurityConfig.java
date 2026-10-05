@@ -5,12 +5,29 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import thinkunderstar.lifemind.lifemindaccount.filter.HeaderAuthenticationFilter;
 
 @Configuration
 @EnableWebSecurity
 public class SpringSecurityConfig {
     @Bean
-    public SecurityFilterChain springSecurityFilterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain springSecurityFilterChain(HttpSecurity http, HeaderAuthenticationFilter headerAuthenticationFilter) throws Exception {
+        //添加下游服务的身份恢复过滤器
+        http.addFilterBefore(headerAuthenticationFilter,UsernamePasswordAuthenticationFilter.class);
 
+        //关闭自带的退出登录接口
+        http.logout(logout -> logout.disable());
+
+        //关闭自带的表单登录
+        http.formLogin(form -> form.disable());
+
+        //所有请求过Security的过滤链
+        http.authorizeRequests(authorizeRequests -> authorizeRequests.anyRequest().authenticated());
+
+        //关闭session认证模式
+        http.sessionManagement(sessionManagement ->sessionManagement.disable());
+
+        return http.build();
     }
 }
