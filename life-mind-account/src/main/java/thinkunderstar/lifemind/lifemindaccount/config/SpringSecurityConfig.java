@@ -12,7 +12,7 @@ import thinkunderstar.lifemind.lifemindaccount.filter.HeaderAuthenticationFilter
 @EnableWebSecurity
 public class SpringSecurityConfig {
     @Bean
-    public SecurityFilterChain springSecurityFilterChain(HttpSecurity http, HeaderAuthenticationFilter headerAuthenticationFilter) throws Exception {
+    public SecurityFilterChain securityFilterChain(HttpSecurity http, HeaderAuthenticationFilter headerAuthenticationFilter) throws Exception {
         //添加下游服务的身份恢复过滤器
         http.addFilterBefore(headerAuthenticationFilter,UsernamePasswordAuthenticationFilter.class);
 
@@ -23,7 +23,11 @@ public class SpringSecurityConfig {
         http.formLogin(form -> form.disable());
 
         //所有请求过Security的过滤链
-        http.authorizeRequests(authorizeRequests -> authorizeRequests.anyRequest().authenticated());
+        http.authorizeHttpRequests(
+                auth -> auth
+                        .requestMatchers("/auth/login").permitAll()
+                        .anyRequest().authenticated()
+        );
 
         //关闭session认证模式
         http.sessionManagement(sessionManagement ->sessionManagement.disable());

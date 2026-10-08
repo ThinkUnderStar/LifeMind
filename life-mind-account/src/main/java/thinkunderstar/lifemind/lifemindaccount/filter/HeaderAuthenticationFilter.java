@@ -43,11 +43,36 @@ public class HeaderAuthenticationFilter extends OncePerRequestFilter {
             HttpServletResponse response,
             FilterChain filterChain
     ) throws ServletException, IOException {
+        //放行登录接口
+        if (request.getRequestURI().equals("/life-mind/account/auth/login")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
         //获取请求头中上游服务传下来的信息
-        long userId = Long.parseLong(request.getHeader("LifeMind-User-Id"));
+        String userIdHeader = request.getHeader("LifeMind-User-Id");
+        if (userIdHeader == null) {
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED,"无必要请求头");
+            return;
+        }
+        Long userId = null;
+        try {
+            userId = Long.parseLong(userIdHeader);
+        } catch (NumberFormatException e) {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST,"请求意外参数");
+            return;
+        }
         String roles = request.getHeader("LifeMind-User-Roles");
+        if (roles == null) {
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED,"无必要请求头");
+            return;
+        }
         List<String> roleList =  Arrays.asList(roles.split(","));
         String scopes = request.getHeader("LifeMind-User-Scopes");
+        if (scopes == null) {
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED,"无必要请求头");
+            return;
+        }
         List<String> scopeList =  Arrays.asList(scopes.split(","));
 
         //构建UserDetails

@@ -16,5 +16,7 @@ spring:
     import:
       - nacos:redis.yaml?group=LIFE_MIND_CONFIG
       - nacos:account.yaml?group=LIFE_MIND_CONFIG
+      - nacos:jwt_key.yaml?group=LIFE_MIND_CONFIG
+
 
 
