@@ -34,13 +34,6 @@
 
     <dependencyManagement>
         <dependencies>
-            <!--   引入Java的JWT工具依赖     -->
-            <dependency>
-                <groupId>com.auth0</groupId>
-                <artifactId>java-jwt</artifactId>
-                <version>4.5.2</version>
-            </dependency>
-
             <!-- Spring Cloud BOM -->
             <dependency>
                 <groupId>org.springframework.cloud</groupId>
@@ -61,6 +54,26 @@
     </dependencyManagement>
 
     <dependencies>
+        <!--    引入redis依赖    -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!--   引入Java的JWT工具依赖     -->
+        <dependency>
+            <groupId>com.auth0</groupId>
+            <artifactId>java-jwt</artifactId>
+            <version>4.5.2</version>
+        </dependency>
+
+        <!--   jBCrypt 密码加密（BCrypt 算法）   -->
+        <dependency>
+            <groupId>org.mindrot</groupId>
+            <artifactId>jbcrypt</artifactId>
+            <version>0.4</version>
+        </dependency>
+
         <!-- Spring Security 核心 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
