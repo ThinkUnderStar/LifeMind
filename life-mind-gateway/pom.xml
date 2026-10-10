@@ -44,6 +44,12 @@
     </dependencyManagement>
 
     <dependencies>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
         <!--  添加redis的依赖    -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

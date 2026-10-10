@@ -43,8 +43,12 @@ public class HeaderAuthenticationFilter extends OncePerRequestFilter {
             HttpServletResponse response,
             FilterChain filterChain
     ) throws ServletException, IOException {
-        //放行登录接口
-        if (request.getRequestURI().equals("/life-mind/account/auth/login")) {
+        //放行登录接口与图形验证码接口（这些接口在下游本来就不需要用户身份）
+        if (
+                request.getRequestURI().equals("/life-mind/account/auth/login/password") ||
+                        request.getRequestURI().equals("/life-mind/account/auth/internal/permissions") ||
+                        request.getRequestURI().equals("/life-mind/account/captcha/get")
+        ) {
             filterChain.doFilter(request, response);
             return;
         }

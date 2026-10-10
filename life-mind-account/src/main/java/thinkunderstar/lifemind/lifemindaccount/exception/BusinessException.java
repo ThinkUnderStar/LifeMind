@@ -1,6 +1,8 @@
-package thinkunderstar.lifemind.lifemindaccount.common;
+package thinkunderstar.lifemind.lifemindaccount.exception;
 
 import lombok.Getter;
+import thinkunderstar.lifemind.lifemindaccount.common.Result;
+import thinkunderstar.lifemind.lifemindaccount.common.ResultCode;
 
 import java.io.Serial;
 

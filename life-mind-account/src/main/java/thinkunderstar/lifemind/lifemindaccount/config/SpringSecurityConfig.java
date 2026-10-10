@@ -37,7 +37,8 @@ public class SpringSecurityConfig {
         //所有请求过Security的过滤链
         http.authorizeHttpRequests(
                 auth -> auth
-                        .requestMatchers("/auth/login").permitAll()
+                        .requestMatchers("/auth/login/password").permitAll()
+                        .requestMatchers("/auth/internal/permissions").permitAll()
                         .anyRequest().authenticated()
         );
 

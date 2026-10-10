@@ -54,6 +54,12 @@
     </dependencyManagement>
 
     <dependencies>
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.8.25</version>
+        </dependency>
+
         <!--    引入redis依赖    -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -167,6 +173,10 @@
                         </configuration>
                     </execution>
                 </executions>
+                <configuration>
+                    <source>14</source>
+                    <target>14</target>
+                </configuration>
             </plugin>
         </plugins>
     </build>

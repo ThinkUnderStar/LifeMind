@@ -7,7 +7,7 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import thinkunderstar.lifemind.lifemindaccount.common.BusinessException;
+import thinkunderstar.lifemind.lifemindaccount.exception.BusinessException;
 import thinkunderstar.lifemind.lifemindaccount.common.Result;
 import thinkunderstar.lifemind.lifemindaccount.common.ResultCode;
 
