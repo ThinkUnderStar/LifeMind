@@ -26,7 +26,14 @@ public class SpringSecurityConfig {
             exchange
                     //CORS 预检请求不携带 Token，必须放行
                     .pathMatchers(HttpMethod.OPTIONS).permitAll()
-                    .pathMatchers("/life-mind/account/auth/login").permitAll()
+                    //注册接口：注册前没有 Token，必须放行
+                    .pathMatchers("/life-mind/account/auth/register").permitAll()
+                    //登录接口（密码 / 手机验证码 / 邮箱验证码）：登录前没有 Token，必须放行
+                    .pathMatchers("/life-mind/account/auth/login/**").permitAll()
+                    //验证码发送接口：同样在登录前调用
+                    .pathMatchers("/life-mind/account/auth/code/send/**").permitAll()
+                    //查询权限属于内部接口不接受调用
+                    .pathMatchers("/life-mind/account/auth/internal/permissions").denyAll()
                     .pathMatchers("/**").authenticated();
         });
 

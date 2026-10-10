@@ -37,7 +37,18 @@ public class SpringSecurityConfig {
         //所有请求过Security的过滤链
         http.authorizeHttpRequests(
                 auth -> auth
+                        //注册接口：注册前没有身份，必须放行
+                        .requestMatchers("/auth/register").permitAll()
+                        //登录接口：登录前没有身份，必须放行
                         .requestMatchers("/auth/login/password").permitAll()
+                        .requestMatchers("/auth/login/phone").permitAll()
+                        .requestMatchers("/auth/login/email").permitAll()
+                        //验证码发送接口：同样在登录前调用
+                        .requestMatchers("/auth/code/send/phone").permitAll()
+                        .requestMatchers("/auth/code/send/email").permitAll()
+                        //图形验证码：登录前就要拿到图片，不然上面的登录接口没法用
+                        .requestMatchers("/captcha/get").permitAll()
+                        //内部接口，由网关回查权限时调用
                         .requestMatchers("/auth/internal/permissions").permitAll()
                         .anyRequest().authenticated()
         );

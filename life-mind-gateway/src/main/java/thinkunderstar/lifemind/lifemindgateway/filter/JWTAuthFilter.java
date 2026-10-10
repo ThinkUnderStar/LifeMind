@@ -82,6 +82,32 @@ public class JWTAuthFilter implements WebFilter {
      */
     private static final String SCOPES_QUERY_PATH = "/auth/internal/permissions";
 
+    /**
+     * 登录接口的路径前缀，覆盖密码登录与手机 / 邮箱验证码登录。
+     * 这些接口在登录前调用，没有 Token，必须跳过 JWT 校验。
+     */
+    private static final String LOGIN_PATH_PREFIX = "/life-mind/account/auth/login";
+
+    /**
+     * 注册接口的完整路径，同样在拿到 Token 之前调用。
+     */
+    private static final String REGISTER_PATH = "/life-mind/account/auth/register";
+
+    /**
+     * 验证码发送接口的路径前缀，同样在登录前调用，不需要 Token。
+     */
+    private static final String SEND_CODE_PATH_PREFIX = "/life-mind/account/auth/code/send";
+
+    /**
+     * account 服务的查询权限接口（内部接口），跳过 JWT 校验。
+     *
+     * <p>这个路径不需要在过滤器里校验 Token：它是网关自己在 Redis 权限缓存未命中时
+     * 回源调用的，调用方是 {@link #fetchScopesFromAccount(String)}（直接走 lb:// 到服务实例，
+     * 本来就不经过这条过滤器链），而外部请求由网关 Security 里的 denyAll 挡掉，
+     * 放行到授权层依然会被拒绝（fail-closed）。
+     */
+    private static final String INTERNAL_PERMISSIONS_PATH = "/life-mind/account/auth/internal/permissions";
+
     private final ReactiveRedisTemplate<Object, Object> reactiveRedisTemplate;
     private final WebClient webClient;
     @Value("${jwt.key}")
@@ -94,7 +120,11 @@ public class JWTAuthFilter implements WebFilter {
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain filterChain) {
-        if (exchange.getRequest().getURI().getPath().startsWith("/life-mind/account/auth/login")) {
+        String path = exchange.getRequest().getURI().getPath();
+        if (path.equals(REGISTER_PATH)
+                || path.equals(INTERNAL_PERMISSIONS_PATH)
+                || path.startsWith(LOGIN_PATH_PREFIX)
+                || path.startsWith(SEND_CODE_PATH_PREFIX)) {
             return filterChain.filter(exchange);
         }
 

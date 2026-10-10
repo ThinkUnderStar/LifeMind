@@ -10,6 +10,8 @@ public class ValidateUtils {
     private static final String EMAIL_REGEX = "^[a-zA-Z0-9_.-]+@[a-zA-Z0-9-]+(\\.[a-zA-Z0-9]+)*\\.[a-zA-Z0-9]{2,6}$";
     private static final String AGENT_NAME_REGEX = "^[\\u4e00-\\u9fa5a-zA-Z0-9_\\-\\s]{1,20}$";
     private static final String UUID_REGEX = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+    private static final String CODE_REGEX = "^\\d{6}$";
+    private static final String NICKNAME_REGEX = "^[\\u4e00-\\u9fa5a-zA-Z0-9_\\-]{1,16}$";
 
     /**
      * Agent 名称规范验证
@@ -75,5 +77,28 @@ public class ValidateUtils {
      */
     public static boolean uuidValidate(String uuid){
         return uuid != null && uuid.matches(UUID_REGEX);
+    }
+
+    /**
+     * 短信 / 邮件验证码格式验证
+     * 固定 6 位数字，与 CodeUtils.getSixDigitCode() 生成的结果一致
+     * @param code 用户输入的验证码
+     * @return 验证结果
+     */
+    public static boolean codeValidate(String code){
+        return code != null && code.matches(CODE_REGEX);
+    }
+
+    /**
+     * 昵称规范验证
+     * 长度：1 ~ 16 位
+     * 允许：中文、字母、数字、下划线、连字符
+     * 不能为空，不能有空格与特殊符号
+     * 天然防 HTML / XSS 注入（禁止 < > ' " & ; \ 等危险字符）
+     * @param nickname 用户输入的昵称
+     * @return 验证结果
+     */
+    public static boolean nicknameValidate(String nickname){
+        return nickname != null && nickname.matches(NICKNAME_REGEX);
     }
 }
