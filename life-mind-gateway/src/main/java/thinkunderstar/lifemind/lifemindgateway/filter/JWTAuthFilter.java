@@ -80,7 +80,7 @@ public class JWTAuthFilter implements WebFilter {
     /**
      * account 服务权限接口的路径部分（注意不含 scheme 和 host）。
      */
-    private static final String SCOPES_QUERY_PATH = "/auth/internal/permissions";
+    private static final String SCOPES_QUERY_PATH = "/user/internal/permissions";
 
     /**
      * 登录接口的路径前缀，覆盖密码登录与手机 / 邮箱验证码登录。
@@ -106,7 +106,12 @@ public class JWTAuthFilter implements WebFilter {
      * 本来就不经过这条过滤器链），而外部请求由网关 Security 里的 denyAll 挡掉，
      * 放行到授权层依然会被拒绝（fail-closed）。
      */
-    private static final String INTERNAL_PERMISSIONS_PATH = "/life-mind/account/auth/internal/permissions";
+    private static final String INTERNAL_PERMISSIONS_PATH = "/life-mind/account/user/internal/permissions";
+
+    /**
+     * 获取人机验证图
+     */
+    private static final String CAPTCHA_PATH_PREFIX = "/life-mind/account/captcha";
 
     private final ReactiveRedisTemplate<Object, Object> reactiveRedisTemplate;
     private final WebClient webClient;
@@ -124,7 +129,9 @@ public class JWTAuthFilter implements WebFilter {
         if (path.equals(REGISTER_PATH)
                 || path.equals(INTERNAL_PERMISSIONS_PATH)
                 || path.startsWith(LOGIN_PATH_PREFIX)
-                || path.startsWith(SEND_CODE_PATH_PREFIX)) {
+                || path.startsWith(SEND_CODE_PATH_PREFIX)
+                || path.startsWith(CAPTCHA_PATH_PREFIX)
+        ) {
             return filterChain.filter(exchange);
         }
 

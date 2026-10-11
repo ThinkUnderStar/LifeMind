@@ -7,12 +7,10 @@ import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import thinkunderstar.lifemind.lifemindaccount.entity.Permission;
 import thinkunderstar.lifemind.lifemindaccount.exception.BusinessException;
 import thinkunderstar.lifemind.lifemindaccount.common.Result;
 import thinkunderstar.lifemind.lifemindaccount.common.ResultCode;
@@ -26,8 +24,8 @@ import thinkunderstar.lifemind.lifemindaccount.dto.response.LoginResponse;
 import thinkunderstar.lifemind.lifemindaccount.entity.Identity;
 import thinkunderstar.lifemind.lifemindaccount.entity.User;
 import thinkunderstar.lifemind.lifemindaccount.entity.UserIdentity;
-import thinkunderstar.lifemind.lifemindaccount.mapper.IdentityPermissionMapper;
 import thinkunderstar.lifemind.lifemindaccount.service.core.AuthService;
+import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.IdentityService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.UserIdentityService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.UserService;
@@ -39,7 +37,6 @@ import thinkunderstar.lifemind.lifemindaccount.util.RedisTokenBucketLimiter;
 import thinkunderstar.lifemind.lifemindaccount.util.SmsUtils;
 import thinkunderstar.lifemind.lifemindaccount.util.ValidateUtils;
 
-import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -74,6 +71,14 @@ public class AuthServiceImpl implements AuthService {
      * 只用于拦住超长输入，避免把无意义的长字符串送进 Redis 查询。
      */
     private static final int MAX_CAPTCHA_LENGTH = 16;
+
+    /**
+     * 人机验证临时 key 长度上限。
+     * 前端用 crypto.randomUUID() 生成，是标准 8-4-4-4-12 的带连字符 UUID，
+     * 固定 36 位（ValidateUtils.UUID_REGEX 也只认这种带连字符的写法）。
+     * 这里同样只用于拦截超长输入，避免把无意义的长字符串当 Redis key 去查。
+     */
+    private static final int MAX_TEMP_KEY_LENGTH = 36;
 
     /**
      * 注册限流：单 IP 桶容量 10、每秒补 1 个（允许连打 10 次，之后平均 1 次/秒）；
@@ -137,20 +142,6 @@ public class AuthServiceImpl implements AuthService {
     private static final String DEFAULT_IDENTITY_CODE = "ROLE_USER";
 
     /**
-     * 用户权限在 Redis 中的 key 前缀，完整 key 为 {@code life-mind:{userId}:scopes}。
-     * 登录时写入、网关读取、本服务回查后回填，三处必须保持一致。
-     */
-    private static final String USER_SCOPES_KEY_PREFIX = "life-mind:";
-
-    /**
-     * 权限缓存有效期，与登录时写入的保持一致。
-     */
-    private static final Duration USER_SCOPES_TTL = Duration.ofDays(7);
-
-    private final IdentityPermissionMapper identityPermissionMapper;
-    private final RedisTemplate<Object, Object> redisTemplate;
-
-    /**
      * 短信 / 邮件验证码使用字符串序列化写入，必须与 {@link CaptchaVerifier} 读取时保持一致，
      * 否则会出现「写进去了但读不到」的情况。
      */
@@ -166,16 +157,21 @@ public class AuthServiceImpl implements AuthService {
     private final PasswordEncoder passwordEncoder;
     private final CaptchaVerifier captchaVerifier;
 
-    public AuthServiceImpl(RedisTokenBucketLimiter rateLimiter, UserService userService, UserIdentityService userIdentityService, IdentityService identityService, PasswordEncoder passwordEncoder, IdentityPermissionMapper identityPermissionMapper, RedisTemplate<Object, Object> redisTemplate, StringRedisTemplate stringRedisTemplate, CaptchaVerifier captchaVerifier) {
+    /**
+     * 用户权限的查询与缓存统一由它负责：登录时写缓存、网关回查时读缓存/回查数据库，
+     * 两条路径共用同一份 Redis key 与过期时间，避免 key 拼接在多处各存一份。
+     */
+    private final UserInfoService userInfoService;
+
+    public AuthServiceImpl(RedisTokenBucketLimiter rateLimiter, UserService userService, UserIdentityService userIdentityService, IdentityService identityService, PasswordEncoder passwordEncoder, StringRedisTemplate stringRedisTemplate, CaptchaVerifier captchaVerifier, UserInfoService userInfoService) {
         this.rateLimiter = rateLimiter;
         this.userService = userService;
         this.userIdentityService = userIdentityService;
         this.identityService = identityService;
         this.passwordEncoder = passwordEncoder;
-        this.identityPermissionMapper = identityPermissionMapper;
-        this.redisTemplate = redisTemplate;
         this.stringRedisTemplate = stringRedisTemplate;
         this.captchaVerifier = captchaVerifier;
+        this.userInfoService = userInfoService;
     }
 
     /**
@@ -193,6 +189,7 @@ public class AuthServiceImpl implements AuthService {
 
         String username = registerRequest.getUsername();
         String password = registerRequest.getPassword();
+        String confirmPassword = registerRequest.getConfirmPassword();
         String nickname = registerRequest.getNickname();
 
         if (username == null || username.isBlank()) {
@@ -200,6 +197,9 @@ public class AuthServiceImpl implements AuthService {
         }
         if (password == null || password.isEmpty()) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "密码不能为空");
+        }
+        if (confirmPassword == null || confirmPassword.isEmpty()) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "确认密码不能为空");
         }
         if (nickname == null || nickname.isBlank()) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "昵称不能为空");
@@ -216,6 +216,10 @@ public class AuthServiceImpl implements AuthService {
         }
         if (!ValidateUtils.passwordValidate(password)) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "密码格式不正确");
+        }
+        // 二次确认密码：必须与密码完全一致（放在格式校验之后，让「密码本身不合法」优先报错）
+        if (!password.equals(confirmPassword)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "两次输入的密码不一致");
         }
 
         // 昵称：同样先拦超长进正则；只放行中文、字母、数字、下划线、连字符，
@@ -348,8 +352,8 @@ public class AuthServiceImpl implements AuthService {
         if (captchaCode == null || captchaCode.isBlank()) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "验证码不能为空");
         }
-        // 长度上限：验证码本身只有几位，超长输入直接判错，不做无谓的 Redis 查询
-        if (tempKey.length() > MAX_USERNAME_LENGTH || captchaCode.length() > MAX_CAPTCHA_LENGTH) {
+        // 长度上限：tempKey 是 36 位 UUID、验证码只有几位，超长输入直接判错，不做无谓的 Redis 查询
+        if (tempKey.length() > MAX_TEMP_KEY_LENGTH || captchaCode.length() > MAX_CAPTCHA_LENGTH) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "验证码参数超出限制");
         }
 
@@ -652,8 +656,8 @@ public class AuthServiceImpl implements AuthService {
         if (captchaCode == null || captchaCode.isBlank()) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "图形验证码不能为空");
         }
-        // 长度上限：验证码本身只有几位，超长输入直接判错，不做无谓的 Redis 查询
-        if (tempKey.length() > MAX_USERNAME_LENGTH || captchaCode.length() > MAX_CAPTCHA_LENGTH) {
+        // 长度上限：tempKey 是 36 位 UUID、验证码只有几位，超长输入直接判错，不做无谓的 Redis 查询
+        if (tempKey.length() > MAX_TEMP_KEY_LENGTH || captchaCode.length() > MAX_CAPTCHA_LENGTH) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "图形验证码参数超出限制");
         }
         if (!captchaVerifier.verify(tempKey, captchaCode)) {
@@ -698,16 +702,10 @@ public class AuthServiceImpl implements AuthService {
                 .map(Identity::getCode)
                 .collect(Collectors.joining(","));
 
-        //获取权限信息并存入redis中
-        String scopes = identityPermissionMapper.selectPermissionsByIdentityIds(identityIds)
-                .stream()
-                .map(Permission::getCode)
-                .collect(Collectors.joining(","));
-        redisTemplate.opsForValue().set(
-                scopesKey(user.getId()),
-                scopes,
-                USER_SCOPES_TTL
-        );
+        //获取权限信息并存入redis中（key 与过期时间由 UserInfoService 统一负责，
+        //与网关回查时的读取必须完全一致）
+        String scopes = userInfoService.loadScopesByIdentityIds(identityIds);
+        userInfoService.cacheScopes(user.getId(), scopes);
 
         //生成JWT
         String jwtToken = JWT.create()
@@ -735,80 +733,5 @@ public class AuthServiceImpl implements AuthService {
      */
     private String emailCodeKey(String email) {
         return EMAIL_CODE_KEY_PREFIX + email;
-    }
-
-    @Override
-    public Result<String> getPermissionsByUserId(Long userId) {
-
-        // ========== 1. 参数校验 ==========
-        if (userId == null || userId <= 0) {
-            throw new BusinessException(ResultCode.PARAM_ERROR, "用户ID不合法");
-        }
-
-        // ========== 2. 校验用户存在且未被禁用 ==========
-        // 这里不校验密码，属于网关到本服务的内网调用；但仍要校验账号状态，
-        // 避免已禁用账号通过该接口拿到权限标识。
-        User user = userService.getById(userId);
-        if (user == null) {
-            throw new BusinessException(ResultCode.NOT_FOUND, "用户不存在");
-        }
-        if (user.getStatus() == null || user.getStatus() != USER_STATUS_ENABLED) {
-            throw new BusinessException(ResultCode.FORBIDDEN, "账号已被禁用");
-        }
-
-        // ========== 3. 先读缓存 ==========
-        // 网关判定缓存未命中才会调过来，但缓存可能刚被写入，
-        // 也可能为空串（该用户确实没有权限），两种情况都直接返回。
-        Object cached = redisTemplate.opsForValue().get(scopesKey(userId));
-        if (cached != null) {
-            return Result.success(cached.toString());
-        }
-
-        // ========== 4. 缓存未命中，回查数据库 ==========
-        String scopes = loadScopesFromDb(userId);
-
-        // 回填缓存，与登录时的 key、过期时间保持一致，
-        // 避免网关每次请求都回查数据库。空串同样会被缓存。
-        redisTemplate.opsForValue().set(scopesKey(userId), scopes, USER_SCOPES_TTL);
-
-        return Result.success(scopes);
-    }
-
-    /**
-     * 从数据库加载用户的权限标识串。
-     *
-     * <p>链路：user_identity 查身份 → identity_permission 关联 permission 查权限。
-     * 权限按权限 ID 去重，防止同一权限被多个身份重复授予时返回重复项。
-     *
-     * @param userId 用户 ID
-     * @return 权限标识串，无权限时为空串
-     */
-    private String loadScopesFromDb(Long userId) {
-        //获取该用户的所有身份ID
-        List<Long> identityIds = userIdentityService.list(
-                new LambdaQueryWrapper<UserIdentity>()
-                        .eq(UserIdentity::getUserId, userId)
-        ).stream()
-                .map(UserIdentity::getIdentityId)
-                .collect(Collectors.toList());
-
-        if (identityIds.isEmpty()) {
-            return "";
-        }
-
-        //获取这些身份拥有的全部权限（SQL 用 DISTINCT 去重），再对权限标识去重兜底
-        return identityPermissionMapper.selectPermissionsByIdentityIds(identityIds)
-                .stream()
-                .map(Permission::getCode)
-                .filter(Objects::nonNull)
-                .distinct()
-                .collect(Collectors.joining(","));
-    }
-
-    /**
-     * 拼接用户权限在 Redis 中的 key，登录、网关、回查三处必须一致。
-     */
-    private String scopesKey(Long userId) {
-        return USER_SCOPES_KEY_PREFIX + userId + ":scopes";
     }
 }

@@ -49,12 +49,15 @@ public class SpringSecurityConfig {
                         //图形验证码：登录前就要拿到图片，不然上面的登录接口没法用
                         .requestMatchers("/captcha/get").permitAll()
                         //内部接口，由网关回查权限时调用
-                        .requestMatchers("/auth/internal/permissions").permitAll()
+                        .requestMatchers("/user/internal/permissions").permitAll()
                         .anyRequest().authenticated()
         );
 
         //关闭session认证模式
         http.sessionManagement(sessionManagement ->sessionManagement.disable());
+
+        //关闭CSRF防护
+        http.csrf(csrf -> csrf.disable());
 
         return http.build();
     }

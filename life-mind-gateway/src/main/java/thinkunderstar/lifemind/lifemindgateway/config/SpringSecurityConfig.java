@@ -32,8 +32,10 @@ public class SpringSecurityConfig {
                     .pathMatchers("/life-mind/account/auth/login/**").permitAll()
                     //验证码发送接口：同样在登录前调用
                     .pathMatchers("/life-mind/account/auth/code/send/**").permitAll()
+                    //获取人机验证图
+                    .pathMatchers("/life-mind/account/captcha/**").permitAll()
                     //查询权限属于内部接口不接受调用
-                    .pathMatchers("/life-mind/account/auth/internal/permissions").denyAll()
+                    .pathMatchers("/life-mind/account/user/internal/permissions").denyAll()
                     .pathMatchers("/**").authenticated();
         });
 
@@ -73,6 +75,12 @@ public class SpringSecurityConfig {
          * 关闭session
          */
         http.securityContextRepository(NoOpServerSecurityContextRepository.getInstance());
+
+        /**
+         * 关闭CSRF防护
+         */
+        http.csrf(csrf -> csrf.disable());
+
         return http.build();
     }
 

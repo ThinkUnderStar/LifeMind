@@ -23,6 +23,11 @@ public class RegisterRequest {
     private String password;
 
     /**
+     * 二次确认密码，必须与 {@link #password} 完全一致，仅用于校验，不落库
+     */
+    private String confirmPassword;
+
+    /**
      * 昵称：不允许为空，只放行中文、字母、数字、下划线、连字符，
      * 天然挡掉 &lt; &gt; ' " 等危险字符（防脚本注入）
      */

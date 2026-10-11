@@ -73,9 +73,17 @@ public class CaptchaServiceImpl implements CaptchaService {
                 TimeUnit.MINUTES
         );
 
-        // ========== 5. 图形验证码写出到响应流 ==========
+
+        // 5. 设置响应头
+        response.setContentType("image/png");
+        response.setHeader("Cache-Control", "no-store, no-cache");
+        response.setHeader("Pragma", "no-cache");
+        response.setDateHeader("Expires", 0);
+
+        // ========== 6. 图形验证码写出到响应流 ==========
         try {
             lineCaptcha.write(response.getOutputStream());
+            response.getOutputStream().flush();
         } catch (IOException e) {
             //客户端断开等情况：这里返回的是图片流，已经无法再写业务响应体，
             //只记日志并抛业务异常，交给 GlobalExceptionHandler 处理

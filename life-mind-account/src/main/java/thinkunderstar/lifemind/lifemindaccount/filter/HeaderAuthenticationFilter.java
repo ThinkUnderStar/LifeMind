@@ -49,7 +49,7 @@ public class HeaderAuthenticationFilter extends OncePerRequestFilter {
                 uri.equals("/life-mind/account/auth/register") ||
                         uri.startsWith("/life-mind/account/auth/login") ||
                         uri.startsWith("/life-mind/account/auth/code/send") ||
-                        uri.equals("/life-mind/account/auth/internal/permissions") ||
+                        uri.equals("/life-mind/account/user/internal/permissions") ||
                         uri.equals("/life-mind/account/captcha/get")
         ) {
             filterChain.doFilter(request, response);
