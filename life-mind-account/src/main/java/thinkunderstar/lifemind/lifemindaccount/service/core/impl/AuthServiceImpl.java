@@ -116,14 +116,6 @@ public class AuthServiceImpl implements AuthService {
     private static final long CODE_TTL_MINUTES = 5L;
 
     /**
-     * 短信 / 邮件验证码在 Redis 中的 key 前缀，完整 key 形如
-     * {@code sms:code:13800000000}、{@code email:code:a@b.com}。
-     * 写入与校验两处必须用同一前缀，否则验证码永远校验不过。
-     */
-    private static final String SMS_CODE_KEY_PREFIX = "sms:code:";
-    private static final String EMAIL_CODE_KEY_PREFIX = "email:code:";
-
-    /**
      * 用户状态：1-正常（0 为禁用）
      */
     private static final int USER_STATUS_ENABLED = 1;
@@ -435,8 +427,8 @@ public class AuthServiceImpl implements AuthService {
 
         // ========== 5. 校验短信验证码 ==========
         // 复用 CaptchaVerifier：同样是「一次性 + 限制试错次数」的校验语义，
-        // 这里把验证码的 Redis key 当作临时 key 传进去。
-        if (!captchaVerifier.verify(smsCodeKey(phone), code)) {
+        // 验证码的 Redis key 由 CaptchaVerifier 统一拼接，与下发时保持一致。
+        if (!captchaVerifier.verifyPhoneCode(phone, code)) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "短信验证码错误或已失效");
         }
 
@@ -508,7 +500,7 @@ public class AuthServiceImpl implements AuthService {
         verifyHumanCaptcha(emailCodeLoginRequest.getTempKey(), emailCodeLoginRequest.getCaptchaCode());
 
         // ========== 5. 校验邮件验证码 ==========
-        if (!captchaVerifier.verify(emailCodeKey(email), code)) {
+        if (!captchaVerifier.verifyEmailCode(email, code)) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "邮箱验证码错误或已失效");
         }
 
@@ -565,7 +557,7 @@ public class AuthServiceImpl implements AuthService {
         // 发送环节不做判断，避免被拿来枚举手机号。
         String code = CodeUtils.getSixDigitCode();
         stringRedisTemplate.opsForValue().set(
-                smsCodeKey(phone),
+                CaptchaVerifier.phoneCodeKey(phone),
                 code,
                 CODE_TTL_MINUTES,
                 TimeUnit.MINUTES
@@ -607,7 +599,7 @@ public class AuthServiceImpl implements AuthService {
         // ========== 3. 生成验证码并写入 Redis ==========
         String code = CodeUtils.getSixDigitCode();
         stringRedisTemplate.opsForValue().set(
-                emailCodeKey(email),
+                CaptchaVerifier.emailCodeKey(email),
                 code,
                 CODE_TTL_MINUTES,
                 TimeUnit.MINUTES
@@ -719,19 +711,5 @@ public class AuthServiceImpl implements AuthService {
 
         //封装返回对象，并返回给前端
         return new LoginResponse(jwtToken, rememberMe);
-    }
-
-    /**
-     * 短信验证码在 Redis 中的 key。
-     */
-    private String smsCodeKey(String phone) {
-        return SMS_CODE_KEY_PREFIX + phone;
-    }
-
-    /**
-     * 邮件验证码在 Redis 中的 key。
-     */
-    private String emailCodeKey(String email) {
-        return EMAIL_CODE_KEY_PREFIX + email;
     }
 }

@@ -7,10 +7,11 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 
 /**
- * 图形验证码校验器。
+ * 图形验证码 / 短信验证码 / 邮件验证码的统一校验器。
  *
- * <p>验证码由 {@code CaptchaServiceImpl} 用 {@link StringRedisTemplate} 写入，
- * key 就是前端生成的临时 key（UUID）。这里必须用同一种模板读取，
+ * <p>图形验证码由 {@code CaptchaServiceImpl} 用 {@link StringRedisTemplate} 写入，
+ * key 就是前端生成的临时 key（UUID）；短信 / 邮件验证码由 {@code AuthServiceImpl} 写入，
+ * key 由本类的前缀拼接。这里必须用同一种模板读取，
  * 否则序列化方式不一致会读不到值（前者是字符串序列化，后者是 JDK 序列化）。
  *
  * <p>校验采用「一次通过即失效」：比对成功后立刻删除 key，
@@ -19,6 +20,21 @@ import java.time.Duration;
 @Slf4j
 @Component
 public class CaptchaVerifier {
+
+    /**
+     * 短信验证码在 Redis 中的 key 前缀，完整 key 形如 {@code sms:code:13800000000}。
+     *
+     * <p>下发（{@code AuthServiceImpl}）与校验（登录、绑定手机号）必须用同一前缀，
+     * 否则会出现「码发出来了但永远校验不过」的问题，所以前缀与拼接统一收在本类，
+     * 各调用方不再各存一份。
+     */
+    public static final String SMS_CODE_KEY_PREFIX = "sms:code:";
+
+    /**
+     * 邮件验证码在 Redis 中的 key 前缀，完整 key 形如 {@code email:code:a@b.com}，
+     * 与 {@link #SMS_CODE_KEY_PREFIX} 同理，下发与校验共用。
+     */
+    public static final String EMAIL_CODE_KEY_PREFIX = "email:code:";
 
     /**
      * 同一个验证码 key 允许的校验次数。
@@ -73,6 +89,42 @@ public class CaptchaVerifier {
         stringRedisTemplate.delete(tempKey);
         stringRedisTemplate.delete(attemptKey(tempKey));
         return true;
+    }
+
+    /**
+     * 校验短信验证码，通过后该验证码立即失效。
+     *
+     * @param phone 手机号
+     * @param code  用户填写的短信验证码
+     * @return true 校验通过
+     */
+    public boolean verifyPhoneCode(String phone, String code) {
+        return verify(phoneCodeKey(phone), code);
+    }
+
+    /**
+     * 校验邮件验证码，通过后该验证码立即失效。
+     *
+     * @param email 邮箱地址
+     * @param code  用户填写的邮件验证码
+     * @return true 校验通过
+     */
+    public boolean verifyEmailCode(String email, String code) {
+        return verify(emailCodeKey(email), code);
+    }
+
+    /**
+     * 短信验证码在 Redis 中的 key，下发与校验必须用同一个方法拼接。
+     */
+    public static String phoneCodeKey(String phone) {
+        return SMS_CODE_KEY_PREFIX + phone;
+    }
+
+    /**
+     * 邮件验证码在 Redis 中的 key，下发与校验必须用同一个方法拼接。
+     */
+    public static String emailCodeKey(String email) {
+        return EMAIL_CODE_KEY_PREFIX + email;
     }
 
     /**

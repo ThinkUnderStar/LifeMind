@@ -167,7 +167,7 @@ public class JWTAuthFilter implements WebFilter {
         }
 
         //获取用户信息
-        String userId = jwt.getClaim("LifeMind-User-Id").asString();
+        String userId = jwt.getClaim("LifeMind-User-Id") + "";
 
         //Token 合法但没有 User-Id claim 时必须拦住，否则会出两个问题：
         //1. 拼接 Redis key 得到字面量 "life-mind:null:scopes"，

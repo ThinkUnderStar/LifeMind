@@ -1,0 +1,31 @@
+package thinkunderstar.lifemind.lifemindaccount.dto.request;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * 绑定 / 换绑手机号请求参数
+ *
+ * <p>绑定与换绑的入参完全一致，所以两者复用同一个 DTO：区别只在调哪个接口，
+ * 绑定要求账号还没有手机号，换绑要求账号已经有手机号。
+ *
+ * <p>不做人机校验，因此没有图形验证码的 tempKey / captchaCode 字段；
+ * 手机号归属靠短信验证码证明，验证码由 {@code /auth/code/send/phone} 下发（换绑时发到新号码）。
+ * 操作的是当前登录用户自己，用户身份取自网关注入的请求头，不需要前端传用户 ID。
+ */
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class BindPhoneRequest {
+
+    /**
+     * 要绑定的手机号
+     */
+    private String phone;
+
+    /**
+     * 短信验证码（6 位数字），由 {@code /auth/code/send/phone} 下发
+     */
+    private String code;
+}
