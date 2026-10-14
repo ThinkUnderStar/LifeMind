@@ -1,0 +1,19 @@
+spring:
+  application:
+    name: life-mind-message
+
+  cloud:
+    nacos:
+      server-addr: 127.0.0.1:18848
+      discovery:
+        group: LIFE_MIND_GROUP
+        ephemeral: false
+
+      config:
+        file-extension: yaml
+
+  config:
+    import:
+      - nacos:redis.yaml?group=LIFE_MIND_CONFIG
+      - nacos:message.yaml?group=LIFE_MIND_CONFIG
+

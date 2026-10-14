@@ -52,5 +52,7 @@ desktop.ini
 ### 本地敏感配置（密钥、密码统一放 Nacos，禁止提交） ###
 *.local.yaml
 *.local.yml
+*-local.yaml
+*-local.yml
 .env
 .env.*
