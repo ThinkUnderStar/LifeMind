@@ -44,12 +44,13 @@ public class HeaderAuthenticationFilter extends OncePerRequestFilter {
             FilterChain filterChain
     ) throws ServletException, IOException {
         //放行注册 / 登录接口、验证码发送接口与图形验证码接口（这些接口在下游本来就不需要用户身份）
+        //内部接口（/user/internal/**）也放行：调用方是网关自己，请求里没有、也不该有用户身份请求头
         String uri = request.getRequestURI();
         if (
                 uri.equals("/life-mind/account/auth/register") ||
                         uri.startsWith("/life-mind/account/auth/login") ||
                         uri.startsWith("/life-mind/account/auth/code/send") ||
-                        uri.equals("/life-mind/account/user/internal/permissions") ||
+                        uri.startsWith("/life-mind/account/user/internal/") ||
                         uri.equals("/life-mind/account/captcha/get")
         ) {
             filterChain.doFilter(request, response);

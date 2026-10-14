@@ -15,9 +15,11 @@ import thinkunderstar.lifemind.lifemindaccount.common.Result;
 import thinkunderstar.lifemind.lifemindaccount.common.ResultCode;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindEmailRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindPhoneRequest;
+import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeNicknameRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByEmailRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByOriginalRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByPhoneRequest;
+import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeUsernameRequest;
 import thinkunderstar.lifemind.lifemindaccount.entity.Permission;
 import thinkunderstar.lifemind.lifemindaccount.entity.User;
 import thinkunderstar.lifemind.lifemindaccount.entity.UserIdentity;
@@ -33,6 +35,8 @@ import thinkunderstar.lifemind.lifemindaccount.util.RedisTokenBucketLimiter;
 import thinkunderstar.lifemind.lifemindaccount.util.ValidateUtils;
 
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
@@ -48,10 +52,15 @@ public class UserInfoServiceImpl implements UserInfoService {
     private static final int USER_STATUS_ENABLED = 1;
 
     /**
-     * 用户权限在 Redis 中的 key 前缀，完整 key 为 {@code life-mind:{userId}:scopes}。
+     * 用户级缓存在 Redis 中的 key 前缀，完整 key 为 {@code life-mind:{userId}:xxx}。
      * 登录时写入、网关读取、本服务回查后回填，三处必须保持一致。
      */
-    private static final String USER_SCOPES_KEY_PREFIX = "life-mind:";
+    private static final String USER_KEY_PREFIX = "life-mind:";
+
+    /**
+     * 权限缓存的 key 后缀，完整 key 为 {@code life-mind:{userId}:scopes}。
+     */
+    private static final String USER_SCOPES_KEY_SUFFIX = ":scopes";
 
     /**
      * 权限缓存有效期，与登录时写入的保持一致。
@@ -59,11 +68,65 @@ public class UserInfoServiceImpl implements UserInfoService {
     private static final Duration USER_SCOPES_TTL = Duration.ofDays(7);
 
     /**
+     * 令牌版本号缓存的 key 后缀，完整 key 为 {@code life-mind:{userId}:token-version}。
+     * 登录时写入、改密时刷新、网关校验时读取、本服务回查后回填，四处必须保持一致。
+     */
+    private static final String USER_TOKEN_VERSION_KEY_SUFFIX = ":token-version";
+
+    /**
+     * 令牌版本号缓存有效期，与权限缓存保持一致。
+     *
+     * <p>过期不算问题：网关读不到时会回查本服务的内部接口，只是多一次内部调用，
+     * 不会把用户的登录态弄丢（令牌本身的有效期是 30 天）。
+     */
+    private static final Duration USER_TOKEN_VERSION_TTL = Duration.ofDays(7);
+
+    /**
      * 手机 / 邮箱长度硬上限，用于在进正则之前拦住超长输入，
      * 与 {@code AuthServiceImpl} 中发送验证码时的上限保持一致。
      */
     private static final int MAX_PHONE_LENGTH = 11;
     private static final int MAX_EMAIL_LENGTH = 64;
+
+    /**
+     * 昵称长度上限，与 {@code ValidateUtils} 里昵称正则的上限、
+     * 以及 {@code AuthServiceImpl} 注册时的上限保持一致。
+     */
+    private static final int MAX_NICKNAME_LENGTH = 16;
+
+    /**
+     * 修改昵称的限流：按 IP、按账号两层，额度与改密一致。
+     *
+     * <p>额度刻意不另设一套：限流键在 {@code RedisTokenBucketLimiter} 里是按用户 / 按 IP
+     * 共用的（{@code rate:user:{userId}}、{@code rate:ip:{ip}}），
+     * 同一个用户改昵称和改密码本来就在同一个桶里，用不同额度只会互相干扰。
+     *
+     * <p>没有「按目标号码」那一层：昵称不是占用型资料（不像手机号 / 邮箱有唯一约束），
+     * 不存在拿别人的值去试探的路径。
+     */
+    private static final long NICKNAME_IP_CAPACITY = 10L;
+    private static final double NICKNAME_IP_RATE = 0.2;
+    private static final long NICKNAME_USER_CAPACITY = 5L;
+    private static final double NICKNAME_USER_RATE = 0.05;
+
+    /**
+     * 账户名长度硬上限，用于在进正则之前拦住超长输入，
+     * 与 {@code AuthServiceImpl} 注册 / 登录时的上限保持一致（真正的长度规则由正则决定，是 4 ~ 16 位）。
+     */
+    private static final int MAX_USERNAME_LENGTH = 32;
+
+    /**
+     * 账户名的修改冷却：一年只能改一次，改完把时间写进 {@code user.username_change_time}。
+     */
+    private static final int USERNAME_COOLDOWN_YEARS = 1;
+
+    /**
+     * 修改账户名的限流：按 IP、按账号两层，额度与改密、改昵称一致（三者共用同一个限流桶）。
+     */
+    private static final long USERNAME_IP_CAPACITY = 10L;
+    private static final double USERNAME_IP_RATE = 0.2;
+    private static final long USERNAME_USER_CAPACITY = 5L;
+    private static final double USERNAME_USER_RATE = 0.05;
 
     /**
      * 绑定手机号 / 邮箱的限流：
@@ -159,6 +222,149 @@ public class UserInfoServiceImpl implements UserInfoService {
     }
 
     @Override
+    public Result<Void> changeNickname(ChangeNicknameRequest changeNicknameRequest, HttpServletRequest request) {
+
+        // ========== 1. 参数非空校验 ==========
+        if (changeNicknameRequest == null) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "请求参数不能为空");
+        }
+
+        String nickname = changeNicknameRequest.getNickname();
+        if (nickname == null || nickname.isBlank()) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "昵称不能为空");
+        }
+
+        // ========== 2. 格式校验 ==========
+        // 长度上限先拦一道：超长输入不进正则，与注册时的顺序一致
+        if (nickname.length() > MAX_NICKNAME_LENGTH) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "昵称长度超出限制");
+        }
+        // 与注册用同一个正则：只放行中文、字母、数字、下划线、连字符，
+        // < > ' " & ; \ 等危险字符一律不通过（防脚本注入）
+        if (!ValidateUtils.nicknameValidate(nickname)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "昵称格式不正确");
+        }
+
+        // ========== 3. 取当前登录用户 + 限流 ==========
+        // 只改网关注入的身份对应的用户，前端传什么用户 ID 都不认
+        Long userId = currentUserId();
+        checkNicknameRateLimit(userId, request);
+
+        // ========== 4. 加载账号并校验状态 ==========
+        // 顺带拿到当前昵称，下一步要比对
+        User user = loadEnabledUser(userId);
+
+        // ========== 5. 新昵称不能与当前昵称相同 ==========
+        // 与换绑手机号 / 邮箱同样的取舍：不做无意义的空写，直接告诉调用方没改
+        if (nickname.equals(user.getNickname())) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "新昵称不能与当前昵称相同");
+        }
+
+        // ========== 6. 落库 ==========
+        // 昵称没有唯一约束，不会像手机号 / 邮箱那样撞唯一索引，所以不需要处理 DuplicateKeyException；
+        // updateTime 由 MyMetaObjectHandler 自动刷新，不需要手工 set
+        boolean updated = userService.lambdaUpdate()
+                .eq(User::getId, userId)
+                .set(User::getNickname, nickname)
+                .update();
+
+        if (!updated) {
+            throw new BusinessException(ResultCode.ERROR, "修改昵称失败，请稍后重试");
+        }
+
+        // 不重新签发令牌：昵称不参与 JWT 声明，也不参与权限判定，
+        // 其他设备上的登录态不受影响（不像改密要作废旧令牌）
+        log.info("修改昵称成功, userId={}", userId);
+        return Result.success();
+    }
+
+    @Override
+    public Result<Void> changeUsername(ChangeUsernameRequest changeUsernameRequest, HttpServletRequest request) {
+
+        // ========== 1. 参数非空校验 ==========
+        if (changeUsernameRequest == null) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "请求参数不能为空");
+        }
+
+        String username = changeUsernameRequest.getUsername();
+        if (username == null || username.isBlank()) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "账户名不能为空");
+        }
+
+        // ========== 2. 格式校验 ==========
+        // 长度上限先拦一道：超长输入不进正则，与注册时的顺序一致
+        if (username.length() > MAX_USERNAME_LENGTH) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "账户名长度超出限制");
+        }
+        // 与注册用同一个正则：4 ~ 16 位、字母开头、只允许字母、数字、下划线
+        if (!ValidateUtils.usernameValidate(username)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "账户名格式不正确");
+        }
+
+        // ========== 3. 取当前登录用户 + 限流 ==========
+        // 只改网关注入的身份对应的用户，前端传什么用户 ID 都不认
+        Long userId = currentUserId();
+        checkUsernameRateLimit(userId, request);
+
+        // ========== 4. 加载账号并校验状态 ==========
+        // 顺带拿到当前账户名与上次修改时间，下面两步都要用
+        User user = loadEnabledUser(userId);
+
+        // ========== 5. 新账户名不能与当前账户名相同 ==========
+        // 忽略大小写比较：库里的唯一索引是大小写不敏感的（utf8mb4_0900_ai_ci），
+        // 「alice」改「Alice」在库看来仍是同一个名字，不该白吃掉一年一次的额度
+        if (username.equalsIgnoreCase(user.getUsername())) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "新账户名不能与当前账户名相同");
+        }
+
+        // ========== 6. 一年只能改一次 ==========
+        LocalDateTime now = LocalDateTime.now();
+        checkUsernameCooldown(user, now);
+
+        // ========== 7. 查重：不能与其他账号重名 ==========
+        // 排除自己：上面已确认新旧名字不同，排除是为了配合大小写不敏感的比较，避免把自己查出来；
+        // deleted 由 @TableLogic 自动追加条件，已注销账号不挡路
+        boolean usernameExists = userService.lambdaQuery()
+                .eq(User::getUsername, username)
+                .ne(User::getId, userId)
+                .exists();
+
+        if (usernameExists) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "账户名已被使用");
+        }
+
+        // ========== 8. 落库 ==========
+        // 冷却时间也写进 WHERE：两个并发请求会同时读到同一个旧时间、同时通过第 6 步，
+        // 带上这个条件后只有一个能更新成功（另一个影响行数为 0），
+        // 一年一次的额度不会被并发请求绕过。
+        boolean updated;
+        try {
+            updated = userService.lambdaUpdate()
+                    .eq(User::getId, userId)
+                    .and(w -> w.isNull(User::getUsernameChangeTime)
+                            .or()
+                            .le(User::getUsernameChangeTime, now.minusYears(USERNAME_COOLDOWN_YEARS)))
+                    .set(User::getUsername, username)
+                    .set(User::getUsernameChangeTime, now)
+                    .update();
+        } catch (DuplicateKeyException e) {
+            // 并发改成同一个名字时上面的查重会同时通过，靠唯一索引 uk_user_username 兜底
+            log.warn("修改账户名重复, userId={}", userId);
+            throw new BusinessException(ResultCode.PARAM_ERROR, "账户名已被使用");
+        }
+
+        if (!updated) {
+            // 走到这里只可能是：第 6 步之后冷却时间被另一个并发请求刷掉了，或者账号刚被注销
+            throw new BusinessException(ResultCode.FORBIDDEN, "账户名一年内只能修改一次，请稍后再试");
+        }
+
+        // 账户名不参与 JWT 声明，也不参与权限判定：不重新签发令牌、不作废旧令牌，
+        // 其他设备上的登录态不受影响。只是下次登录要用新账户名。
+        log.info("修改账户名成功, userId={}", userId);
+        return Result.success();
+    }
+
+    @Override
     public Result<Void> changePasswordByOriginal(ChangePasswordByOriginalRequest changePasswordByOriginalRequest,
                                                  HttpServletRequest request) {
         if (changePasswordByOriginalRequest == null) {
@@ -204,8 +410,9 @@ public class UserInfoServiceImpl implements UserInfoService {
      * 入参校验、限流、新旧密码比对、落库完全一致，所以用 {@link PasswordProof} 表达，
      * 不拆成三份实现。接口层是三个入口，各自只做参数空判后转发到这里。
      *
-     * <p>不涉及令牌：密码不参与 JWT 声明，改完也不重新签发，
-     * 已经发出去的令牌继续有效（本次不引入失效机制）。
+     * <p>改密会顺带把用户的令牌版本号 +1 并刷新缓存：JWT 里带着旧版本号，
+     * 网关比对不通过，等于把此前签发的所有令牌（含本次请求用的那一个）一次性作废，
+     * 改完必须重新登录；这是「改密码踢掉所有旧登录态」的实现方式。
      *
      * @param proof           证明方式（原密码 / 短信验证码 / 邮箱验证码）
      * @param proofValue      证明材料：原密码明文，或 6 位验证码
@@ -262,19 +469,38 @@ public class UserInfoServiceImpl implements UserInfoService {
             throw new BusinessException(ResultCode.PARAM_ERROR, "新密码不能与原密码相同");
         }
 
-        // ========== 7. 落库 ==========
+        // ========== 7. 落库：改密 + 令牌版本号 +1 ==========
+        // 版本号取第 4 步刚读出来的行 +1：一次 UPDATE 同时改掉密码和版本号，
+        // 不会出现「密码改了但版本号没动」的中间态。
+        // 并发改密时两个请求可能读到同一个旧值、都写回同一个新值：旧令牌仍会被作废，
+        // 不会漏掉哪一次，所以这里不需要额外加锁。
+        int newTokenVersion = normalizeTokenVersion(user.getTokenVersion()) + 1;
+
         // 只存密文；updateTime 由 MyMetaObjectHandler 自动刷新，不需要手工 set
         boolean updated = userService.lambdaUpdate()
                 .eq(User::getId, userId)
                 .set(User::getPassword, passwordEncoder.encode(newPassword))
+                .set(User::getTokenVersion, newTokenVersion)
                 .update();
 
         if (!updated) {
             throw new BusinessException(ResultCode.ERROR, "修改密码失败，请稍后重试");
         }
 
-        // 不重新签发令牌：密码不参与 JWT 声明，权限也不随密码变化。
-        // 注意旧令牌不会因此失效（本次不引入凭证失效机制），其他设备仍可继续使用。
+        // ========== 8. 刷新令牌版本缓存 ==========
+        // 网关校验读的就是这份缓存，不刷新的话旧令牌会拿着缓存里的旧版本号继续通过校验，
+        // 等于白改一次密码。
+        try {
+            cacheTokenVersion(userId, newTokenVersion);
+        } catch (Exception e) {
+            // 刷新失败（如 Redis 抖动）：把 key 删掉比留着旧值安全——
+            // 网关读不到会回查本服务的内部接口，回查读到的是库里的新版本号，旧令牌照样被拒。
+            log.error("刷新令牌版本缓存失败, userId={}", userId, e);
+            redisTemplate.delete(tokenVersionKey(userId));
+        }
+
+        // 本次改密用的令牌也被一并作废（版本号对不上），改完需要重新登录，
+        // 其他设备上的登录态同样失效——这正是「改密踢掉所有旧令牌」要的效果。
         log.info("修改密码成功, userId={}, 途径={}", userId, proofLabel);
         return Result.success();
     }
@@ -341,6 +567,65 @@ public class UserInfoServiceImpl implements UserInfoService {
         }
         if (!rateLimiter.tryAcquireByUser(userId, PASSWORD_USER_CAPACITY, PASSWORD_USER_RATE)) {
             throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+    }
+
+    /**
+     * 修改昵称的限流：按 IP、按账号两层。
+     *
+     * <p>没有绑定接口那层「按目标号码」：昵称不是占用型资料，不存在拿别人的值试的路径。
+     *
+     * @param userId  当前登录用户 ID
+     * @param request 当前请求，用于解析客户端真实 IP
+     */
+    private void checkNicknameRateLimit(Long userId, HttpServletRequest request) {
+        if (!rateLimiter.tryAcquireByIp(IpUtils.getClientIp(request), NICKNAME_IP_CAPACITY, NICKNAME_IP_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+        if (!rateLimiter.tryAcquireByUser(userId, NICKNAME_USER_CAPACITY, NICKNAME_USER_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+    }
+
+    /**
+     * 修改账户名的限流：按 IP、按账号两层。
+     *
+     * @param userId  当前登录用户 ID
+     * @param request 当前请求，用于解析客户端真实 IP
+     */
+    private void checkUsernameRateLimit(Long userId, HttpServletRequest request) {
+        if (!rateLimiter.tryAcquireByIp(IpUtils.getClientIp(request), USERNAME_IP_CAPACITY, USERNAME_IP_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+        if (!rateLimiter.tryAcquireByUser(userId, USERNAME_USER_CAPACITY, USERNAME_USER_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+    }
+
+    /**
+     * 检查账户名的修改冷却：一年只能改一次。
+     *
+     * <p>上次修改时间在 {@code user.username_change_time}：为空表示从未改过（注册不算一次修改），
+     * 随时可以改第一次。
+     *
+     * @param user 当前账号，取其上次修改账户名的时间
+     * @param now  本次请求的时间
+     */
+    private void checkUsernameCooldown(User user, LocalDateTime now) {
+        LocalDateTime lastChangeTime = user.getUsernameChangeTime();
+
+        // 从没改过：不受冷却限制
+        if (lastChangeTime == null) {
+            return;
+        }
+
+        LocalDateTime nextChangeTime = lastChangeTime.plusYears(USERNAME_COOLDOWN_YEARS);
+        if (now.isBefore(nextChangeTime)) {
+            // 向上取整，不足一天也按一天算，免得出现「还需等待 0 天」这种没意义的提示
+            long remainDays = (ChronoUnit.SECONDS.between(now, nextChangeTime) + 86399) / 86400;
+            throw new BusinessException(ResultCode.FORBIDDEN,
+                    "账户名 " + USERNAME_COOLDOWN_YEARS + " 年内只能修改一次，还需等待 " + remainDays
+                            + " 天，最早可于 " + nextChangeTime.toLocalDate() + " 修改");
         }
     }
 
@@ -555,6 +840,95 @@ public class UserInfoServiceImpl implements UserInfoService {
         redisTemplate.opsForValue().set(scopesKey(userId), scopes, USER_SCOPES_TTL);
     }
 
+    @Override
+    public Result<Integer> getTokenVersionByUserId(Long userId) {
+
+        // ========== 1. 参数校验 ==========
+        if (userId == null || userId <= 0) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "用户ID不合法");
+        }
+
+        // ========== 2. 校验用户存在且未被禁用 ==========
+        // 这里不校验密码，属于网关到本服务的内网调用；但仍要校验账号状态，
+        // 避免已禁用账号拿着旧令牌通过版本校验继续访问。
+        User user = userService.getById(userId);
+        if (user == null) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "用户不存在");
+        }
+        if (user.getStatus() == null || user.getStatus() != USER_STATUS_ENABLED) {
+            throw new BusinessException(ResultCode.FORBIDDEN, "账号已被禁用");
+        }
+
+        // ========== 3. 先读缓存 ==========
+        // 与权限接口一样：网关判定缓存未命中才会调过来，但缓存可能刚被写入，
+        // 命中就直接返回，不再查库。
+        Integer cached = readCachedTokenVersion(userId);
+        if (cached != null) {
+            return Result.success(cached);
+        }
+
+        // ========== 4. 缓存未命中，用刚查出来的这一行回填 ==========
+        // 回填后，网关同一个请求里接下来的读缓存就能命中，也不再需要回源
+        int tokenVersion = normalizeTokenVersion(user.getTokenVersion());
+        cacheTokenVersion(userId, tokenVersion);
+
+        return Result.success(tokenVersion);
+    }
+
+    @Override
+    public int getTokenVersion(Long userId) {
+        // ========== 1. 先读缓存 ==========
+        Integer cached = readCachedTokenVersion(userId);
+        if (cached != null) {
+            return cached;
+        }
+
+        // ========== 2. 缓存未命中，回查数据库并回填 ==========
+        // 与网关回查走同一份缓存：这里回填后，网关那次读缓存就能命中
+        User user = userService.getById(userId);
+        int tokenVersion = normalizeTokenVersion(user == null ? null : user.getTokenVersion());
+        cacheTokenVersion(userId, tokenVersion);
+
+        return tokenVersion;
+    }
+
+    @Override
+    public void cacheTokenVersion(Long userId, int tokenVersion) {
+        // 存字符串而不是数字：网关用的是另一套 ReactiveRedisTemplate，
+        // 值与权限缓存一样按字符串序列化，两边才能互相读到。
+        redisTemplate.opsForValue()
+                .set(tokenVersionKey(userId), String.valueOf(tokenVersion), USER_TOKEN_VERSION_TTL);
+    }
+
+    /**
+     * 读令牌版本缓存。
+     *
+     * @return 缓存里的版本号；返回 null 表示「没缓存」或「缓存内容不是数字」，
+     * 两种情况都由调用方按未命中处理，回查数据库重新回填。
+     */
+    private Integer readCachedTokenVersion(Long userId) {
+        Object cached = redisTemplate.opsForValue().get(tokenVersionKey(userId));
+        if (cached == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(cached.toString().trim());
+        } catch (NumberFormatException e) {
+            log.warn("令牌版本缓存内容不是数字, userId={}, value={}", userId, cached);
+            return null;
+        }
+    }
+
+    /**
+     * 令牌版本号的空值兜底。
+     *
+     * <p>库里该列非空且默认 0，正常查不出 null；这里只是防止历史数据或极端情况下
+     * 拿到 null 直接 NPE，兜底值取 0（与库默认值、新用户初始值一致）。
+     */
+    private int normalizeTokenVersion(Integer tokenVersion) {
+        return tokenVersion == null ? 0 : tokenVersion;
+    }
+
     /**
      * 取当前登录用户的 ID。
      *
@@ -661,6 +1035,13 @@ public class UserInfoServiceImpl implements UserInfoService {
      * 拼接用户权限在 Redis 中的 key，登录、网关、回查三处必须一致。
      */
     private String scopesKey(Long userId) {
-        return USER_SCOPES_KEY_PREFIX + userId + ":scopes";
+        return USER_KEY_PREFIX + userId + USER_SCOPES_KEY_SUFFIX;
+    }
+
+    /**
+     * 拼接令牌版本号在 Redis 中的 key，登录、改密、网关校验、回查四处必须一致。
+     */
+    private String tokenVersionKey(Long userId) {
+        return USER_KEY_PREFIX + userId + USER_TOKEN_VERSION_KEY_SUFFIX;
     }
 }

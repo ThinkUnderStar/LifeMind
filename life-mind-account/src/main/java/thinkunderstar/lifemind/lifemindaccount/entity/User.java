@@ -29,6 +29,14 @@ public class User {
     private String username;
 
     /**
+     * 上次修改账户名的时间，null 表示从未改过。
+     *
+     * <p>账户名一年只能改一次，改的时候把当前时间写进来，下次改之前先比对这个时间。
+     * 注册时留空（注册不算一次「修改」），所以新账号随时都能改第一次。
+     */
+    private LocalDateTime usernameChangeTime;
+
+    /**
      * 密码（BCrypt 加密后的密文）
      */
     private String password;
@@ -57,6 +65,15 @@ public class User {
      * 状态：0-禁用 1-正常
      */
     private Integer status;
+
+    /**
+     * 令牌版本号：登录时写进 JWT 负载，修改密码后 +1。
+     *
+     * <p>网关会拿 JWT 里的版本号与当前版本号比对，对不上就拒绝该令牌，
+     * 所以改密后此前签发的所有令牌都会立即失效（旧令牌里的版本号偏小）。
+     * 从 0 开始，只增不减。
+     */
+    private Integer tokenVersion;
 
     /**
      * 逻辑删除：0-未删除 1-已删除

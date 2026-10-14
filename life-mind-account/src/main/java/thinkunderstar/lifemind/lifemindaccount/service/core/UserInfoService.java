@@ -4,23 +4,29 @@ import jakarta.servlet.http.HttpServletRequest;
 import thinkunderstar.lifemind.lifemindaccount.common.Result;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindEmailRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindPhoneRequest;
+import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeNicknameRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByEmailRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByOriginalRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByPhoneRequest;
+import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeUsernameRequest;
 
 import java.util.Collection;
 
 /**
  * 用户信息维度的服务。
  *
- * <p>承载三类职责：
+ * <p>承载四类职责：
  * <ul>
  *     <li>用户权限标识的查询与缓存：登录时把权限写入 Redis 供网关读取，
  *     网关缓存未命中时再回查数据库并回填。这两条路径必须共用同一份 Redis key 与过期时间，
  *     所以统一收敛到本服务，避免 key 拼接逻辑在多处各存一份而静默失配。</li>
- *     <li>用户资料的修改：绑定 / 换绑手机号与邮箱。归属校验靠短信 / 邮件验证码，
- *     不做人机校验（图形验证码）；绑定与换绑分成各自的入口（已绑定走绑定接口会提示换绑），
- *     但四个入口共用同一段实现。</li>
+ *     <li>令牌版本号的查询与缓存：同一份缓存登录签令牌时读、网关校验令牌时读，
+ *     未命中才回查数据库并回填。改密会把版本号 +1 并刷新缓存，旧令牌随之失效。</li>
+ *     <li>用户资料的修改：绑定 / 换绑手机号与邮箱，以及修改昵称、修改账户名。手机号与邮箱的归属校验靠
+ *     短信 / 邮件验证码，不做人机校验（图形验证码）；绑定与换绑分成各自的入口
+ *     （已绑定走绑定接口会提示换绑），但四个入口共用同一段实现。昵称是纯展示资料、
+ *     账户名是登录名，两者都不需要凭证，各自一个入口；账户名还多两道：
+ *     不能与其他账号重名，且一年只能改一次（靠 {@code user.username_change_time} 记录上次改动时间）。</li>
  *     <li>密码的修改：原密码 / 手机验证码 / 邮箱验证码三条路，同样分成各自的入口，
  *     落库那一段共用同一段实现。</li>
  * </ul>
@@ -64,12 +70,45 @@ public interface UserInfoService {
      */
     Result<Void> rebindEmail(BindEmailRequest bindEmailRequest, HttpServletRequest request);
 
+    /**
+     * 修改昵称：只作用于「当前登录用户」，不接收前端传来的用户 ID。
+     *
+     * <p>昵称是纯展示用的资料，不参与 JWT 声明，也不涉及归属证明，
+     * 所以既没有验证码 / 原密码，也不做人机校验，只做格式校验与限流。
+     *
+     * <p>新昵称与当前昵称相同时报错，不当成一次成功的空操作。
+     *
+     * @param changeNicknameRequest 请求参数（新昵称）
+     * @param request               当前请求，用于解析客户端真实 IP 做限流
+     */
+    Result<Void> changeNickname(ChangeNicknameRequest changeNicknameRequest, HttpServletRequest request);
+
+    /**
+     * 修改账户名：只作用于「当前登录用户」，不接收前端传来的用户 ID。
+     *
+     * <p>三道约束：
+     * <ul>
+     *     <li>格式同注册：4 ~ 16 位、字母开头、只允许字母与数字与下划线；</li>
+     *     <li>不能与其他账号重名：先查一次，最后靠 {@code uk_user_username} 唯一索引兜底并发；</li>
+     *     <li>一年只能改一次：上次改动时间记在 {@code user.username_change_time}，
+     *     没到一年直接拒绝并给出还需等待的天数。注册时该字段为空，所以新账号随时能改第一次。</li>
+     * </ul>
+     *
+     * <p>账户名不参与 JWT 声明，所以改完不重新签发令牌、不作废任何令牌。
+     * 改完之后要用新账户名登录（登录时按账户名查账号）。
+     *
+     * @param changeUsernameRequest 请求参数（新账户名）
+     * @param request               当前请求，用于解析客户端真实 IP 做限流
+     */
+    Result<Void> changeUsername(ChangeUsernameRequest changeUsernameRequest, HttpServletRequest request);
+
     /*
      * 修改密码三个入口的共同约定：
      *   1. 都只作用于「当前登录用户」：身份取自网关注入的请求头，不接收前端传来的用户 ID，
      *      否则登录用户可以改别人的密码；
-     *   2. 只改密码，不动令牌：密码不参与 JWT 声明，签发出去的令牌也不做失效处理，
-     *      所以改密不会把其他设备上的登录态踢掉（见实现的注释）；
+     *   2. 只改密码：不重新签发令牌。但会把用户的令牌版本号 +1，而版本号是 JWT 负载的一部分，
+     *      网关校验时对不上就会拒绝，所以改密后此前签发的所有令牌（含本次这一个）立即失效，
+     *      需要重新登录——其他设备上的登录态一并被踢掉；
      *   3. 手机 / 邮箱两条路由服务端自取「账号已绑的号码」去验码，请求里只有验证码，
      *      客户端指定不了号码；未绑定会提示先走对应的绑定接口；
      *   4. 新密码统一按注册时的规则校验（长度 + 字符集），保证改完还能正常登录，
@@ -141,4 +180,40 @@ public interface UserInfoService {
      * @param scopes 权限标识串，多个用英文逗号分隔
      */
     void cacheScopes(Long userId, String scopes);
+
+    /**
+     * 根据用户 ID 查询该用户当前的令牌版本号（内部接口）。
+     *
+     * <p>内部接口，供网关在 Redis 中读不到令牌版本号时回查数据库使用。
+     * 与 {@link #getPermissionsByUserId(Long)} 一样校验账号存在且未被禁用，
+     * 用户不存在或被禁用时抛业务异常，网关对业务码非 200 一律按「无法校验令牌」拒绝。
+     *
+     * <p>返回值同样是「先读缓存、未命中回查数据库并回填」，
+     * 所以网关那边不会因为缓存过期而反复回查。
+     *
+     * @param userId 用户 ID
+     * @return 令牌版本号（0 是合法值，不要用 0 当「查不到」）
+     */
+    Result<Integer> getTokenVersionByUserId(Long userId);
+
+    /**
+     * 读取用户当前的令牌版本号：先读缓存，未命中回查数据库并回填缓存。
+     *
+     * <p>签名令牌（登录）与网关校验共用同一个值，所以这一步必须是同一份读写逻辑：
+     * 登录时把它写进 JWT 负载，网关再拿 JWT 里的值与这个值比对，对不上就拒绝该令牌。
+     *
+     * @param userId 用户 ID
+     * @return 令牌版本号；库中没有这条记录（正常不会发生）时按 0 处理
+     */
+    int getTokenVersion(Long userId);
+
+    /**
+     * 把令牌版本号写入 Redis 缓存，key 与过期时间和 {@link #getTokenVersion(Long)} 读取时一致。
+     *
+     * <p>修改密码把库里的版本号 +1 之后必须调用一次，否则网关还会按缓存里的旧版本号放行旧令牌。
+     *
+     * @param userId       用户 ID
+     * @param tokenVersion 令牌版本号
+     */
+    void cacheTokenVersion(Long userId, int tokenVersion);
 }

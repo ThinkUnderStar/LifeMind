@@ -121,6 +121,11 @@ public class AuthServiceImpl implements AuthService {
     private static final int USER_STATUS_ENABLED = 1;
 
     /**
+     * 新用户的令牌版本号，与 {@code user.token_version} 的库默认值保持一致。
+     */
+    private static final int DEFAULT_TOKEN_VERSION = 0;
+
+    /**
      * 身份状态：1-正常（0 为禁用）
      */
     private static final int IDENTITY_STATUS_ENABLED = 1;
@@ -262,6 +267,8 @@ public class AuthServiceImpl implements AuthService {
         // 状态 1-正常；deleted 显式给 0，避免库中该列没有默认值时插入失败
         user.setStatus(USER_STATUS_ENABLED);
         user.setDeleted(0);
+        // 令牌版本号从 0 开始，与库中该列的默认值一致；改密时 +1
+        user.setTokenVersion(DEFAULT_TOKEN_VERSION);
 
         try {
             userService.save(user);
@@ -674,7 +681,7 @@ public class AuthServiceImpl implements AuthService {
      * 为已通过认证的用户签发令牌。
      *
      * <p>三种登录方式（密码、手机验证码、邮箱验证码）共用这一段：
-     * 查身份与权限 → 权限写入 Redis 供网关读取 → 签 JWT。
+     * 查身份与权限 → 权限写入 Redis 供网关读取 → 取令牌版本号 → 签 JWT。
      *
      * @param user       已通过认证的用户
      * @param rememberMe 1-记住我 0-不记住我
@@ -699,10 +706,15 @@ public class AuthServiceImpl implements AuthService {
         String scopes = userInfoService.loadScopesByIdentityIds(identityIds);
         userInfoService.cacheScopes(user.getId(), scopes);
 
+        //取当前令牌版本号：同样是先读缓存、未命中才回查数据库并回填（由 UserInfoService 统一负责），
+        //网关校验时读的是同一份缓存。改密会把版本号 +1，这里签发出来的下一个令牌才会带上新值
+        int tokenVersion = userInfoService.getTokenVersion(user.getId());
+
         //生成JWT
         String jwtToken = JWT.create()
                 .withClaim("LifeMind-User-Id", user.getId())
                 .withClaim("LifeMind-User-Roles", roles)
+                .withClaim("LifeMind-Token-Version", tokenVersion)
                 .withExpiresAt(new Date(System.currentTimeMillis() + TimeUnit.DAYS.toMillis(30)))
                 .withIssuedAt(new Date(System.currentTimeMillis()))
                 .withIssuer("LifeMind")

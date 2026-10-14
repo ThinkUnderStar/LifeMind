@@ -48,8 +48,9 @@ public class SpringSecurityConfig {
                         .requestMatchers("/auth/code/send/email").permitAll()
                         //图形验证码：登录前就要拿到图片，不然上面的登录接口没法用
                         .requestMatchers("/captcha/get").permitAll()
-                        //内部接口，由网关回查权限时调用
+                        //内部接口，由网关回查权限 / 令牌版本时调用
                         .requestMatchers("/user/internal/permissions").permitAll()
+                        .requestMatchers("/user/internal/token-version").permitAll()
                         .anyRequest().authenticated()
         );
 

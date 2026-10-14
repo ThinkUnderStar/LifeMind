@@ -41,15 +41,45 @@ public class JWTAuthFilter implements WebFilter {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     /**
-     * 用户权限在 Redis 中的 key 前缀，完整 key 为 {@code life-mind:{userId}:scopes}，
+     * JWT 负载里令牌版本号的声明名，由 account 服务登录时写入。
+     * 用户每次改密这个值都会在 account 侧 +1，对不上就说明令牌已作废。
+     */
+    private static final String TOKEN_VERSION_CLAIM = "LifeMind-Token-Version";
+
+    /**
+     * 用户级缓存在 Redis 中的 key 前缀，完整 key 为 {@code life-mind:{userId}:xxx}，
      * 必须与 account 服务登录时写入的 key 完全一致。
      */
-    private static final String USER_SCOPES_KEY_PREFIX = "life-mind:";
+    private static final String USER_KEY_PREFIX = "life-mind:";
+
+    /**
+     * 权限缓存的 key 后缀，完整 key 为 {@code life-mind:{userId}:scopes}。
+     */
+    private static final String USER_SCOPES_KEY_SUFFIX = ":scopes";
 
     /**
      * 权限缓存有效期，与 account 服务写入时保持一致。
      */
     private static final Duration SCOPES_TTL = Duration.ofDays(7);
+
+    /**
+     * 令牌版本号缓存的 key 后缀，完整 key 为 {@code life-mind:{userId}:token-version}，
+     * 必须与 account 服务登录、改密时写入的 key 完全一致。
+     */
+    private static final String USER_TOKEN_VERSION_KEY_SUFFIX = ":token-version";
+
+    /**
+     * 令牌版本号缓存有效期，与 account 服务写入时保持一致。
+     */
+    private static final Duration TOKEN_VERSION_TTL = Duration.ofDays(7);
+
+    /**
+     * 令牌版本号取不到时的标记值：JWT 里的版本号一定是 >= 0 的整数，
+     * 所以用 -1 表示「没查到 / 回源失败」，与「版本号恰好是 0」区分开。
+     *
+     * <p>拿到这个值时一律拒绝请求（fail-closed）：校验不出来不能当成校验通过。
+     */
+    private static final int TOKEN_VERSION_UNAVAILABLE = -1;
 
     /**
      * 回源 account 服务的超时时间：account 服务卡住时不能把网关请求一起拖死。
@@ -83,6 +113,16 @@ public class JWTAuthFilter implements WebFilter {
     private static final String SCOPES_QUERY_PATH = "/user/internal/permissions";
 
     /**
+     * account 服务令牌版本接口的路径部分（注意不含 scheme 和 host）。
+     */
+    private static final String TOKEN_VERSION_QUERY_PATH = "/user/internal/token-version";
+
+    /**
+     * 回源 account 服务查询令牌版本号的超时时间，与权限一致。
+     */
+    private static final Duration TOKEN_VERSION_QUERY_TIMEOUT = Duration.ofSeconds(3);
+
+    /**
      * 登录接口的路径前缀，覆盖密码登录与手机 / 邮箱验证码登录。
      * 这些接口在登录前调用，没有 Token，必须跳过 JWT 校验。
      */
@@ -109,6 +149,15 @@ public class JWTAuthFilter implements WebFilter {
     private static final String INTERNAL_PERMISSIONS_PATH = "/life-mind/account/user/internal/permissions";
 
     /**
+     * account 服务的查询令牌版本接口（内部接口），跳过 JWT 校验。
+     *
+     * <p>与 {@link #INTERNAL_PERMISSIONS_PATH} 同理：网关自己在缓存未命中时回源调用它，
+     * 走的是 {@code lb://} 到服务实例，不经过这条过滤器链；
+     * 外部请求由网关 Security 里的 denyAll 挡掉。
+     */
+    private static final String INTERNAL_TOKEN_VERSION_PATH = "/life-mind/account/user/internal/token-version";
+
+    /**
      * 获取人机验证图
      */
     private static final String CAPTCHA_PATH_PREFIX = "/life-mind/account/captcha";
@@ -128,6 +177,7 @@ public class JWTAuthFilter implements WebFilter {
         String path = exchange.getRequest().getURI().getPath();
         if (path.equals(REGISTER_PATH)
                 || path.equals(INTERNAL_PERMISSIONS_PATH)
+                || path.equals(INTERNAL_TOKEN_VERSION_PATH)
                 || path.startsWith(LOGIN_PATH_PREFIX)
                 || path.startsWith(SEND_CODE_PATH_PREFIX)
                 || path.startsWith(CAPTCHA_PATH_PREFIX)
@@ -198,6 +248,94 @@ public class JWTAuthFilter implements WebFilter {
                 new UsernamePasswordAuthenticationToken(userId, null, authorities)
         );
 
+        //先校验令牌版本号，再查权限：版本对不上说明令牌已被改密作废，没必要继续往下走
+        return checkTokenVersion(exchange, jwt, userId)
+                .flatMap(passed -> Boolean.TRUE.equals(passed)
+                        //版本一致：继续原有流程（查权限后放行）
+                        ? checkScopes(exchange, filterChain, jwt, userId, securityContext)
+                        //版本不一致 / 无法校验：checkTokenVersion 里已经写过错误响应，到此结束
+                        : Mono.empty());
+    }
+
+    /**
+     * 校验 JWT 里的令牌版本号与用户当前的版本号是否一致。
+     *
+     * <p>版本号由 account 服务在登录签令牌时写进 JWT，改密后库里 +1 并刷新 Redis，
+     * 所以版本对不上就说明这个令牌是改密之前签发的，必须作废——
+     * 「改密让旧 JWT 全部失效」就是靠这一步实现的。
+     *
+     * <p>取当前版本号的顺序与 account 服务一致：先读 Redis，读不到（或缓存内容不是数字）
+     * 再回查 account 的内部接口，并把回查结果回填缓存。
+     * 读缓存失败、回源失败都按「取不到版本号」处理，一律拒绝请求（fail-closed），
+     * 不能把「校验不出来」变成「校验通过」。
+     *
+     * @return true-版本一致，可以继续；false-已拒绝，错误响应已在方法内写回，调用方直接结束链路
+     */
+    private Mono<Boolean> checkTokenVersion(ServerWebExchange exchange, DecodedJWT jwt, String userId) {
+        Integer jwtVersion = jwt.getClaim(TOKEN_VERSION_CLAIM).asInt();
+
+        //登录接口一定会写入版本号声明；缺这个声明（或声明不是数字）说明令牌
+        //不是本系统登录接口签发的，按无效令牌处理，不能当成版本 0 放行
+        if (jwtVersion == null) {
+            log.warn("Token 缺少令牌版本声明, userId={}", userId);
+            return ResponseUtils.writeError(
+                    exchange,
+                    HttpStatus.UNAUTHORIZED,
+                    "TOKEN_INVALID",
+                    "Token 缺少令牌版本信息"
+            ).thenReturn(false);
+        }
+
+        //先读缓存：版本号按字符串写入，缓存内容不是数字时按未命中处理，回源重新取一份
+        Mono<Integer> currentVersion = reactiveRedisTemplate.opsForValue().get(tokenVersionKey(userId))
+                .flatMap(cached -> Mono.justOrEmpty(parseTokenVersion(cached)))
+                .switchIfEmpty(fetchTokenVersionFromAccount(userId))
+                //回源失败：拿不到当前版本号，用哨兵值表示「无法校验」
+                .defaultIfEmpty(TOKEN_VERSION_UNAVAILABLE)
+                //Redis 连接异常等：同样按「无法校验」处理，不放行
+                .onErrorResume(e -> {
+                    log.error("查询用户令牌版本失败, userId={}", userId, e);
+                    return Mono.just(TOKEN_VERSION_UNAVAILABLE);
+                });
+
+        return currentVersion.flatMap(version -> {
+            //1. 取不到当前版本号：无法判断令牌是否还有效，拒绝
+            if (version == TOKEN_VERSION_UNAVAILABLE) {
+                log.error("无法获取用户令牌版本, userId={}", userId);
+                return ResponseUtils.writeError(
+                        exchange,
+                        HttpStatus.SERVICE_UNAVAILABLE,
+                        "TOKEN_VERSION_UNAVAILABLE",
+                        "无法校验登录状态，请稍后重试"
+                ).thenReturn(false);
+            }
+
+            //2. 版本对不上：令牌已被改密作废（或账号已注销 / 禁用），要求重新登录
+            if (!version.equals(jwtVersion)) {
+                log.info("令牌版本已失效, userId={}, tokenVersion={}, currentVersion={}",
+                        userId, jwtVersion, version);
+                return ResponseUtils.writeError(
+                        exchange,
+                        HttpStatus.UNAUTHORIZED,
+                        "TOKEN_REVOKED",
+                        "登录状态已失效，请重新登录"
+                ).thenReturn(false);
+            }
+
+            //3. 版本一致：放行
+            return Mono.just(true);
+        });
+    }
+
+    /**
+     * 查询用户权限，并把用户信息与权限交给后续过滤器。
+     *
+     * <p>权限取值顺序：先读 Redis，读不到再回查 account 服务并回填缓存。
+     *
+     * @return 放行请求；查询失败时写回错误响应后结束
+     */
+    private Mono<Void> checkScopes(ServerWebExchange exchange, WebFilterChain filterChain, DecodedJWT jwt,
+                                   String userId, SecurityContext securityContext) {
         //用户权限列表
         //这里必须返回 Mono<String>：错误分支返回的是 Mono<Void>，
         //用 <String>onErrorResume / <String>flatMap 显式指定类型，
@@ -341,6 +479,96 @@ public class JWTAuthFilter implements WebFilter {
     }
 
     /**
+     * 回源 account 服务查询用户当前的令牌版本号，并在拿到后回填缓存。
+     *
+     * <p>返回空 Mono 表示「取不到」：服务不可用、超时、响应结构不符合预期，
+     * 或 account 明确答复用户不存在 / 账号被禁用（业务码非 200）。
+     * 调用方统一按「无法校验登录状态」拒绝请求，即 fail-closed。
+     *
+     * <p>不用 0 表示取不到：0 是合法版本号（新用户的初始值），两者必须区分开。
+     *
+     * @param userId 用户 ID
+     */
+    private Mono<Integer> fetchTokenVersionFromAccount(String userId) {
+        return webClient.get()
+                .uri(uriBuilder -> uriBuilder
+                        //scheme 与 host 的写法与权限接口一致，原因见 fetchScopesFromAccount 的注释
+                        .scheme(LB_SCHEME)
+                        .host(ACCOUNT_SERVICE_ID)
+                        .path(TOKEN_VERSION_QUERY_PATH)
+                        .queryParam("userId", userId)
+                        .build())
+                .retrieve()
+                //与权限接口同样用参数化类型，让反序列化直接给出 Integer，省掉一次强转
+                .bodyToMono(new ParameterizedTypeReference<Result<Integer>>() {
+                })
+                .flatMap(result -> resolveTokenVersion(result, userId))
+                .timeout(TOKEN_VERSION_QUERY_TIMEOUT)
+                //空 Mono 就是「取不到」的标记，异常与超时在这里统一转成它
+                .onErrorResume(e -> {
+                    log.error("回源查询用户令牌版本失败, userId={}", userId, e);
+                    return Mono.empty();
+                });
+    }
+
+    /**
+     * 校验 account 服务返回的响应体，取出令牌版本号并回填缓存。
+     *
+     * @param result account 服务的响应
+     * @param userId 用户 ID，用于拼接回填缓存的 key
+     * @return 令牌版本号；响应结构不符合预期或业务失败时返回空 Mono（表示取不到）
+     */
+    private Mono<Integer> resolveTokenVersion(Result<Integer> result, String userId) {
+        //1. 响应体与业务码不能为空
+        if (result == null || result.getCode() == null) {
+            log.error("回源查询用户令牌版本返回异常响应, 响应结构不符合预期");
+            return Mono.empty();
+        }
+
+        //2. 业务码非 200：account 服务给出的权威答复（用户不存在、账号被禁用等）。
+        //   这种账号不该再通过令牌校验，按「取不到」处理，上层会拒绝该请求。
+        if (!result.isSuccess()) {
+            log.warn("回源查询用户令牌版本业务失败, code={}, message={}",
+                    result.getCode(), result.getMessage());
+            return Mono.empty();
+        }
+
+        //3. code=200 但 data 为 null：响应结构不符合预期，按取不到处理
+        Integer tokenVersion = result.getData();
+        if (tokenVersion == null) {
+            log.error("回源查询用户令牌版本返回空数据, 响应结构不符合预期");
+            return Mono.empty();
+        }
+
+        //4. 回源成功：回填缓存，避免每次请求都回源；回填失败不影响本次校验
+        return reactiveRedisTemplate.opsForValue()
+                .set(tokenVersionKey(userId), String.valueOf(tokenVersion), TOKEN_VERSION_TTL)
+                .thenReturn(tokenVersion)
+                .onErrorResume(e -> {
+                    log.warn("回填用户令牌版本缓存失败, userId={}", userId, e);
+                    return Mono.just(tokenVersion);
+                });
+    }
+
+    /**
+     * 把缓存里读到的令牌版本号解析成整数。
+     *
+     * @param cached 缓存里的值
+     * @return 版本号；缓存内容不是数字时返回 null，调用方按「未命中」处理，回源重新取一份
+     */
+    private Integer parseTokenVersion(Object cached) {
+        if (cached == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(cached.toString().trim());
+        } catch (NumberFormatException e) {
+            log.warn("令牌版本缓存内容不是数字, value={}", cached);
+            return null;
+        }
+    }
+
+    /**
      * 把用户信息与权限写入请求头，交给后续过滤器处理。
      *
      * @param scopes 权限标识串，逗号分隔；空串表示该用户没有任何权限
@@ -377,6 +605,14 @@ public class JWTAuthFilter implements WebFilter {
      * 否则登录后权限永远查不到，每次请求都会回源。
      */
     private String scopesKey(String userId) {
-        return USER_SCOPES_KEY_PREFIX + userId + ":scopes";
+        return USER_KEY_PREFIX + userId + USER_SCOPES_KEY_SUFFIX;
+    }
+
+    /**
+     * 拼接令牌版本号在 Redis 中的 key，必须与 account 服务登录、改密时写入的 key 完全一致，
+     * 否则校验令牌版本时永远读不到缓存，每次请求都会回源。
+     */
+    private String tokenVersionKey(String userId) {
+        return USER_KEY_PREFIX + userId + USER_TOKEN_VERSION_KEY_SUFFIX;
     }
 }

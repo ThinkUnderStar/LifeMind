@@ -34,8 +34,9 @@ public class SpringSecurityConfig {
                     .pathMatchers("/life-mind/account/auth/code/send/**").permitAll()
                     //获取人机验证图
                     .pathMatchers("/life-mind/account/captcha/**").permitAll()
-                    //查询权限属于内部接口不接受调用
+                    //查询权限、查询令牌版本属于内部接口不接受调用
                     .pathMatchers("/life-mind/account/user/internal/permissions").denyAll()
+                    .pathMatchers("/life-mind/account/user/internal/token-version").denyAll()
                     .pathMatchers("/**").authenticated();
         });
 
