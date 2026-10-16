@@ -6,7 +6,9 @@ import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableLogic;
 import com.baomidou.mybatisplus.annotation.TableName;
+import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
 
@@ -14,6 +16,8 @@ import java.time.LocalDateTime;
  * 通用通知表
  */
 @Data
+@NoArgsConstructor
+@AllArgsConstructor
 @TableName("notification")
 public class Notification {
 
@@ -100,4 +104,28 @@ public class Notification {
      */
     @TableField(fill = FieldFill.INSERT_UPDATE)
     private LocalDateTime updateTime;
+
+    public Notification(
+            Long userId,
+            String type,
+            String title,
+            String content,
+            Long senderId,
+            String bizType,
+            String bizId,
+            String jumpUrl,
+            Integer level,
+            String extra
+    ) {
+        this.userId = userId;
+        this.type = type;
+        this.title = title;
+        this.content = content;
+        this.senderId = senderId;
+        this.bizType = bizType;
+        this.bizId = bizId;
+        this.jumpUrl = jumpUrl;
+        this.level = level;
+        this.extra = extra;
+    }
 }

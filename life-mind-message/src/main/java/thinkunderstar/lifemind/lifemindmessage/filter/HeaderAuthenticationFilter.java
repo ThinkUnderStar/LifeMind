@@ -43,10 +43,10 @@ public class HeaderAuthenticationFilter extends OncePerRequestFilter {
             HttpServletResponse response,
             FilterChain filterChain
     ) throws ServletException, IOException {
-        //放行内部发送信息的接口
+        //白名单
         String uri = request.getRequestURI();
         if (
-                uri.equals("/life-mind/message/notification/send")
+                uri.equals("")
         ) {
             filterChain.doFilter(request, response);
             return;
