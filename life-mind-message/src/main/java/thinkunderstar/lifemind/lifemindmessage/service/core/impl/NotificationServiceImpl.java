@@ -1,8 +1,15 @@
 package thinkunderstar.lifemind.lifemindmessage.service.core.impl;
 
 import cn.hutool.core.bean.BeanUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.stereotype.Service;
+import thinkunderstar.lifemind.lifemindmessage.common.Result;
 import thinkunderstar.lifemind.lifemindmessage.common.ResultCode;
+import thinkunderstar.lifemind.lifemindmessage.dto.request.NotificationQueryRequest;
+import thinkunderstar.lifemind.lifemindmessage.dto.response.NotificationResponse;
 import thinkunderstar.lifemind.lifemindmessage.entity.Notification;
 import thinkunderstar.lifemind.lifemindmessage.event.NotificationEvent;
 import thinkunderstar.lifemind.lifemindmessage.exception.BusinessException;
@@ -56,6 +63,59 @@ public class NotificationServiceImpl implements NotificationService {
 
         //落库
         notificationWrapperService.save(notification);
+    }
+
+    @Override
+    public Result<IPage<NotificationResponse>> getNotificationPage(NotificationQueryRequest queryRequest,
+                                                                   HttpServletRequest request) {
+
+        // ========== 1. 参数校验 ==========
+        if (queryRequest == null) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "请求参数不能为空");
+        }
+
+        // ========== 2. 取当前登录用户 ==========
+        // 只查网关注入的身份对应的用户的通知，前端传什么用户 ID 都不认；
+        // 认证由网关完成，身份从 LifeMind-User-Id 请求头解析（与 HeaderAuthenticationFilter 一致），
+        // 请求头缺失或格式非法说明请求没带 Token 或没走网关，按未登录处理
+        String userIdHeader = request.getHeader("LifeMind-User-Id");
+        if (userIdHeader == null) {
+            throw new BusinessException(ResultCode.UNAUTHORIZED, "未登录或登录已过期");
+        }
+        Long userId;
+        try {
+            userId = Long.parseLong(userIdHeader);
+        } catch (NumberFormatException e) {
+            throw new BusinessException(ResultCode.UNAUTHORIZED, "未登录或登录已过期");
+        }
+
+        // ========== 3. 组装分页查询 ==========
+        // 页码、每页条数做兜底，防止前端传 0 或负数导致分页插件异常
+        long pageNum = queryRequest.getPageNum() == null || queryRequest.getPageNum() <= 0
+                ? 1 : queryRequest.getPageNum();
+        long pageSize = queryRequest.getPageSize() == null || queryRequest.getPageSize() <= 0
+                ? 10 : queryRequest.getPageSize();
+
+        LambdaQueryWrapper<Notification> queryWrapper = new LambdaQueryWrapper<Notification>()
+                .eq(Notification::getUserId, userId)
+                // 通知类型过滤，可选
+                .eq(queryRequest.getType() != null && !queryRequest.getType().isBlank(),
+                        Notification::getType, queryRequest.getType())
+                // 已读状态过滤，可选
+                .eq(queryRequest.getIsRead() != null,
+                        Notification::getIsRead, queryRequest.getIsRead())
+                // 新通知在前
+                .orderByDesc(Notification::getCreateTime);
+
+        // ========== 4. 分页查询并转换返回 ==========
+        // 分页信息（total/current/size/pages）由 Page 自带给前端
+        Page<Notification> page = notificationWrapperService.page(
+                new Page<>(pageNum, pageSize), queryWrapper);
+
+        IPage<NotificationResponse> pageResult = page.convert(
+                notification -> BeanUtil.copyProperties(notification, NotificationResponse.class));
+
+        return Result.success(pageResult);
     }
 
     /**
