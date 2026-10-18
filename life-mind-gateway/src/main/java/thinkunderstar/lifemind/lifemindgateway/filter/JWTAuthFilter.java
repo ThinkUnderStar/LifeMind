@@ -158,6 +158,11 @@ public class JWTAuthFilter implements WebFilter {
     private static final String INTERNAL_TOKEN_VERSION_PATH = "/life-mind/account/user/internal/token-version";
 
     /**
+     * 访问MinIO的公开的桶的路径前缀
+     */
+    private static final String MINIO_PUBLIC_PATH_PREFIX = "/minio/life-mind-public";
+
+    /**
      * 获取人机验证图
      */
     private static final String CAPTCHA_PATH_PREFIX = "/life-mind/account/captcha";
@@ -181,6 +186,7 @@ public class JWTAuthFilter implements WebFilter {
                 || path.startsWith(LOGIN_PATH_PREFIX)
                 || path.startsWith(SEND_CODE_PATH_PREFIX)
                 || path.startsWith(CAPTCHA_PATH_PREFIX)
+                || path.startsWith(MINIO_PUBLIC_PATH_PREFIX)
         ) {
             return filterChain.filter(exchange);
         }

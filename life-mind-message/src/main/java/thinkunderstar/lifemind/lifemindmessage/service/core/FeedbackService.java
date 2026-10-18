@@ -2,6 +2,7 @@ package thinkunderstar.lifemind.lifemindmessage.service.core;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.web.multipart.MultipartFile;
 import thinkunderstar.lifemind.lifemindmessage.common.Result;
 import thinkunderstar.lifemind.lifemindmessage.dto.request.FeedbackProcessRequest;
 import thinkunderstar.lifemind.lifemindmessage.dto.request.FeedbackQueryRequest;
@@ -20,7 +21,7 @@ public interface FeedbackService {
      * @param request       当前请求，用于从请求头解析用户 ID
      * @return 操作结果
      */
-    Result<Void> submitFeedback(FeedbackSubmitRequest submitRequest, HttpServletRequest request);
+    Result<Void> submitFeedback(FeedbackSubmitRequest submitRequest, MultipartFile file , HttpServletRequest request);
 
     /**
      * 分页查询全部反馈（管理员视角）。

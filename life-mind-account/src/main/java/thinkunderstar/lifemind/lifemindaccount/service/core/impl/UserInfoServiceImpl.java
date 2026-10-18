@@ -1,10 +1,12 @@
 package thinkunderstar.lifemind.lifemindaccount.service.core.impl;
 
+import cn.hutool.core.date.DateTime;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.support.SFunction;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.security.core.Authentication;
@@ -23,6 +25,7 @@ import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeUsernameRequest
 import thinkunderstar.lifemind.lifemindaccount.entity.Permission;
 import thinkunderstar.lifemind.lifemindaccount.entity.User;
 import thinkunderstar.lifemind.lifemindaccount.entity.UserIdentity;
+import thinkunderstar.lifemind.lifemindaccount.event.NotificationEvent;
 import thinkunderstar.lifemind.lifemindaccount.exception.BusinessException;
 import thinkunderstar.lifemind.lifemindaccount.mapper.IdentityPermissionMapper;
 import thinkunderstar.lifemind.lifemindaccount.security.LifeMindUserDetails;
@@ -168,6 +171,7 @@ public class UserInfoServiceImpl implements UserInfoService {
     private final RedisTokenBucketLimiter rateLimiter;
     private final CaptchaVerifier captchaVerifier;
     private final PasswordEncoder passwordEncoder;
+    private final RocketMQTemplate rocketMQTemplate;
 
     public UserInfoServiceImpl(UserService userService,
                                UserIdentityService userIdentityService,
@@ -175,7 +179,7 @@ public class UserInfoServiceImpl implements UserInfoService {
                                RedisTemplate<Object, Object> redisTemplate,
                                RedisTokenBucketLimiter rateLimiter,
                                CaptchaVerifier captchaVerifier,
-                               PasswordEncoder passwordEncoder) {
+                               PasswordEncoder passwordEncoder, RocketMQTemplate rocketMQTemplate) {
         this.userService = userService;
         this.userIdentityService = userIdentityService;
         this.identityPermissionMapper = identityPermissionMapper;
@@ -183,6 +187,7 @@ public class UserInfoServiceImpl implements UserInfoService {
         this.rateLimiter = rateLimiter;
         this.captchaVerifier = captchaVerifier;
         this.passwordEncoder = passwordEncoder;
+        this.rocketMQTemplate = rocketMQTemplate;
     }
 
     @Override
@@ -498,6 +503,18 @@ public class UserInfoServiceImpl implements UserInfoService {
             log.error("刷新令牌版本缓存失败, userId={}", userId, e);
             redisTemplate.delete(tokenVersionKey(userId));
         }
+
+        // 9. 发送一条密码修改成功的通知
+        //拼装服务间规定的消息对象
+        NotificationEvent notificationEvent = new NotificationEvent();
+        notificationEvent.setUserId(userId);
+        notificationEvent.setType("system");
+        notificationEvent.setTitle("账号密码修改通知");
+        notificationEvent.setContent("该账号的密码于" + DateTime.now().toString("yyyy-MM-dd HH:mm:ss") + "修改成功");
+        notificationEvent.setLevel(1);
+
+        //发送消息到消息队列中
+        rocketMQTemplate.convertAndSend("life-mind-notification:PASSWORD_CHANGED", notificationEvent);
 
         // 本次改密用的令牌也被一并作废（版本号对不上），改完需要重新登录，
         // 其他设备上的登录态同样失效——这正是「改密踢掉所有旧令牌」要的效果。

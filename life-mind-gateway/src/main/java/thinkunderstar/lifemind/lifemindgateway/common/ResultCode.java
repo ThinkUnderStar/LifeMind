@@ -39,6 +39,16 @@ public enum ResultCode {
     NOT_FOUND(404, "请求的资源不存在"),
 
     /**
+     * 上传失败
+     */
+    UPLOAD_ERROR(506, "上传失败"),
+
+    /**
+     * 下载失败
+     */
+    DOWNLOAD_ERROR(507, "下载失败"),
+
+    /**
      * 请求过于频繁，被限流
      */
     TOO_MANY_REQUESTS(429, "操作过于频繁，请稍后再试");

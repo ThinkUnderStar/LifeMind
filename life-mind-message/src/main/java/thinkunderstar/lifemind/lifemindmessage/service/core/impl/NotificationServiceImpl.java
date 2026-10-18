@@ -2,6 +2,7 @@ package thinkunderstar.lifemind.lifemindmessage.service.core.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import jakarta.servlet.http.HttpServletRequest;
@@ -9,6 +10,7 @@ import org.springframework.stereotype.Service;
 import thinkunderstar.lifemind.lifemindmessage.common.Result;
 import thinkunderstar.lifemind.lifemindmessage.common.ResultCode;
 import thinkunderstar.lifemind.lifemindmessage.dto.request.NotificationQueryRequest;
+import thinkunderstar.lifemind.lifemindmessage.dto.request.NotificationReadRequest;
 import thinkunderstar.lifemind.lifemindmessage.dto.response.NotificationResponse;
 import thinkunderstar.lifemind.lifemindmessage.entity.Notification;
 import thinkunderstar.lifemind.lifemindmessage.event.NotificationEvent;
@@ -16,6 +18,8 @@ import thinkunderstar.lifemind.lifemindmessage.exception.BusinessException;
 import thinkunderstar.lifemind.lifemindmessage.service.core.NotificationService;
 import thinkunderstar.lifemind.lifemindmessage.service.wrapper.NotificationWrapperService;
 import thinkunderstar.lifemind.lifemindmessage.util.RedisTokenBucketLimiter;
+
+import java.time.LocalDateTime;
 
 @Service
 public class NotificationServiceImpl implements NotificationService {
@@ -26,6 +30,10 @@ public class NotificationServiceImpl implements NotificationService {
      */
     private static final long NOTIFICATION_USER_CAPACITY = 10L;
     private static final double NOTIFICATION_USER_RATE = 1.0;
+
+    /** 标记已读限流：桶容量 10，每秒补充 1 个令牌，按用户限流防刷 */
+    private static final long NOTIFICATION_READ_CAPACITY = 10L;
+    private static final double NOTIFICATION_READ_RATE = 1.0;
 
     private final RedisTokenBucketLimiter rateLimiter;
     private final NotificationWrapperService notificationWrapperService;
@@ -116,6 +124,53 @@ public class NotificationServiceImpl implements NotificationService {
                 notification -> BeanUtil.copyProperties(notification, NotificationResponse.class));
 
         return Result.success(pageResult);
+    }
+
+    @Override
+    public Result<Void> markNotificationRead(NotificationReadRequest readRequest, HttpServletRequest request) {
+
+        // ========== 1. 参数校验 ==========
+        if (readRequest == null || readRequest.getId() == null || readRequest.getId() <= 0) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "通知ID不能为空");
+        }
+
+        // ========== 2. 取当前登录用户 ==========
+        // 只允许标记属于自己的通知，身份从网关注入的 LifeMind-User-Id 请求头解析
+        String userIdHeader = request.getHeader("LifeMind-User-Id");
+        if (userIdHeader == null) {
+            throw new BusinessException(ResultCode.UNAUTHORIZED, "未登录或登录已过期");
+        }
+        Long userId;
+        try {
+            userId = Long.parseLong(userIdHeader);
+        } catch (NumberFormatException e) {
+            throw new BusinessException(ResultCode.UNAUTHORIZED, "未登录或登录已过期");
+        }
+
+        // ========== 3. 限流 ==========
+        if (!rateLimiter.tryAcquireByUser(userId, NOTIFICATION_READ_CAPACITY, NOTIFICATION_READ_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+
+        // ========== 4. 查询通知并校验归属 ==========
+        // 不存在或不属于当前用户统一按"通知不存在"处理，避免暴露他人通知的存在性
+        Notification notification = notificationWrapperService.getById(readRequest.getId());
+        if (notification == null || !notification.getUserId().equals(userId)) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "通知不存在");
+        }
+
+        // ========== 5. 已读幂等：已是已读状态直接返回 ==========
+        if (notification.getIsRead() != null && notification.getIsRead() == 1) {
+            return Result.success();
+        }
+
+        // ========== 6. 标记已读 ==========
+        notificationWrapperService.update(new LambdaUpdateWrapper<Notification>()
+                .eq(Notification::getId, readRequest.getId())
+                .set(Notification::getIsRead, 1)
+                .set(Notification::getReadTime, LocalDateTime.now()));
+
+        return Result.success();
     }
 
     /**

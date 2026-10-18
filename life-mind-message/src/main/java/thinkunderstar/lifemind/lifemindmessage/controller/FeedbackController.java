@@ -3,12 +3,8 @@ package thinkunderstar.lifemind.lifemindmessage.controller;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.ModelAttribute;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 import thinkunderstar.lifemind.lifemindmessage.common.Result;
 import thinkunderstar.lifemind.lifemindmessage.dto.request.FeedbackProcessRequest;
 import thinkunderstar.lifemind.lifemindmessage.dto.request.FeedbackQueryRequest;
@@ -38,8 +34,9 @@ public class FeedbackController {
      */
     @PostMapping("/submit")
     public Result<Void> submitFeedback(@RequestBody FeedbackSubmitRequest submitRequest,
+                                       @RequestParam(value = "file", required = false) MultipartFile file,
                                        HttpServletRequest request) {
-        return feedbackService.submitFeedback(submitRequest, request);
+        return feedbackService.submitFeedback(submitRequest,file ,request);
     }
 
     /**

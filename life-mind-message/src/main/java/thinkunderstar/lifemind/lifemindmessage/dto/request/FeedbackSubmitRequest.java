@@ -25,11 +25,6 @@ public class FeedbackSubmitRequest {
     private String content;
 
     /**
-     * 反馈图片地址列表，JSON数组格式字符串，可空
-     */
-    private String images;
-
-    /**
      * 联系方式（邮箱/手机号等，便于官方回复），可空
      */
     private String contact;

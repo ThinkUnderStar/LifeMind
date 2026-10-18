@@ -4,9 +4,11 @@ import cn.hutool.core.bean.BeanUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import io.minio.*;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 import thinkunderstar.lifemind.lifemindmessage.common.Result;
 import thinkunderstar.lifemind.lifemindmessage.common.ResultCode;
 import thinkunderstar.lifemind.lifemindmessage.dto.request.FeedbackProcessRequest;
@@ -21,7 +23,11 @@ import thinkunderstar.lifemind.lifemindmessage.service.core.NotificationService;
 import thinkunderstar.lifemind.lifemindmessage.service.wrapper.FeedbackWrapperService;
 import thinkunderstar.lifemind.lifemindmessage.util.RedisTokenBucketLimiter;
 
+import java.io.InputStream;
 import java.time.LocalDateTime;
+import java.util.Locale;
+import java.util.Set;
+import java.util.UUID;
 
 /**
  * 反馈服务实现。
@@ -55,8 +61,33 @@ public class FeedbackServiceImpl implements FeedbackService {
     /** 处理状态合法范围（提交时固定为待处理，处理时可流转到 1/2/3） */
     private static final int[] FEEDBACK_STATUS = {1, 2, 3};
 
+    /** 反馈截图：允许的常见图片格式 */
+    private static final Set<String> IMAGE_EXTENSIONS = Set.of("jpg", "jpeg", "png", "gif", "webp", "bmp");
+
+    /** 反馈截图：最大体积 5MB */
+    private static final long MAX_IMAGE_SIZE = 5L * 1024 * 1024;
+
+    /** 反馈截图存储桶：公共读桶，匿名可下载图片 */
+    private static final String FEEDBACK_IMAGE_BUCKET = "life-mind-public";
+
+    /** 公共读桶策略：允许匿名 s3:GetObject，%s 为桶名 */
+    private static final String BUCKET_PUBLIC_READ_POLICY =
+            "{\n" +
+            "  \"Version\": \"2012-10-17\",\n" +
+            "  \"Statement\": [\n" +
+            "    {\n" +
+            "      \"Effect\": \"Allow\",\n" +
+            "      \"Principal\": {\"AWS\": [\"*\"]},\n" +
+            "      \"Action\": [\"s3:GetObject\"],\n" +
+            "      \"Resource\": [\"arn:aws:s3:::%s/*\"]\n" +
+            "    }\n" +
+            "  ]\n" +
+            "}";
+
+    private final MinioClient minioClient;
+
     @Override
-    public Result<Void> submitFeedback(FeedbackSubmitRequest submitRequest, HttpServletRequest request) {
+    public Result<Void> submitFeedback(FeedbackSubmitRequest submitRequest, MultipartFile file , HttpServletRequest request) {
 
         // ========== 1. 参数校验 ==========
         if (submitRequest == null) {
@@ -74,6 +105,11 @@ public class FeedbackServiceImpl implements FeedbackService {
             throw new BusinessException(ResultCode.PARAM_ERROR, "反馈内容不能超过1000字");
         }
 
+        // 反馈截图校验（可选）：文件为空则跳过，否则校验图片格式与体积
+        if (file != null && !file.isEmpty()) {
+            validateFeedbackImage(file);
+        }
+
         // ========== 2. 取当前登录用户 ==========
         // 用户身份由网关注入的 LifeMind-User-Id 请求头解析（与 HeaderAuthenticationFilter 一致），
         // 请求头缺失或格式非法说明请求没带 Token 或没走网关，按未登录处理
@@ -85,17 +121,52 @@ public class FeedbackServiceImpl implements FeedbackService {
             throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "提交反馈过于频繁，请稍后再试");
         }
 
-        // ========== 4. 组装并保存反馈 ==========
+        // 4. 如果有截图的话将截图存入minio中
+        String objectName = null;
+        String bucketName = null;
+        if (file != null && !file.isEmpty()) {
+            try {
+                String fileType = file.getOriginalFilename().substring(file.getOriginalFilename().lastIndexOf("."));
+                String fileName = UUID.randomUUID() + fileType;
+                bucketName = FEEDBACK_IMAGE_BUCKET;
+
+                if (!minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucketName).build())){
+                    minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucketName).build());
+                    minioClient.setBucketPolicy(SetBucketPolicyArgs.builder()
+                            .bucket(bucketName)
+                            .config(String.format(BUCKET_PUBLIC_READ_POLICY, bucketName))
+                            .build());
+                }
+
+                objectName = "users/" + userId + "/feedback-images/" + fileName;
+
+                InputStream inputStream = file.getInputStream();
+                minioClient.putObject(
+                        PutObjectArgs.builder()
+                                .bucket(bucketName)
+                                .contentType(file.getContentType())
+                                .stream(inputStream,file.getSize(),-1)
+                                .object(objectName)
+                                .build()
+                );
+
+                inputStream.close();
+            }catch (Exception e){
+                throw new BusinessException(ResultCode.UPLOAD_ERROR,"反馈截图上传失败");
+            }
+        }
+
+        // ========== 5. 组装并保存反馈 ==========
         Feedback feedback = new Feedback();
         feedback.setUserId(userId);
         feedback.setType(type);
         feedback.setContent(content);
-        feedback.setImages(submitRequest.getImages());
+        feedback.setImages("/minio/" + bucketName + "/" + objectName);
         feedback.setContact(submitRequest.getContact());
         feedback.setStatus(0); // 初始待处理
         feedbackWrapperService.save(feedback);
 
-        // ========== 4. 发送"反馈已收到"通知 ==========
+        // ========== 6. 发送"反馈已收到"通知 ==========
         NotificationEvent event = new NotificationEvent();
         event.setUserId(userId);
         event.setType("feedback");
@@ -106,6 +177,30 @@ public class FeedbackServiceImpl implements FeedbackService {
         notificationService.sendNotification(event);
 
         return Result.success();
+    }
+
+    /**
+     * 校验反馈截图是否为合法的静态图片。
+     *
+     * <p>校验项：文件名非空、扩展名为常见图片格式（jpg/jpeg/png/gif/webp/bmp）、
+     * 体积不超过 5MB。调用方需保证文件非空。
+     *
+     * @param file 反馈截图文件
+     */
+    private void validateFeedbackImage(MultipartFile file) {
+        String filename = file.getOriginalFilename();
+        if (filename == null || filename.isBlank()) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "反馈截图文件名不能为空");
+        }
+        String extension = filename.contains(".")
+                ? filename.substring(filename.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT)
+                : "";
+        if (!IMAGE_EXTENSIONS.contains(extension)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "反馈截图仅支持常见图片格式（jpg/jpeg/png/gif/webp/bmp）");
+        }
+        if (file.getSize() > MAX_IMAGE_SIZE) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "反馈截图不能超过5MB");
+        }
     }
 
     @Override
