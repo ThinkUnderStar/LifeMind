@@ -33,6 +33,7 @@ import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.UserIdentityService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.UserService;
 import thinkunderstar.lifemind.lifemindaccount.util.CaptchaVerifier;
+import thinkunderstar.lifemind.lifemindaccount.util.DesensitizeUtils;
 import thinkunderstar.lifemind.lifemindaccount.util.IpUtils;
 import thinkunderstar.lifemind.lifemindaccount.util.RedisTokenBucketLimiter;
 import thinkunderstar.lifemind.lifemindaccount.util.ValidateUtils;
@@ -747,6 +748,22 @@ public class UserInfoServiceImpl implements UserInfoService {
         }
 
         // 成功后不重新签发令牌：手机号与邮箱都不参与 JWT 声明，账号权限也不随绑定变化
+
+        // 9. 发送一条绑定 / 换绑成功的通知
+        // 拼装服务间规定的消息对象，content 中号码 / 邮箱脱敏，避免隐私外泄
+        NotificationEvent notificationEvent = new NotificationEvent();
+        notificationEvent.setUserId(userId);
+        notificationEvent.setType("system");
+        notificationEvent.setTitle("账号" + mode.getLabel() + label + "通知");
+        notificationEvent.setContent("您的账号已于" + DateTime.now().toString("yyyy-MM-dd HH:mm:ss")
+                + mode.getLabel() + label + "为：" + (phone
+                ? DesensitizeUtils.desensitizePhone(value)
+                : DesensitizeUtils.desensitizeEmail(value)));
+        notificationEvent.setLevel(1);
+
+        //发送消息到消息队列中
+        rocketMQTemplate.convertAndSend("life-mind-notification:BINDING_CHANGED", notificationEvent);
+
         return Result.success();
     }
 
