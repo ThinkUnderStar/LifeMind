@@ -107,4 +107,15 @@ public class AuthController {
     ) {
         return authService.sendEmailCode(emailCodeSendRequest, request);
     }
+
+    /**
+     * 注销账号（软删除）：当前登录用户注销自己的账号。
+     *
+     * <p>需携带 Token（身份由网关解析后注入请求头，注销的永远是「自己」）。
+     * 逻辑删除账号并解绑身份、作废全部登录态，只落一条注销审计，不发通知。
+     */
+    @PostMapping("/deactivate")
+    public Result<Void> deactivateAccount(HttpServletRequest request) {
+        return authService.deactivateAccount(request);
+    }
 }

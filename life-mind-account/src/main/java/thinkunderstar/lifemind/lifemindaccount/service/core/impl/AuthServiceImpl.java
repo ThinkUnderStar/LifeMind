@@ -1,13 +1,20 @@
 package thinkunderstar.lifemind.lifemindaccount.service.core.impl;
 
+import cn.hutool.http.useragent.UserAgent;
+import cn.hutool.http.useragent.UserAgentUtil;
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,15 +29,20 @@ import thinkunderstar.lifemind.lifemindaccount.dto.request.PhoneCodeSendRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.RegisterRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.response.LoginResponse;
 import thinkunderstar.lifemind.lifemindaccount.entity.Identity;
+import thinkunderstar.lifemind.lifemindaccount.entity.LoginAudit;
 import thinkunderstar.lifemind.lifemindaccount.entity.User;
 import thinkunderstar.lifemind.lifemindaccount.entity.UserIdentity;
+import thinkunderstar.lifemind.lifemindaccount.event.NotificationEvent;
+import thinkunderstar.lifemind.lifemindaccount.security.LifeMindUserDetails;
 import thinkunderstar.lifemind.lifemindaccount.service.core.AuthService;
 import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.IdentityService;
+import thinkunderstar.lifemind.lifemindaccount.service.wrapper.LoginAuditService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.UserIdentityService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.UserService;
 import thinkunderstar.lifemind.lifemindaccount.util.CaptchaVerifier;
 import thinkunderstar.lifemind.lifemindaccount.util.CodeUtils;
+import thinkunderstar.lifemind.lifemindaccount.util.IpRegionUtils;
 import thinkunderstar.lifemind.lifemindaccount.util.IpUtils;
 import thinkunderstar.lifemind.lifemindaccount.util.MailUtils;
 import thinkunderstar.lifemind.lifemindaccount.util.RedisTokenBucketLimiter;
@@ -90,6 +102,24 @@ public class AuthServiceImpl implements AuthService {
     private static final double REGISTER_USERNAME_RATE = 0.05;
 
     /**
+     * 注销账号的限流：按 IP、按账号两层。
+     *
+     * <p>额度与改密同一档，避免高频重放注销请求；注销是登录态内的高敏操作，
+     * 不需要「按目标」那一层（不认请求里的号码），按 IP + 按账号足够。
+     */
+    private static final long DEACTIVATE_IP_CAPACITY = 10L;
+    private static final double DEACTIVATE_IP_RATE = 0.2;
+    private static final long DEACTIVATE_USER_CAPACITY = 5L;
+    private static final double DEACTIVATE_USER_RATE = 0.05;
+
+    /**
+     * 权限缓存的 key 前后缀，完整 key 为 {@code life-mind:{userId}:scopes}，
+     * 与 {@code UserInfoServiceImpl} 中登录写缓存、网关读取时保持一致，注销时据此清除。
+     */
+    private static final String SCOPES_CACHE_KEY_PREFIX = "life-mind:";
+    private static final String SCOPES_CACHE_KEY_SUFFIX = ":scopes";
+
+    /**
      * 手机 / 邮箱长度硬上限，用于在进正则之前拦住超长输入。
      */
     private static final int MAX_PHONE_LENGTH = 11;
@@ -143,6 +173,7 @@ public class AuthServiceImpl implements AuthService {
      * 否则会出现「写进去了但读不到」的情况。
      */
     private final StringRedisTemplate stringRedisTemplate;
+    private final RedisTemplate<Object, Object> redisTemplate;
 
     @Value("${jwt.key}")
     private String jwtKey;
@@ -155,12 +186,22 @@ public class AuthServiceImpl implements AuthService {
     private final CaptchaVerifier captchaVerifier;
 
     /**
+     * 登录审计：登录/注册/注销时落一条审计记录（账号注销后记录仍保留）。
+     */
+    private final LoginAuditService loginAuditService;
+
+    /**
+     * RocketMQ 模板：向通知服务投递事件消息。
+     */
+    private final RocketMQTemplate rocketMQTemplate;
+
+    /**
      * 用户权限的查询与缓存统一由它负责：登录时写缓存、网关回查时读缓存/回查数据库，
      * 两条路径共用同一份 Redis key 与过期时间，避免 key 拼接在多处各存一份。
      */
     private final UserInfoService userInfoService;
 
-    public AuthServiceImpl(RedisTokenBucketLimiter rateLimiter, UserService userService, UserIdentityService userIdentityService, IdentityService identityService, PasswordEncoder passwordEncoder, StringRedisTemplate stringRedisTemplate, CaptchaVerifier captchaVerifier, UserInfoService userInfoService) {
+    public AuthServiceImpl(RedisTokenBucketLimiter rateLimiter, UserService userService, UserIdentityService userIdentityService, IdentityService identityService, PasswordEncoder passwordEncoder, StringRedisTemplate stringRedisTemplate, CaptchaVerifier captchaVerifier, LoginAuditService loginAuditService, RocketMQTemplate rocketMQTemplate, UserInfoService userInfoService, RedisTemplate<Object, Object> redisTemplate) {
         this.rateLimiter = rateLimiter;
         this.userService = userService;
         this.userIdentityService = userIdentityService;
@@ -168,7 +209,10 @@ public class AuthServiceImpl implements AuthService {
         this.passwordEncoder = passwordEncoder;
         this.stringRedisTemplate = stringRedisTemplate;
         this.captchaVerifier = captchaVerifier;
+        this.loginAuditService = loginAuditService;
+        this.rocketMQTemplate = rocketMQTemplate;
         this.userInfoService = userInfoService;
+        this.redisTemplate = redisTemplate;
     }
 
     /**
@@ -288,9 +332,171 @@ public class AuthServiceImpl implements AuthService {
         userIdentity.setIdentityId(defaultIdentity.getId());
         userIdentityService.save(userIdentity);
 
-        // ========== 9. 注册完成 ==========
+        // ========== 9. 添加注册记录，并发送注册成功的信息 ==========
+
+        // 9.1 登录审计：记录本次注册的 IP、设备等信息（账号注销后记录仍保留半年）
+        String clientIp = IpUtils.getClientIp(request);
+        String userAgent = request.getHeader("User-Agent");
+
+        LoginAudit loginAudit = new LoginAudit();
+        loginAudit.setUserId(user.getId());
+        loginAudit.setType(LoginAudit.TYPE_REGISTER);
+        loginAudit.setIp(clientIp);
+        loginAudit.setRegion(IpRegionUtils.getRegion(clientIp));
+        loginAudit.setUserAgent(userAgent);
+        loginAudit.setDeviceType(parseDeviceType(userAgent));
+        loginAuditService.save(loginAudit);
+
+        // 9.2 发送注册成功通知：走 RocketMQ 投递给通知服务落库分发（与改密/换绑通知同一链路）
+        NotificationEvent notificationEvent = new NotificationEvent();
+        notificationEvent.setUserId(user.getId());
+        notificationEvent.setType("system");
+        notificationEvent.setTitle("注册成功通知");
+        notificationEvent.setContent("欢迎加入 LifeMind！您的账号：" + username + " 于"
+                + cn.hutool.core.date.DateTime.now().toString("yyyy-MM-dd HH:mm:ss") + "注册成功");
+        notificationEvent.setLevel(1);
+        rocketMQTemplate.convertAndSend("life-mind-notification:REGISTERED", notificationEvent);
+
+        log.info("注册成功, userId={}, username={}, ip={}", user.getId(), username, clientIp);
+
+        // ========== 10. 注册完成 ==========
         // 这里不签发令牌：注册成功后由前端跳转到登录页，用户重新登录
         return Result.success();
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public Result<Void> deactivateAccount(HttpServletRequest request) {
+
+        // ========== 1. 取当前登录用户 ==========
+        // 注销是高敏操作，身份必须来自网关注入并经 HeaderAuthenticationFilter 还原进安全上下文
+        Long userId = currentUserId();
+
+        // ========== 2. 限流 ==========
+        // 2.1 按 IP 限流：挡住同一来源的高频注销
+        if (!rateLimiter.tryAcquireByIp(IpUtils.getClientIp(request), DEACTIVATE_IP_CAPACITY, DEACTIVATE_IP_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+        // 2.2 按账号限流：正常用户不会反复注销同一个账号
+        if (!rateLimiter.tryAcquireByUser(userId, DEACTIVATE_USER_CAPACITY, DEACTIVATE_USER_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+
+        // ========== 3. 加载账号并校验状态 ==========
+        // 顺带拿到当前令牌版本号，下面软删除时要一起 +1
+        User user = loadEnabledUser(userId);
+        int newTokenVersion = normalizeTokenVersion(user.getTokenVersion()) + 1;
+
+        // ========== 4. 软删除 + 解绑身份 + 令牌版本号 +1 ==========
+        // 逻辑删除 user 行（deleted=1），并解绑该用户全部身份关系；
+        // token_version +1 使 JWT 里的旧版本号对不上，此前签发的所有登录态一并作废。
+        userService.lambdaUpdate()
+                .eq(User::getId, userId)
+                .set(User::getDeleted, 1)
+                .set(User::getTokenVersion, newTokenVersion)
+                .update();
+        userIdentityService.lambdaUpdate()
+                .eq(UserIdentity::getUserId, userId)
+                .remove();
+
+        // ========== 5. 清缓存 ==========
+        // 5.1 刷新令牌版本缓存：不刷新的话网关读到的还是旧版本号，会继续放行旧令牌
+        userInfoService.cacheTokenVersion(userId, newTokenVersion);
+        // 5.2 删除权限缓存：账号已注销，不再让网关命中这份残留权限
+        stringRedisTemplate.delete(SCOPES_CACHE_KEY_PREFIX + userId + SCOPES_CACHE_KEY_SUFFIX);
+
+        // ========== 6. 落一条注销审计 ==========
+        // 注销不发任何消息，只留审计记录（type=注销，账号注销后记录仍保留半年）
+        String clientIp = IpUtils.getClientIp(request);
+        String userAgent = request.getHeader("User-Agent");
+
+        LoginAudit loginAudit = new LoginAudit();
+        loginAudit.setUserId(userId);
+        loginAudit.setType(LoginAudit.TYPE_RETIRE);
+        loginAudit.setIp(clientIp);
+        loginAudit.setRegion(IpRegionUtils.getRegion(clientIp));
+        loginAudit.setUserAgent(userAgent);
+        loginAudit.setDeviceType(parseDeviceType(userAgent));
+        loginAuditService.save(loginAudit);
+
+        log.info("注销账号成功, userId={}, ip={}", userId, clientIp);
+        return Result.success();
+    }
+
+    /**
+     * 用 hutool 解析 User-Agent，判定设备类型：1-PC 2-移动端。
+     * 注意：hutool 5.8.46 的 UserAgent 只提供 isMobile() 一个布尔判定，
+     * 平板/爬虫等其余场景统一按 PC（1）处理。
+     */
+    private Integer parseDeviceType(String userAgent) {
+        if (userAgent == null || userAgent.isBlank()) {
+            return null;
+        }
+        UserAgent parsed = UserAgentUtil.parse(userAgent);
+        if (parsed == null) {
+            return null;
+        }
+        return parsed.isMobile() ? 2 : 1;
+    }
+
+    /**
+     * 取当前登录用户的 ID。
+     *
+     * <p>身份由网关注入的请求头经 {@code HeaderAuthenticationFilter} 还原进 SecurityContext，
+     * 所以这里拿到的一定是「已通过网关认证」的用户；拿不到说明请求没带 Token 或没走网关，
+     * 按未登录处理。
+     *
+     * @return 当前登录用户 ID
+     */
+    private Long currentUserId() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication != null) {
+            Object principal = authentication.getPrincipal();
+            if (principal instanceof LifeMindUserDetails) {
+                Long userId = ((LifeMindUserDetails) principal).getUserId();
+                if (userId != null && userId > 0) {
+                    return userId;
+                }
+            }
+        }
+        throw new BusinessException(ResultCode.UNAUTHORIZED, "未登录或登录已过期");
+    }
+
+    /**
+     * 加载账号并校验其存在且未被禁用。
+     */
+    private User loadEnabledUser(Long userId) {
+        User user = userService.getById(userId);
+        if (user == null) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "用户不存在");
+        }
+        if (user.getStatus() == null || user.getStatus() != USER_STATUS_ENABLED) {
+            throw new BusinessException(ResultCode.FORBIDDEN, "账号已被禁用");
+        }
+        return user;
+    }
+
+    /**
+     * 令牌版本号的空值兜底，与库默认值一致。
+     */
+    private int normalizeTokenVersion(Integer tokenVersion) {
+        return tokenVersion == null ? DEFAULT_TOKEN_VERSION : tokenVersion;
+    }
+
+    /**
+     * 读该用户上次登录地区缓存；无缓存或缓存内容为空时返回 null。
+     *
+     * <p>key 与 {@code issueLoginToken} 中写入本次登录地区时保持一致
+     * （{@code life-mind-account:{userId}:last-login}）。
+     */
+    private String readLastLoginRegion(Long userId) {
+        Object cached = redisTemplate.opsForValue()
+                .get("life-mind-account:" + userId + ":last-login");
+        if (cached == null) {
+            return null;
+        }
+        String value = cached.toString();
+        return value.isBlank() ? null : value;
     }
 
     @Override
@@ -381,7 +587,7 @@ public class AuthServiceImpl implements AuthService {
         }
 
         // ========== 6. 签发令牌 ==========
-        return Result.success(issueLoginToken(user, rememberMe));
+        return Result.success(issueLoginToken(user, rememberMe, request));
     }
 
     @Override
@@ -455,7 +661,7 @@ public class AuthServiceImpl implements AuthService {
         }
 
         // ========== 7. 签发令牌 ==========
-        return Result.success(issueLoginToken(user, rememberMe));
+        return Result.success(issueLoginToken(user, rememberMe, request));
     }
 
     @Override
@@ -526,7 +732,7 @@ public class AuthServiceImpl implements AuthService {
         }
 
         // ========== 7. 签发令牌 ==========
-        return Result.success(issueLoginToken(user, rememberMe));
+        return Result.success(issueLoginToken(user, rememberMe, request));
     }
 
     @Override
@@ -681,13 +887,14 @@ public class AuthServiceImpl implements AuthService {
      * 为已通过认证的用户签发令牌。
      *
      * <p>三种登录方式（密码、手机验证码、邮箱验证码）共用这一段：
-     * 查身份与权限 → 权限写入 Redis 供网关读取 → 取令牌版本号 → 签 JWT。
+     * 查身份与权限 → 权限写入 Redis 供网关读取 → 取令牌版本号 → 签 JWT → 落一条登录审计。
      *
      * @param user       已通过认证的用户
      * @param rememberMe 1-记住我 0-不记住我
+     * @param request    当前请求，用于解析客户端真实 IP / User-Agent 做登录审计
      * @return 登录响应
      */
-    private LoginResponse issueLoginToken(User user, int rememberMe) {
+    private LoginResponse issueLoginToken(User user, int rememberMe, HttpServletRequest request) {
         //获取身份信息
         List<Long> identityIds = userIdentityService.list(
                 new LambdaQueryWrapper<UserIdentity>()
@@ -720,6 +927,67 @@ public class AuthServiceImpl implements AuthService {
                 .withIssuer("LifeMind")
                 .withJWTId(UUID.randomUUID().toString())
                 .sign(Algorithm.HMAC256(jwtKey));
+
+        //落一条登录审计：三种登录方式共用此方法，所以登录记录只在这里统一写一份
+        //（账号注销后记录仍保留半年）
+        String clientIp = IpUtils.getClientIp(request);
+        String userAgent = request.getHeader("User-Agent");
+
+        String region = IpRegionUtils.getRegion(clientIp);
+        LoginAudit loginAudit = new LoginAudit();
+        loginAudit.setUserId(user.getId());
+        loginAudit.setType(LoginAudit.TYPE_LOGIN);
+        loginAudit.setIp(clientIp);
+        loginAudit.setRegion(region);
+        loginAudit.setUserAgent(userAgent);
+        loginAudit.setDeviceType(parseDeviceType(userAgent));
+        loginAuditService.save(loginAudit);
+
+        //检查是否异地登录，如果是发送警告信息
+        // 原则：拿本次登录地区对比「最近一次已知登录地区」，不同则判定异地，发一条安全提醒。
+        // 地区为空（本机/内网 IP，ip2region 不收录）时无法比较，跳过检查。
+        if (region != null) {
+            // 1. 先走缓存：读上次登录地区
+            String lastRegion = readLastLoginRegion(user.getId());
+            if (lastRegion == null) {
+                // 2. 缓存未命中，回查数据库取该用户最近一条审计记录的地区。
+                //    若最近一次是注册记录（type=2，尚未产生过真正登录地区），忽略并跳过本次检查
+                LoginAudit lastLogin = loginAuditService.lambdaQuery()
+                        .eq(LoginAudit::getUserId, user.getId())
+                        .orderByDesc(LoginAudit::getId)
+                        .last("limit 1")
+                        .one();
+                if (lastLogin != null
+                        && lastLogin.getType() != null
+                        && lastLogin.getType() == LoginAudit.TYPE_LOGIN) {
+                    lastRegion = lastLogin.getRegion();
+                }
+            }
+
+            // 3. 两侧都有地区且不同，认定为异地登录，发一条安全提醒
+            if (lastRegion != null && !region.equals(lastRegion)) {
+                NotificationEvent warning = new NotificationEvent();
+                warning.setUserId(user.getId());
+                warning.setType("system");
+                warning.setTitle("异地登录提醒");
+                warning.setContent("您的账号于 "
+                        + cn.hutool.core.date.DateTime.now().toString("yyyy-MM-dd HH:mm:ss")
+                        + " 在 " + region + " 登录，若并非本人操作，请及时修改密码。");
+                warning.setLevel(1);
+                rocketMQTemplate.convertAndSend("life-mind-notification:LOGIN_WARNING", warning);
+                log.warn("检测到异地登录, userId={}, 上次地区={}, 本次地区={}",
+                        user.getId(), lastRegion, region);
+            }
+        }
+
+        //将这次登录的地址存入redis，提高检查异地登录的性能
+        redisTemplate.opsForValue().set(
+                "life-mind-account:"+user.getId()+":last-login",
+                region,30,
+                TimeUnit.DAYS
+        );
+
+        log.info("用户登录成功, userId={}, ip={}", user.getId(), clientIp);
 
         //封装返回对象，并返回给前端
         return new LoginResponse(jwtToken, rememberMe);
