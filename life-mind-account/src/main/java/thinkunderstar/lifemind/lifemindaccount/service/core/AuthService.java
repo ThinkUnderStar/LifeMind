@@ -83,4 +83,15 @@ public interface AuthService {
      * @param request              当前请求，用于解析客户端真实 IP 做限流
      */
     Result<Void> sendEmailCode(EmailCodeSendRequest emailCodeSendRequest, HttpServletRequest request);
+
+    /**
+     * 注销账号（软删除）。
+     *
+     * <p>逻辑删除 {@code user} 行（{@code deleted = 1}）并解绑身份关系，同时把令牌版本号 +1、
+     * 清掉权限与令牌版本缓存，使已签发的所有登录态一并作废，之后必须重新注册（同一用户名可复用）。
+     * 注销不发消息，只落一条 type=注销 的登录审计；审计记录不删，账号注销后仍保留半年。
+     *
+     * @param request 当前请求，用于解析客户端真实 IP / User-Agent 做审计与限流
+     */
+    Result<Void> deactivateAccount(HttpServletRequest request);
 }
