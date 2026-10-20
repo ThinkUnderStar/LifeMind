@@ -1,6 +1,7 @@
 package thinkunderstar.lifemind.lifemindaccount.service.core;
 
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.web.multipart.MultipartFile;
 import thinkunderstar.lifemind.lifemindaccount.common.Result;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindEmailRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindPhoneRequest;
@@ -101,6 +102,17 @@ public interface UserInfoService {
      * @param request               当前请求，用于解析客户端真实 IP 做限流
      */
     Result<Void> changeUsername(ChangeUsernameRequest changeUsernameRequest, HttpServletRequest request);
+
+    /**
+     * 修改头像：只作用于「当前登录用户」，不接收前端传来的用户 ID。
+     *
+     * <p>头像走文件上传，由前端以 multipart 表单提交。这里只搭接口骨架，
+     * 真正的落库（更新 {@code user.avatar}）、上传文件等实现由调用方自行完善。
+     *
+     * @param avatar 挑选的头像文件，可为空（此时按空文件处理，由实现决定是否报错）
+     * @param request 当前请求，用于解析客户端真实 IP 做限流
+     */
+    Result<Void> changeAvatar(MultipartFile avatar, HttpServletRequest request);
 
     /*
      * 修改密码三个入口的共同约定：

@@ -3,6 +3,7 @@ package thinkunderstar.lifemind.lifemindaccount.service.core.impl;
 import cn.hutool.core.date.DateTime;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.support.SFunction;
+import io.minio.*;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -13,6 +14,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 import thinkunderstar.lifemind.lifemindaccount.common.Result;
 import thinkunderstar.lifemind.lifemindaccount.common.ResultCode;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindEmailRequest;
@@ -28,6 +30,7 @@ import thinkunderstar.lifemind.lifemindaccount.entity.UserIdentity;
 import thinkunderstar.lifemind.lifemindaccount.event.NotificationEvent;
 import thinkunderstar.lifemind.lifemindaccount.exception.BusinessException;
 import thinkunderstar.lifemind.lifemindaccount.mapper.IdentityPermissionMapper;
+import thinkunderstar.lifemind.lifemindaccount.mapper.UserMapper;
 import thinkunderstar.lifemind.lifemindaccount.security.LifeMindUserDetails;
 import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.UserIdentityService;
@@ -38,12 +41,11 @@ import thinkunderstar.lifemind.lifemindaccount.util.IpUtils;
 import thinkunderstar.lifemind.lifemindaccount.util.RedisTokenBucketLimiter;
 import thinkunderstar.lifemind.lifemindaccount.util.ValidateUtils;
 
+import java.io.InputStream;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
-import java.util.Collection;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -165,30 +167,71 @@ public class UserInfoServiceImpl implements UserInfoService {
     private static final long PASSWORD_USER_CAPACITY = 5L;
     private static final double PASSWORD_USER_RATE = 0.05;
 
+    /**
+     * 头像体积上限：头像一般比反馈截图更小，按 2MB 收紧。
+     */
+    private static final long MAX_AVATAR_SIZE = 2L * 1024 * 1024;
+
+    /**
+     * 头像允许的常见图片格式，与反馈截图一致。
+     */
+    private static final Set<String> AVATAR_IMAGE_EXTENSIONS = Set.of(
+            "jpg", "jpeg", "png", "gif", "webp", "bmp");
+
+    /** 公共读桶 */
+    private static final String PUBLIC_BUCKET = "life-mind-public";
+
+    /** 公共读桶策略：允许匿名 s3:GetObject，%s 为桶名 */
+    private static final String BUCKET_PUBLIC_READ_POLICY =
+            "{\n" +
+                    "  \"Version\": \"2012-10-17\",\n" +
+                    "  \"Statement\": [\n" +
+                    "    {\n" +
+                    "      \"Effect\": \"Allow\",\n" +
+                    "      \"Principal\": {\"AWS\": [\"*\"]},\n" +
+                    "      \"Action\": [\"s3:GetObject\"],\n" +
+                    "      \"Resource\": [\"arn:aws:s3:::%s/*\"]\n" +
+                    "    }\n" +
+                    "  ]\n" +
+                    "}";
+
+    /**
+     * 修改头像的限流：按 IP、按账号两层，额度与改昵称、改密一致（共用同一限流桶）。
+     */
+    private static final long AVATAR_IP_CAPACITY = 10L;
+    private static final double AVATAR_IP_RATE = 0.2;
+    private static final long AVATAR_USER_CAPACITY = 5L;
+    private static final double AVATAR_USER_RATE = 0.05;
+
     private final UserService userService;
     private final UserIdentityService userIdentityService;
     private final IdentityPermissionMapper identityPermissionMapper;
+    private final UserMapper userMapper;
     private final RedisTemplate<Object, Object> redisTemplate;
     private final RedisTokenBucketLimiter rateLimiter;
     private final CaptchaVerifier captchaVerifier;
     private final PasswordEncoder passwordEncoder;
     private final RocketMQTemplate rocketMQTemplate;
+    private final MinioClient minioClient;
 
     public UserInfoServiceImpl(UserService userService,
                                UserIdentityService userIdentityService,
                                IdentityPermissionMapper identityPermissionMapper,
+                               UserMapper userMapper,
                                RedisTemplate<Object, Object> redisTemplate,
                                RedisTokenBucketLimiter rateLimiter,
                                CaptchaVerifier captchaVerifier,
-                               PasswordEncoder passwordEncoder, RocketMQTemplate rocketMQTemplate) {
+                               PasswordEncoder passwordEncoder, RocketMQTemplate rocketMQTemplate, MinioClient minioClient) {
         this.userService = userService;
         this.userIdentityService = userIdentityService;
         this.identityPermissionMapper = identityPermissionMapper;
+        this.userMapper = userMapper;
         this.redisTemplate = redisTemplate;
         this.rateLimiter = rateLimiter;
         this.captchaVerifier = captchaVerifier;
         this.passwordEncoder = passwordEncoder;
         this.rocketMQTemplate = rocketMQTemplate;
+        this.minioClient = minioClient;
     }
 
     @Override
@@ -367,6 +410,58 @@ public class UserInfoServiceImpl implements UserInfoService {
         // 账户名不参与 JWT 声明，也不参与权限判定：不重新签发令牌、不作废旧令牌，
         // 其他设备上的登录态不受影响。只是下次登录要用新账户名。
         log.info("修改账户名成功, userId={}", userId);
+        return Result.success();
+    }
+
+    @Override
+    public Result<Void> changeAvatar(MultipartFile avatar, HttpServletRequest request) {
+        // ========== 1. 判空 ==========
+        if (avatar == null || avatar.isEmpty()) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "头像文件不能为空");
+        }
+
+        // ========== 2. 取当前登录用户 + 限流 ==========
+        Long userId = currentUserId();
+        checkAvatarRateLimit(userId, request);
+
+        // ========== 3. 图片校验：文件名非空、常见图片后缀、体积不超过 2MB ==========
+        validateAvatarImage(avatar);
+
+        // 旧头像路径：先查出来，等新头像上传成功后再删，避免传新失败时旧头像也没了
+        User user = userService.getOne(
+                new LambdaQueryWrapper<User>()
+                        .eq(User::getId, userId)
+        );
+        String oldAvatarPath = user.getAvatar();
+
+        // 上传新的账户头像，成功后落库、再删旧头像
+        try (InputStream inputStream = avatar.getInputStream()) {
+            // 确保公共读桶存在且持有公开读策略（幂等：桶不存在则创建并设策略，存在也重新设一次）
+            ensurePublicBucket(PUBLIC_BUCKET);
+
+            String fileType = avatar.getOriginalFilename().substring(avatar.getOriginalFilename().lastIndexOf("."));
+            String objectName = "users/" + userId + "/avatar/" + UUID.randomUUID() + fileType;
+
+            minioClient.putObject(
+                    PutObjectArgs.builder()
+                            .bucket(PUBLIC_BUCKET)
+                            .object(objectName)
+                            .contentType(avatar.getContentType())
+                            .stream(inputStream, avatar.getSize(), -1)
+                            .build()
+            );
+
+            user.setAvatar("/minio/" + PUBLIC_BUCKET + "/" + objectName);
+            // 落库：user 是已存在的记录，用更新而不是插入
+            userService.updateById(user);
+
+            // 新头像已生效，再删旧头像；删除失败不阻断换头像
+            deleteOldAvatar(oldAvatarPath);
+        } catch (Exception e) {
+            log.error("头像上传失败, userId={}", userId, e);
+            throw new BusinessException(ResultCode.UPLOAD_ERROR, "账户头像上传失败");
+        }
+
         return Result.success();
     }
 
@@ -621,6 +716,90 @@ public class UserInfoServiceImpl implements UserInfoService {
     }
 
     /**
+     * 检查修改头像的限流：按 IP、按账号两层。
+     *
+     * @param userId  当前登录用户 ID
+     * @param request 当前请求，用于解析客户端真实 IP
+     */
+    private void checkAvatarRateLimit(Long userId, HttpServletRequest request) {
+        if (!rateLimiter.tryAcquireByIp(IpUtils.getClientIp(request), AVATAR_IP_CAPACITY, AVATAR_IP_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+        if (!rateLimiter.tryAcquireByUser(userId, AVATAR_USER_CAPACITY, AVATAR_USER_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+    }
+
+    /**
+     * 校验头像是否为合法的静态图片。
+     *
+     * <p>校验项：文件名非空、扩展名为常见图片格式（jpg/jpeg/png/gif/webp/bmp）、
+     * 体积不超过 2MB。调用方需保证文件非空。
+     *
+     * @param file 头像文件
+     */
+    private void validateAvatarImage(MultipartFile file) {
+        String filename = file.getOriginalFilename();
+        if (filename == null || filename.isBlank()) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "头像文件名不能为空");
+        }
+        String extension = filename.contains(".")
+                ? filename.substring(filename.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT)
+                : "";
+        if (!AVATAR_IMAGE_EXTENSIONS.contains(extension)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "头像仅支持常见图片格式（jpg/jpeg/png/gif/webp/bmp）");
+        }
+        if (file.getSize() > MAX_AVATAR_SIZE) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "头像不能超过2MB");
+        }
+    }
+
+    /**
+     * 确保公共读桶存在且持有公开读策略（幂等）。
+     *
+     * <p>桶不存在则创建并套上匿名可读策略；桶已存在也重新设一次策略，
+     * 防止桶是早先手动建成的私有桶，导致上传成功但匿名读不了。
+     */
+    private void ensurePublicBucket(String bucketName) throws Exception {
+        if (!minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucketName).build())) {
+            minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucketName).build());
+        }
+        minioClient.setBucketPolicy(SetBucketPolicyArgs.builder()
+                .bucket(bucketName)
+                .config(String.format(BUCKET_PUBLIC_READ_POLICY, bucketName))
+                .build());
+    }
+
+    /**
+     * 删除旧头像对象。
+     *
+     * <p>传入的是库里存的访问路径（形如 {@code /minio/life-mind-public/users/...}），
+     * 从路径里截出对象名；路径不含公共桶前缀时说明不是本桶对象，跳过不报错。
+     * 删除失败只记日志，不阻断换头像主流程。
+     *
+     * @param oldAvatarPath 旧头像访问路径，可为 null
+     */
+    private void deleteOldAvatar(String oldAvatarPath) {
+        if (oldAvatarPath == null) {
+            return;
+        }
+        int prefixIndex = oldAvatarPath.indexOf(PUBLIC_BUCKET + "/");
+        if (prefixIndex < 0) {
+            log.warn("旧头像路径不包含公共桶前缀, 跳过删除, path={}", oldAvatarPath);
+            return;
+        }
+        String oldObjectName = oldAvatarPath.substring(prefixIndex + PUBLIC_BUCKET.length() + 1);
+        try {
+            minioClient.removeObject(RemoveObjectArgs.builder()
+                    .bucket(PUBLIC_BUCKET)
+                    .object(oldObjectName)
+                    .build());
+        } catch (Exception e) {
+            log.warn("删除旧头像失败, object={}", oldObjectName, e);
+        }
+    }
+
+    /**
      * 检查账户名的修改冷却：一年只能改一次。
      *
      * <p>上次修改时间在 {@code user.username_change_time}：为空表示从未改过（注册不算一次修改），
@@ -727,8 +906,9 @@ public class UserInfoServiceImpl implements UserInfoService {
         }
 
         // ========== 7. 查重：拦「被其他账号占用」 ==========
-        // 绑定是账号当前为空、换绑是上面已确认新旧值不同，所以查到的记录必定属于其他账号
-        assertContactBindable(field, label, value);
+        // 绑定是账号当前为空、换绑是上面已确认新旧值不同，所以查到的记录必定属于其他账号；
+        // 若占用方是已注销（软删除）账号则清掉它的号码，让该号码可复用
+        assertContactBindable(phone, field, label, value);
 
         // ========== 8. 落库 ==========
         boolean updated;
@@ -1030,26 +1210,39 @@ public class UserInfoServiceImpl implements UserInfoService {
     }
 
     /**
-     * 校验手机号 / 邮箱没有被占用。
+     * 校验手机号 / 邮箱没有被占用；若仅被软删除账号占用，则清掉已注销账号的这个号码使其可复用。
      *
      * <p>调用前已经排除了「目标就是当前账号已绑的那个」这一种情况（绑定要求账号当前为空，
-     * 换绑要求新旧值不同），所以这里查到的任何一条记录都属于其他账号，一律拒绝。
+     * 换绑要求新旧值不同），所以这里查到的任何一条活跃账号记录都属于其他账号，一律拒绝。
      *
      * <p>用 list 而不是 one()：one() 在库中出现多条同号数据时会抛
      * {@code TooManyResultsException}，变成一个看不懂的 500，
      * 这里统一按「已被占用」拒绝更稳妥。
      *
+     * <p>被软删除（已注销）账号占用时不拒绝：注销账号的绑定资料失去意义，
+     * 且它占着唯一索引会让号码永远绑不上，直接清掉。
+     * lambdaQuery 受 {@code @TableLogic} 影响自动过滤 deleted=0，查不到注销账号，
+     * 所以清除走 Mapper 原生 SQL（见 {@code UserMapper.clearPhoneOfDeletedUser} 等）。
+     *
+     * @param phone 是否为手机号（true=phone，false=email）
      * @param field 待校验的字段（{@code user.phone} / {@code user.email}）
      * @param label 资料名，用于拼提示文案
      * @param value 待绑定的手机号 / 邮箱
      */
-    private void assertContactBindable(SFunction<User, String> field, String label, String value) {
+    private void assertContactBindable(boolean phone, SFunction<User, String> field, String label, String value) {
         List<User> owners = userService.lambdaQuery()
                 .eq(field, value)
                 .list();
 
         if (!owners.isEmpty()) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "该" + label + "已被其他账号绑定");
+        }
+
+        // 活跃账号不占用时，清掉可能被软删除账号占着的号码，让该号码可复用
+        if (phone) {
+            userMapper.clearPhoneOfDeletedUser(value);
+        } else {
+            userMapper.clearEmailOfDeletedUser(value);
         }
     }
 
