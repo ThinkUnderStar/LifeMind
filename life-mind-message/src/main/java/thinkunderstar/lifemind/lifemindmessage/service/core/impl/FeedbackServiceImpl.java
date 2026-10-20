@@ -7,6 +7,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import io.minio.*;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import thinkunderstar.lifemind.lifemindmessage.common.Result;
@@ -37,6 +38,7 @@ import java.util.UUID;
  */
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class FeedbackServiceImpl implements FeedbackService {
 
     private final FeedbackWrapperService feedbackWrapperService;
@@ -67,8 +69,8 @@ public class FeedbackServiceImpl implements FeedbackService {
     /** 反馈截图：最大体积 5MB */
     private static final long MAX_IMAGE_SIZE = 5L * 1024 * 1024;
 
-    /** 反馈截图存储桶：公共读桶，匿名可下载图片 */
-    private static final String FEEDBACK_IMAGE_BUCKET = "life-mind-public";
+    /** 公共读桶 */
+    private static final String PUBLIC_BUCKET = "life-mind-public";
 
     /** 公共读桶策略：允许匿名 s3:GetObject，%s 为桶名 */
     private static final String BUCKET_PUBLIC_READ_POLICY =
@@ -123,36 +125,27 @@ public class FeedbackServiceImpl implements FeedbackService {
 
         // 4. 如果有截图的话将截图存入minio中
         String objectName = null;
-        String bucketName = null;
         if (file != null && !file.isEmpty()) {
-            try {
+            try (InputStream inputStream = file.getInputStream()) {
                 String fileType = file.getOriginalFilename().substring(file.getOriginalFilename().lastIndexOf("."));
                 String fileName = UUID.randomUUID() + fileType;
-                bucketName = FEEDBACK_IMAGE_BUCKET;
 
-                if (!minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucketName).build())){
-                    minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucketName).build());
-                    minioClient.setBucketPolicy(SetBucketPolicyArgs.builder()
-                            .bucket(bucketName)
-                            .config(String.format(BUCKET_PUBLIC_READ_POLICY, bucketName))
-                            .build());
-                }
+                // 确保公共读桶存在且持有公开读策略（幂等）
+                ensurePublicBucket(PUBLIC_BUCKET);
 
                 objectName = "users/" + userId + "/feedback-images/" + fileName;
 
-                InputStream inputStream = file.getInputStream();
                 minioClient.putObject(
                         PutObjectArgs.builder()
-                                .bucket(bucketName)
+                                .bucket(PUBLIC_BUCKET)
                                 .contentType(file.getContentType())
-                                .stream(inputStream,file.getSize(),-1)
+                                .stream(inputStream, file.getSize(), -1)
                                 .object(objectName)
                                 .build()
                 );
-
-                inputStream.close();
-            }catch (Exception e){
-                throw new BusinessException(ResultCode.UPLOAD_ERROR,"反馈截图上传失败");
+            } catch (Exception e) {
+                log.error("反馈截图上传失败, userId={}", userId, e);
+                throw new BusinessException(ResultCode.UPLOAD_ERROR, "反馈截图上传失败");
             }
         }
 
@@ -161,7 +154,10 @@ public class FeedbackServiceImpl implements FeedbackService {
         feedback.setUserId(userId);
         feedback.setType(type);
         feedback.setContent(content);
-        feedback.setImages("/minio/" + bucketName + "/" + objectName);
+        // 没传截图时 images 存空，避免拼出 "/minio/life-mind-public/null"
+        feedback.setImages(file != null && !file.isEmpty()
+                ? "/minio/" + PUBLIC_BUCKET + "/" + objectName
+                : null);
         feedback.setContact(submitRequest.getContact());
         feedback.setStatus(0); // 初始待处理
         feedbackWrapperService.save(feedback);
@@ -201,6 +197,22 @@ public class FeedbackServiceImpl implements FeedbackService {
         if (file.getSize() > MAX_IMAGE_SIZE) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "反馈截图不能超过5MB");
         }
+    }
+
+    /**
+     * 确保公共读桶存在且持有公开读策略（幂等）。
+     *
+     * <p>桶不存在则创建并套上匿名可读策略；桶已存在也重新设一次策略，
+     * 防止桶是早先手动建成的私有桶，导致上传成功但匿名读不了。
+     */
+    private void ensurePublicBucket(String bucketName) throws Exception {
+        if (!minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucketName).build())) {
+            minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucketName).build());
+        }
+        minioClient.setBucketPolicy(SetBucketPolicyArgs.builder()
+                .bucket(bucketName)
+                .config(String.format(BUCKET_PUBLIC_READ_POLICY, bucketName))
+                .build());
     }
 
     @Override

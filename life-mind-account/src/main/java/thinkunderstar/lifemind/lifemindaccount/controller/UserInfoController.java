@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 import thinkunderstar.lifemind.lifemindaccount.common.Result;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindEmailRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.BindPhoneRequest;
@@ -174,6 +175,19 @@ public class UserInfoController {
             HttpServletRequest request
     ) {
         return userInfoService.changePasswordByEmail(changePasswordByEmailRequest, request);
+    }
+
+    /**
+     * 修改头像：头像以 multipart 表单上传，表单字段名 {@code avatar}。
+     *
+     * <p>只作用于当前登录用户（身份由网关解析 JWT 后注入请求头）。
+     */
+    @PostMapping("/avatar")
+    public Result<Void> changeAvatar(
+            @RequestParam("avatar") MultipartFile avatar,
+            HttpServletRequest request
+    ) {
+        return userInfoService.changeAvatar(avatar, request);
     }
 
     /**
