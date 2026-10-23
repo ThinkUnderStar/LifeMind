@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # =================== nacos 服务配置参数 =======================
     NACOS_SERVER: str = "127.0.0.1:8848"
-    NACOS_NAMESPACE: str = "public"
+    NACOS_NAMESPACE: str = ""
     NACOS_GROUP: str = "DEFAULT_GROUP"
 
     # ==================== Pydantic 配置加载规则 ====================

@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncContextManager
 
+import yaml
 from fastapi import FastAPI
 from v2.nacos import RegisterInstanceParam, DeregisterInstanceParam, ConfigParam
 
@@ -36,7 +37,20 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
     )
 
     remote_config = await nacos_config_client.get_config(config_param)
-    apply_remote_config(remote_config)
+    if remote_config:
+        try:
+            nacos_agent_config = yaml.safe_load(remote_config)
+            for key, value in nacos_agent_config.items():
+                upper = str(key).upper()
+                if hasattr(settings, upper):
+                    setattr(settings, upper, value)
+
+            print("从nacos拉取agent服务配置成功")
+
+        except yaml.YAMLError as e:
+            print(f"❌ YAML 格式错误，解析失败: {e}")
+    else:
+        print("⚠️ Nacos 上没找到该配置文件，将使用默认值")
 
     #构建监听器，动态更新配置
     await nacos_config_client.add_listener(
