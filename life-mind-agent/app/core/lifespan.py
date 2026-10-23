@@ -3,9 +3,9 @@ from contextlib import asynccontextmanager
 from typing import AsyncContextManager
 
 from fastapi import FastAPI
-from v2.nacos import RegisterInstanceParam, DeregisterInstanceParam
+from v2.nacos import RegisterInstanceParam, DeregisterInstanceParam, ConfigParam
 
-from app.config.nacos_config import get_nacos_service
+from app.config.nacos_config import get_nacos_service, get_nacos_config, on_config_changed, apply_remote_config
 from app.config.settings import settings
 from app.util.server_tool import get_local_ip
 
@@ -24,8 +24,29 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
     """
 
     logger = logging.getLogger(__name__)
-    nacos_name_client = await get_nacos_service()
     local_ip = get_local_ip()
+
+    #拉取配置
+    nacos_config_client = await get_nacos_config()
+
+    # 构建配置参数，data_id 和 group 需与 Nacos 控制台一致
+    config_param = ConfigParam(
+        data_id="agent.yaml",
+        group="LIFE_MIND_CONFIG"
+    )
+
+    remote_config = await nacos_config_client.get_config(config_param)
+    apply_remote_config(remote_config)
+
+    #构建监听器，动态更新配置
+    await nacos_config_client.add_listener(
+        data_id="agent.yaml",
+        group="LIFE_MIND_CONFIG",
+        listener=on_config_changed
+    )
+
+    #注册服务
+    nacos_name_client = await get_nacos_service()
 
     # 构建注册参数
     register_param = RegisterInstanceParam(
