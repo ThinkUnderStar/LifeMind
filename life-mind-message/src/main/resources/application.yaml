@@ -7,7 +7,7 @@ spring:
       server-addr: 127.0.0.1:18848
       discovery:
         group: LIFE_MIND_GROUP
-        ephemeral: false
+        ephemeral: true
 
       config:
         file-extension: yaml
