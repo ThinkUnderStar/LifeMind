@@ -61,9 +61,12 @@ def apply_remote_config(config: str):
         print("⚠️ Nacos 上没找到该配置文件，将使用默认值")
 
 
-# 监听器执行逻辑
-def on_config_changed(config):
+# 监听回调函数
+async def on_config_changed(tenant: str, group: str, data_id: str, content: str):
     """这是当 Nacos 配置变动时，SDK 自动触发的回调函数"""
-    print(f"\n🔄 检测到 Nacos 配置变更！最新内容:\n{config['content']}")
-    # 在回调里再次调用覆盖方法
-    apply_remote_config(config['content'])
+    print(f"\n🔄 检测到 Nacos 配置变更！")
+    print(f"Namespace: {tenant}, Group: {group}, DataId: {data_id}")
+    print(f"最新内容:\n{content}")
+
+    # 直接把纯字符串 content 传给覆盖方法
+    apply_remote_config(content)
