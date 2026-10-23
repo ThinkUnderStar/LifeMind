@@ -8,6 +8,11 @@ class Settings(BaseSettings):
     继承自 Pydantic 的 BaseSettings，具备自动从环境变量和 .env 文件中
     读取配置并覆盖默认值的能力，同时自带严格的类型校验。
     """
+    # =================== server 相关配置参数 ======================
+    APP_NAME: str = "life-mind-agent"
+    SERVER_PORT: int = 8004
+
+    # =================== nacos 服务配置参数 =======================
     NACOS_SERVER: str = "127.0.0.1:8848"
     NACOS_NAMESPACE: str = "public"
     NACOS_GROUP: str = "DEFAULT_GROUP"

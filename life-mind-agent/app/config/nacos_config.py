@@ -1,4 +1,4 @@
-from v2.nacos import ClientConfigBuilder
+from v2.nacos import ClientConfigBuilder, NacosNamingService
 
 from app.config.settings import settings
 
@@ -10,3 +10,11 @@ client_config = (
     .namespace_id(settings.NACOS_NAMESPACE)
     .build()
 )
+
+async def get_nacos_service() -> NacosNamingService:
+    """
+    获取nacos服务的连接对象
+
+    :return: nacos的服务连接对象
+    """
+    return await NacosNamingService.create_naming_service(client_config)
