@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
 from app.api.v1.router import api_v1_router
-from app.config.settings import settings
+from app.core.settings import settings
 from app.core.lifespan import lifespan
 
 app = FastAPI(lifespan=lifespan)

@@ -6,8 +6,9 @@ import yaml
 from fastapi import FastAPI
 from v2.nacos import RegisterInstanceParam, DeregisterInstanceParam, ConfigParam
 
-from app.config.nacos_config import get_nacos_service, get_nacos_config, on_config_changed, apply_remote_config
-from app.config.settings import settings
+from app.agent.llm import create_chat_llm
+from app.core.nacos_client import get_nacos_service, get_nacos_config, on_config_changed
+from app.core.settings import settings
 from app.util.server_tool import get_local_ip
 
 
@@ -27,6 +28,7 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
     logger = logging.getLogger(__name__)
     local_ip = get_local_ip()
 
+    # ============================== nacos配置拉取 ==================================
     #拉取配置
     nacos_config_client = await get_nacos_config()
 
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
         listener=on_config_changed
     )
 
+    # ============================= nacos服务注册 =================================
     #注册服务
     nacos_name_client = await get_nacos_service()
 
