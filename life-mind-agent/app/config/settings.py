@@ -11,11 +11,19 @@ class Settings(BaseSettings):
     # =================== server 相关配置参数 ======================
     APP_NAME: str = "life-mind-agent"
     SERVER_PORT: int = 8004
+    SERVER_PATH: str = "/life-mind/agent"
 
     # =================== nacos 服务配置参数 =======================
     NACOS_SERVER: str = "127.0.0.1:8848"
     NACOS_NAMESPACE: str = ""
     NACOS_GROUP: str = "DEFAULT_GROUP"
+
+    # =================== agent 相关配置 ==========================
+    # 与用户交互的模型配置
+    CHAT_MODEL_NAME: str = "chat-model"
+    CHAT_MODEL_TEMPERATURE: float = 1.0
+    CHAT_MODEL_BASE_URL: str = ""
+    CHAT_MODEL_API_KEY: str = ""
 
     # ==================== Pydantic 配置加载规则 ====================
     model_config = SettingsConfigDict(
