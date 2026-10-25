@@ -3,7 +3,6 @@ import logging
 import yaml
 from v2.nacos import ClientConfigBuilder, NacosNamingService, NacosConfigService
 
-from app.agent.llm import create_chat_llm
 from app.core.settings import settings
 
 # 构建连接 Nacos 服务端的客户端对象
