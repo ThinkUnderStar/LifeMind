@@ -6,9 +6,11 @@ import yaml
 from fastapi import FastAPI
 from v2.nacos import RegisterInstanceParam, DeregisterInstanceParam, ConfigParam
 
-from app.agent.llm import create_chat_llm
 from app.core.nacos_client import get_nacos_service, get_nacos_config, on_config_changed
 from app.core.settings import settings
+from app.db.milvus.client import init_milvus_client
+from app.db.mysql.session import init_mysql_db
+from app.db.postgresql.session import connect_postgresql_db, close_postgresql_db
 from app.util.server_tool import get_local_ip
 
 
@@ -77,11 +79,22 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
     await nacos_name_client.register_instance(request=register_param)
     print(f"🚀 服务 [{settings.APP_NAME}] 注册成功: {local_ip}:{settings.SERVER_PORT}")
 
+    # ========================= 初始化mysql数据库连接 ==============================
+    init_mysql_db()
+
+    # ===================== 初始化postgresql数据库的连接 ===========================
+    await connect_postgresql_db()
+
+    # =========================== 初始化milvus客户端 ==============================
+    init_milvus_client()
+
+    # ========== 服务运行 ==========
+    # 卡住进程，以此来控制一些组件的连接的生命周期
     yield
 
     logger.info("🔌 正在关闭系统依赖...")
 
-    # 1. 注销服务 (Naming)
+    # ======================= 注销nacos注册的服务 ===============================
     await nacos_name_client.deregister_instance(DeregisterInstanceParam(
         service_name=settings.APP_NAME,
         group_name=settings.NACOS_GROUP,
@@ -89,3 +102,6 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
         port=settings.SERVER_PORT
     ))
     logger.info("✅ Nacos 服务已注销")
+
+    # ========================关闭postgresql连接 =================================
+    await close_postgresql_db()

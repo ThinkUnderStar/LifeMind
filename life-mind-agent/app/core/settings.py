@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     NACOS_NAMESPACE: str = ""
     NACOS_GROUP: str = "DEFAULT_GROUP"
 
+    # =================== mysql 数据库配置参数 ======================
+    MYSQL_URL: str = ""
+
+    # ================== postgresql 相关配置 ======================
+    POSTGRES_URL: str = ""
+
+    # =============== milvus 向量数据库相关配置 =====================
+    MILVUS_URI: str = ""
+    MILVUS_TOKEN: str = ""
+    MILVUS_DB_NAME: str = ""
+    MILVUS_DIMENSION: int = 2560
+
     # =================== agent 相关配置 ==========================
     # 与用户交互的模型配置
     CHAT_MODEL_NAME: str = "chat-model"
