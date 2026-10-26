@@ -1,0 +1,72 @@
+############################################################
+# LifeMind 统一忽略规则（全仓库仅此一份，各模块不再单独维护）
+# 说明：不带前导斜杠的模式（如 target/、build/）在任何层级都匹配，
+#      因此可以直接覆盖 life-mind-account / -gateway / -message / -agent。
+############################################################
+
+# ============ AI 助手工作区数据 ============
+.workbuddy/
+
+# ============ 操作系统 ============
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============ 本地敏感配置（密钥、密码统一放 Nacos，禁止提交） ============
+.env
+.env.*
+!.env.example
+*.local.yaml
+*.local.yml
+*-local.yaml
+*-local.yml
+
+# ============ IntelliJ IDEA ============
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# ============ Eclipse / STS ============
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+# ============ NetBeans ============
+nbproject/private/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# ============ VS Code / 其他编辑器 ============
+.vscode/
+*.swp
+
+# ============ Java / Maven 构建产物 ============
+target/
+out/
+build/
+dist/
+*.class
+HELP.md
+**/.mvn/wrapper/maven-wrapper.jar
+
+# ============ Python 缓存与产物 ============
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# ============ 日志与临时文件 ============
+*.log
+logs/
+*.tmp
+*.bak
+*.orig
+*.rej
