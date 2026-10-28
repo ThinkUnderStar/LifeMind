@@ -37,6 +37,21 @@ class Settings(BaseSettings):
     CHAT_MODEL_BASE_URL: str = ""
     CHAT_MODEL_API_KEY: str = ""
 
+    # =================== RAG 相关配置 =====================
+    # 文本切分相关配置
+    SPLIT_CHUNK_SIZE: int = 512
+    SPLIT_CHUNK_OVERLAP: int = 64
+    # 嵌入模型相关配置
+    EMBEDDING_MODEL: str = ""
+    EMBEDDING_CACHE_PATH: str = ""
+    # 精排相关配置
+    RERANKER_MODEL: str = ""
+    RERANKER_TOP_N: int = 10
+    # 摘要相关配置
+    EXTRACTOR_MODEL: str = ""
+    # 查询变体相关配置
+    MULTI_QUERY_MODEL: str = ""
+
     # ==================== Pydantic 配置加载规则 ====================
     model_config = SettingsConfigDict(
         env_file=".env",
