@@ -25,7 +25,7 @@ async def llm_memory_processor(message: ChatMessageEntity) -> List[Document]:
          document = Document(
             page_content=message.content,
             metadata={
-                "id": message.id,
+                "message_id": message.id,
                 "conversation_id": message.conversation_id,
                 "role": message.role,
                 "status": message.status,
@@ -45,12 +45,12 @@ async def llm_memory_processor(message: ChatMessageEntity) -> List[Document]:
             Document(
                 page_content=content,
                 metadata={
-                    "id": message.id,
+                    "message_id": message.id,
                     "conversation_id": message.conversation_id,
                     "role": message.role,
                     "status": message.status,
-                    "create_time": message.create_time,
-                    "update_time": message.update_time,
+                    "create_time": str(message.create_time),
+                    "update_time": str(message.update_time),
                 }
             )
         )
