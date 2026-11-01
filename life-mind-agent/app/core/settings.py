@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     MILVUS_DB_NAME: str = ""
     MILVUS_DIMENSION: int = 2560
 
+    # =================== 记忆相关配置 ==========================
+    # 会话记忆统一存放的 collection，所有用户共用一张表，靠 user_id / conversation_id 过滤
+    SESSION_MEMORY_COLLECTION: str = "life_mind_session_memory"
+
     # =================== agent 相关配置 ==========================
     # 与用户交互的模型配置
     CHAT_MODEL_NAME: str = "chat-model"
