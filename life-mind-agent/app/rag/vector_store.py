@@ -16,6 +16,8 @@ async def vector_store(embed: List[Dict], collection_name: str) -> None:
     Args:
         embed: 每项含 text / vector 及若干 metadata 字段，
                字段名必须与 collection schema 严格一致，多或少都会整批写入失败。
+               主键由 Milvus 生成（auto_id），行数据里不要带主键字段，
+               否则 insert 会因为「主键不该由外部提供」而报错。
         collection_name: 目标 collection，通常按用户或会话隔离。
 
     Returns:
