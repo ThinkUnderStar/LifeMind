@@ -23,7 +23,6 @@ graph.add_node("save_ai_session_memory", save_ai_session_memory)
 graph.add_edge(START, "relevant_user_memories")
 graph.add_edge("relevant_user_memories", "save_human_session_memory")
 graph.add_edge("save_human_session_memory", "llm_node")
-# llm_node 用 Command 控制走向：有工具调用去 run_tool，无工具调用直接去 save_ai_session_memory
 graph.add_edge("save_ai_session_memory", END)
 
 
