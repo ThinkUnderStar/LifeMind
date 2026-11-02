@@ -41,6 +41,7 @@ from app.rag.document_processor import llm_memory_processor
 from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
 from app.schemas.graph.state import State
+from app.util.any_to_str import user_memories_to_str
 
 logger = logging.getLogger(__name__)
 
@@ -250,8 +251,53 @@ async def _save_session_memory(
 
 
 async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
-    # TODO 全量注入永久记忆
-    return {"messages": [SystemMessage(content=prompt, id=old_system.id)]}
+    """
+    检索用户级长期记忆，全量注入系统提示词。
+
+    位置：图里第一个节点（START 直连），必须早于 llm_node，且与 llm_node 之间不夹会改 messages 的节点。
+    它替换 messages[0] 的 SystemMessage，模型这一轮调用才会读到最新的用户记忆。
+
+    注入方式：从 PG store 的 ("users_memory", user_id) 命名空间把记忆全量取出，拼成一段文本填进
+    SYSTEM_PROMPT_TEMPLATE 的 {memories}，再用原 SystemMessage 的 id 写回 messages。
+    不做语义检索（store 未配置 index_config 时 query 会被忽略），注入的是该用户当前全部记忆。
+
+    前置条件缺失（messages[0] 不是 SystemMessage、config 里没有 user_id）不算异常：
+    只记日志并返回 {}，系统提示词保持接口服务给的那份，对话照常继续。
+
+    Note:
+        1. 写回时沿用 old_system.id 是硬要求：add_messages 按 id 覆盖，id 变了会追加出第二条
+           SystemMessage，模型会同时看到两份互相冲突的系统提示。
+        2. asearch 不带 query 时实际是 ORDER BY updated_at DESC LIMIT 1000，超过 1000 条最早的
+           记忆会被静默丢弃，不是严格意义的「全量」；要真全量得按 offset 分页。
+        3. 这里没有 try/except：store 异常会直接冒到全局异常处理器，整轮对话失败，
+           与「记忆读失败不影响回答」的 fail-open 约定相反。
+        4. user_id 用 == "" 判空判不出 None，显式传 None 时会往下拼出 ("users_memory", "None")
+           这个命名空间，表现是静默读不到任何记忆而不是报错。
+        5. ainvoke 返回的是 StringPromptValue 而非 str，必须 to_string()，
+           直接塞进 SystemMessage(content=...) 会抛 pydantic ValidationError。
+
+    :param state: 当前图状态，messages[0] 应是接口服务初始化的 SystemMessage
+    :param config: 运行时配置，需带 configurable.user_id
+    :return: 状态更新字典；注入成功时是 {"messages": [替换后的 SystemMessage]}，跳过时是 {}
+    """
+    old_system = state.messages[0]
+    if not isinstance(old_system, SystemMessage):
+        logger.error("第一条消息不是系统提示此")
+        return {}
+
+    configurable = config.get("configurable", {})
+    user_id = configurable.get("user_id","")
+    if user_id == "":
+        logger.error("未传入user_id")
+        return {}
+
+    name_space = ("users_memory",str(user_id))
+    items = await get_store().asearch(name_space, limit=1000)
+    user_memories = user_memories_to_str(items, with_key=True, max_chars=None)
+
+    prompt = await SYSTEM_PROMPT_TEMPLATE.ainvoke({"memories": user_memories})
+
+    return {"messages": [SystemMessage(content=prompt.to_string(), id=old_system.id)]}
 
 
 async def llm_node(state: State) -> Command:
@@ -272,6 +318,7 @@ async def llm_node(state: State) -> Command:
     response = None
     chat_llm_with_tools = ChatLlmWithToolsManager.get_chat_llm_with_tools()
     async for chunk in chat_llm_with_tools.astream(state.messages):
+        # 这边的AIMessage对象相加等价于content拼接
         response = chunk if response is None else response + chunk
 
     if response is None:

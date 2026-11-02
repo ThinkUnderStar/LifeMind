@@ -18,12 +18,11 @@ graph.add_node("llm_node", llm_node)
 graph.add_node("save_ai_session_memory", save_ai_session_memory)
 
 #创建边
-# 用户消息先落记忆再进模型：先写再答，后面节点抛异常也不会丢用户说过的话
-graph.add_edge(START, "save_human_session_memory")
-# 记忆注入必须在 llm_node 之前：它替换 messages[0] 的 SystemMessage，
-# 模型这次调用才会读到最新的用户记忆
-graph.add_edge("save_human_session_memory", "relevant_user_memories")
-graph.add_edge("relevant_user_memories", "llm_node")
+# 先注入用户记忆再落库：relevant_user_memories 替换 messages[0] 的 SystemMessage，
+# 之后保存用户消息、调用模型时，整个 state 都已带最新记忆
+graph.add_edge(START, "relevant_user_memories")
+graph.add_edge("relevant_user_memories", "save_human_session_memory")
+graph.add_edge("save_human_session_memory", "llm_node")
 # llm_node 用 Command 控制走向：有工具调用去 run_tool，无工具调用直接去 save_ai_session_memory
 graph.add_edge("save_ai_session_memory", END)
 
