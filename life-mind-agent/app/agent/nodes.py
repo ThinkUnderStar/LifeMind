@@ -292,7 +292,7 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
         return {}
 
     name_space = ("users_memory",str(user_id))
-    items = await get_store().asearch(name_space, limit=1000)
+    items = await get_store().asearch(name_space, limit=200)
     user_memories = user_memories_to_str(items, with_key=True, max_chars=None)
 
     prompt = await SYSTEM_PROMPT_TEMPLATE.ainvoke({"memories": user_memories})
