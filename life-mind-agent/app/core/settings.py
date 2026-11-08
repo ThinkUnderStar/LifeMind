@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     # 文本切分相关配置
     SPLIT_CHUNK_SIZE: int = 512
     SPLIT_CHUNK_OVERLAP: int = 64
+    # 检索相关配置
+    # 单查询召回的候选条数：要比最终送 LLM 的条数大得多，否则阈值一筛就没东西可精排
+    RETRIEVE_TOP_K: int = 40
+    # 原始余弦相似度下限：低于它的候选直接丢弃，不参与精排
+    # 值域是 [-1, 1]，中文 embedding 常见分档：无关 ≤0.35、相关 0.5+
+    RETRIEVE_SCORE_THRESHOLD: float = 0.4
+    # 最终送进大模型的条数：再多只涨 token 成本，对答案质量的边际收益很低
+    RETRIEVE_FINAL_TOP_K: int = 6
     # 嵌入模型相关配置
     EMBEDDING_MODEL: str = ""
     EMBEDDING_CACHE_PATH: str = ""
