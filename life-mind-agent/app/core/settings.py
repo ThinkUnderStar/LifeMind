@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     RETRIEVE_SCORE_THRESHOLD: float = 0.4
     # 最终送进大模型的条数：再多只涨 token 成本，对答案质量的边际收益很低
     RETRIEVE_FINAL_TOP_K: int = 6
+    # 阈值把候选全清空时是否兜底：开启后「问了就一定有东西可答」，
+    # 代价是与知识库无关的问题也会拿到几条最相近的切片，模型可能硬答
+    RETRIEVE_FALLBACK_ON_EMPTY: bool = False
+    # 兜底取几条：不再应用阈值，纯按相似度取最相近的若干块
+    RETRIEVE_FALLBACK_TOP_K: int = 10
     # 嵌入模型相关配置
     EMBEDDING_MODEL: str = ""
     EMBEDDING_CACHE_PATH: str = ""
