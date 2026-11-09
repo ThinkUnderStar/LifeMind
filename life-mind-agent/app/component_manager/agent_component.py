@@ -13,6 +13,7 @@ from typing import Tuple
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 
+from app.agent.tools import save_user_memory
 from app.core.settings import settings
 
 
@@ -109,7 +110,8 @@ class ChatLlmWithToolsManager:
             chat_llm = ChatLlmManager.get_chat_llm()
             # 工具集暂为空，待注册；bind 阶段不报错，但请求时 tools=[] 会被多数接口拒绝
             chat_llm_with_tools = chat_llm.bind_tools([
-
+                # 保存为用户级记忆
+                save_user_memory,
             ])
             # 整体替换而非新增，缓存只留当前配置一份
             cls._cache = {sig: chat_llm_with_tools}

@@ -36,7 +36,7 @@ USER_MEMORY_ITEM_MAX_CHARS = 500
 USER_MEMORY_MAX_ITEMS = 200
 
 
-@tool
+@tool(name_or_callable="save_user_memory")
 async def save_user_memory(content: str, config: RunnableConfig) -> str:
     """
     把关于用户的一条长期信息写入用户级记忆，跨会话长期生效。

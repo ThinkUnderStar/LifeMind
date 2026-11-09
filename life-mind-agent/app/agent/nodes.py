@@ -22,11 +22,12 @@ Agent 图节点集合。
 """
 import asyncio
 import logging
-from typing import List
+from typing import List, Dict
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import Command
+
+from langgraph.types import Command, interrupt
 from pymilvus import CollectionSchema, DataType, FieldSchema
 from pymilvus.milvus_client import IndexParams
 
@@ -42,6 +43,8 @@ from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
 from app.schemas.graph.state import State
 from app.util.any_to_str import user_memories_to_str
+
+from app.agent.tools import save_user_memory
 
 logger = logging.getLogger(__name__)
 
@@ -376,3 +379,71 @@ async def save_ai_session_memory(state: State, config: RunnableConfig) -> dict:
         role 字段区分 user / assistant，检索时才能按角色过滤（例如只召回用户自己的话）。
     """
     return await _save_session_memory(state, config, role="assistant", message_type=AIMessage)
+
+async def run_tool(state: State, config: RunnableConfig) -> Dict:
+    """
+    执行上一轮模型给出的工具调用，把每个结果包成 ToolMessage 回填到消息列表。
+
+    位置：llm_node 判断有 tool_calls 时 goto 到这里，执行完再回到 llm_node，
+    所以工具轮次可以连续多轮，直到模型不再要求调用工具为止。
+
+    Args:
+        state: 图状态，messages 的最后一条必须是带 tool_calls 的 AIMessage。
+        config: 运行时配置，原样转交给工具。必须传，否则工具取不到 configurable.user_id，
+                只会静默返回「未取到当前用户身份」，不报错也不落库。
+
+    Returns:
+        dict: {"messages": [ToolMessage, ...]}，每个 tool_call 一条，顺序与调用顺序一致。
+
+    Note:
+        1. 确认环节用 interrupt 实现，前端 resume 必须回 {"choice": ...}：
+           approve 按原参数执行、reject 不执行、edit 时取同级的 "edit" 字段替换内容。
+           整个节点没有 try/except，resume 回来的不是 dict 会直接抛 TypeError。
+        2. 未知工具不抛异常，只回一条说明：让模型知道这个工具不存在，
+           比让整轮请求失败可控。
+        3. 已知隐患：interrupt 在 for 循环里，而循环体内有写入副作用。resume 会从节点开头重放，
+           一次返回多个 tool_call 时，前面已执行的工具会被重复执行（同一条记忆会写两次）。
+        4. ToolMessage 的 tool_call_id 必须与 tool_call 的 id 严格对应，
+           少回一条，下一轮上游就会以「tool_calls 没有对应响应」拒绝继续对话。
+    """
+    last_message = state.messages[-1]
+    last_ai_message = last_message if isinstance(last_message ,AIMessage) else None
+    messages = []
+
+    if not last_ai_message:
+        logger.info("工具运行节点获取到的最后一条消息对象不为AI发的消息")
+        return {}
+
+    tool_calls = last_ai_message.tool_calls
+    for tool_call in tool_calls:
+        tool_id = tool_call.get("id")
+        tool_name = tool_call.get("name")
+        tool_args = tool_call.get("args")
+
+        # 调用用户级记忆保存工具
+        if tool_name == "save_user_memory":
+            user_choice = interrupt({
+                "question": f"是否同意将:\n {tool_args["content"]} \n添加进用户级记忆？",
+                "options": ["approve", "reject", "edit"]
+            })
+
+            if user_choice["choice"] == "approve":
+
+                result = await save_user_memory.ainvoke(tool_args, config=config)
+            elif user_choice["choice"] == "reject":
+
+                result = "用户拒绝将该内容添加进用户级记忆"
+            elif user_choice["choice"] == "edit":
+
+                result = await save_user_memory.ainvoke({"content": user_choice["edit"]}, config=config)
+            else:
+
+                result = "用户的选择异常，不符合规范"
+
+            messages.append(ToolMessage(tool_call_id=tool_id, content=result))
+
+        # 无匹配工具的兜底操作
+        else:
+            messages.append(ToolMessage(tool_call_id=tool_id,content="工具库中并没有你想调用的工具"))
+
+    return {"messages": messages}
