@@ -27,12 +27,17 @@ async def rag_search(question: str, collection_name: str) -> List[Document]:
 
     :param question: 用户问题原文，不做预处理（改写由多查询检索器负责）
     :param collection_name: 目标 collection
-    :return: 精排后的文档列表，最多 RETRIEVE_FINAL_TOP_K 条；无候选或无一条通过阈值时返回空列表
+    :return: 精排后的文档列表，最多 RETRIEVE_FINAL_TOP_K 条；
+             无一条通过阈值且关闭兜底时返回空列表
 
     Note:
         不挂 LLMChainExtractor：它给每条命中块各调一次小模型做抽取，
         3B 级模型经常漏句或改写，抽掉的往往正是答案句，代价是 N 次串行调用。
         压缩交给"阈值过滤 + 精排"完成，纯规则、零模型调用。
+
+        阈值清空候选时按 RETRIEVE_FALLBACK_ON_EMPTY 决定要不要兜底：
+        开启后取最相近的 RETRIEVE_FALLBACK_TOP_K 条，好处是"问了总有东西可答"，
+        代价是无关问题也能捞到几条切片，模型有概率硬答。
     """
     milvus_client = get_milvus_client()
     # 集合要先 load 才能搜索，必须放 try 外面：load 失败没有可释放的资源
@@ -69,8 +74,17 @@ async def rag_search(question: str, collection_name: str) -> List[Document]:
             logger.warning("多查询扩展失败，降级为单查询：%s: %s", type(e).__name__, e)
             candidates = await retriever.ainvoke(question)
 
+        # 阈值可能把所有候选都筛掉：知识库确实没有相关内容，或者块切得太碎导致分数被稀释
+        if not candidates and settings.RETRIEVE_FALLBACK_ON_EMPTY:
+            # 兜底分支不再比阈值，纯按相似度取最相近的若干块，让模型至少有东西可参考
+            candidates = await vector_store.asimilarity_search(question, k=settings.RETRIEVE_FALLBACK_TOP_K)
+            logger.info(
+                "阈值 %.2f 无命中，兜底取最相近 %s 条 collection=%s 实际 %s 条",
+                settings.RETRIEVE_SCORE_THRESHOLD, settings.RETRIEVE_FALLBACK_TOP_K, collection_name, len(candidates),
+            )
+
         if not candidates:
-            logger.info("rag 无候选通过阈值 %.2f collection=%s", settings.RETRIEVE_SCORE_THRESHOLD, collection_name)
+            logger.info("rag 无候选且未开兜底 collection=%s", collection_name)
             return []
 
         # 精排只在候选上跑：交叉编码器逐条推理，条数直接决定耗时
