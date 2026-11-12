@@ -11,10 +11,12 @@ Agent 组件：聊天大模型。
 from typing import Tuple
 
 from langchain_core.runnables import Runnable
+from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 from app.agent.tools import save_user_memory
 from app.core.settings import settings
+from app.schemas.graph.output import GateOutput
 
 
 def _create_chat_llm() -> ChatOpenAI:
@@ -117,3 +119,24 @@ class ChatLlmWithToolsManager:
             cls._cache = {sig: chat_llm_with_tools}
 
         return cls._cache[sig]
+
+class GateLlmManager:
+    _cache: dict[str, Runnable] = {}
+
+    @classmethod
+    def get_gate_llm(cls) -> Runnable:
+
+        sig = settings.GATE_MODEL_NAME
+
+        if sig not in cls._cache:
+            gate_llm = ChatOllama(
+                model=settings.GATE_MODEL_NAME,
+                temperature=0
+            )
+            # 模型结构化输出
+            gate_llm_structured = gate_llm.with_structured_output(schema=GateOutput)
+
+            cls._cache = {sig: gate_llm_structured}
+
+        return cls._cache[sig]
+

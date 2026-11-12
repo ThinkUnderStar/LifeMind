@@ -31,13 +31,14 @@ from langgraph.types import Command, interrupt
 from pymilvus import CollectionSchema, DataType, FieldSchema
 from pymilvus.milvus_client import IndexParams
 
-from app.agent.prompts import SYSTEM_PROMPT_TEMPLATE
-from app.component_manager.agent_component import ChatLlmWithToolsManager
+from app.agent.prompts import VIOLATION_REPLY
+from app.component_manager.agent_component import ChatLlmWithToolsManager, GateLlmManager
 from app.core.settings import settings
 from app.db.milvus.client import get_milvus_client
 from app.db.mysql import ChatMessageEntity
 from app.db.mysql.session import session_scope
 from app.db.postgresql.session import get_store
+from app.rag import rag_flow
 from app.rag.document_processor import llm_memory_processor
 from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
@@ -298,9 +299,7 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
     items = await get_store().asearch(name_space, limit=200)
     user_memories = user_memories_to_str(items, with_key=True, max_chars=None)
 
-    prompt = await SYSTEM_PROMPT_TEMPLATE.ainvoke({"memories": user_memories})
-
-    return {"messages": [SystemMessage(content=prompt.to_string(), id=old_system.id)]}
+    return {"relevant_user_memories": user_memories}
 
 
 async def llm_node(state: State) -> Command:
@@ -447,3 +446,18 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
             messages.append(ToolMessage(tool_call_id=tool_id,content="工具库中并没有你想调用的工具"))
 
     return {"messages": messages}
+
+async def gate(state: State) -> Dict:
+    human_message = state.messages[-1]
+    gate_llm = GateLlmManager.get_gate_llm()
+    output = await gate_llm.ainvoke(human_message)
+
+    return {"type": output.type}
+
+async def violation_reply(state: State) -> Dict:
+    return {
+        "messages": AIMessage(content=VIOLATION_REPLY)
+    }
+
+async def recall(state: State) -> Dict:
+    rag_flow.rag_search(question=state.messages[-1].content,collection_name=)
