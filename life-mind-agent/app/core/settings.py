@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     CHAT_MODEL_TEMPERATURE: float = 1.0
     CHAT_MODEL_BASE_URL: str = ""
     CHAT_MODEL_API_KEY: str = ""
+    # 回答类型分类模型
+    GATE_MODEL_NAME: str = ""
 
     # =================== RAG 相关配置 =====================
     # 文本切分相关配置
