@@ -40,67 +40,66 @@ async def rag_search(question: str, collection_name: str) -> List[Document]:
         代价是无关问题也能捞到几条切片，模型有概率硬答。
     """
     milvus_client = get_milvus_client()
-    # 集合要先 load 才能搜索，必须放 try 外面：load 失败没有可释放的资源
+    # 一会话一集合：新会话还没写过消息时集合并不存在，直接 load 会抛错打断整轮对话；
+    # 也不该为了一次空检索建出空集合。
+    if not await milvus_client.has_collection(collection_name=collection_name):
+        logger.info("rag 跳过：会话集合尚未建立 collection=%s", collection_name)
+        return []
+
+    # 集合要先 load 才能搜索。这里不 release：同一会话的写入链可能正在用这个集合，
+    # 一次检索就释放会让并发写入落在未 load 的集合上，释放交给会话归档 / 清理流程。
     await milvus_client.load_collection(collection_name)
 
+    vector_store = Milvus(
+        embedding_function=CacheEmbeddingManager.get_cache_embeddings(),
+        collection_name=collection_name,
+        text_field="text",
+        vector_field="vector",
+        connection_args={
+            "uri": settings.MILVUS_URI,
+            "token": settings.MILVUS_TOKEN,
+            "db_name": settings.MILVUS_DB_NAME
+        },
+    )
+
+    # 阈值在这一层生效：拿 Milvus 原始余弦比，不经过 langchain 的分数换算
+    retriever = CosineTopKRetriever(
+        store=vector_store,
+        k=settings.RETRIEVE_TOP_K,
+        threshold=settings.RETRIEVE_SCORE_THRESHOLD,
+    )
+
+    # 变体生成属于可选增强：改写模型没配好或输出格式不对时必须降级为单查询，
+    # 否则一次改写失败会让整条检索挂掉
     try:
-        vector_store = Milvus(
-            embedding_function=CacheEmbeddingManager.get_cache_embeddings(),
-            collection_name=collection_name,
-            text_field="text",
-            vector_field="vector",
-            connection_args={
-                "uri": settings.MILVUS_URI,
-                "token": settings.MILVUS_TOKEN,
-                "db_name": settings.MILVUS_DB_NAME
-            },
-        )
+        candidates = await MultiQueryRetriever.from_llm(
+            retriever=retriever,
+            llm=MultiQueryLlmManager.get_multi_query_llm(),
+        ).ainvoke(question)
+    except Exception as e:
+        logger.warning("多查询扩展失败，降级为单查询：%s: %s", type(e).__name__, e)
+        candidates = await retriever.ainvoke(question)
 
-        # 阈值在这一层生效：拿 Milvus 原始余弦比，不经过 langchain 的分数换算
-        retriever = CosineTopKRetriever(
-            store=vector_store,
-            k=settings.RETRIEVE_TOP_K,
-            threshold=settings.RETRIEVE_SCORE_THRESHOLD,
-        )
-
-        # 变体生成属于可选增强：改写模型没配好或输出格式不对时必须降级为单查询，
-        # 否则一次改写失败会让整条检索挂掉
-        try:
-            candidates = await MultiQueryRetriever.from_llm(
-                retriever=retriever,
-                llm=MultiQueryLlmManager.get_multi_query_llm(),
-            ).ainvoke(question)
-        except Exception as e:
-            logger.warning("多查询扩展失败，降级为单查询：%s: %s", type(e).__name__, e)
-            candidates = await retriever.ainvoke(question)
-
-        # 阈值可能把所有候选都筛掉：知识库确实没有相关内容，或者块切得太碎导致分数被稀释
-        if not candidates and settings.RETRIEVE_FALLBACK_ON_EMPTY:
-            # 兜底分支不再比阈值，纯按相似度取最相近的若干块，让模型至少有东西可参考
-            candidates = await vector_store.asimilarity_search(question, k=settings.RETRIEVE_FALLBACK_TOP_K)
-            logger.info(
-                "阈值 %.2f 无命中，兜底取最相近 %s 条 collection=%s 实际 %s 条",
-                settings.RETRIEVE_SCORE_THRESHOLD, settings.RETRIEVE_FALLBACK_TOP_K, collection_name, len(candidates),
-            )
-
-        if not candidates:
-            logger.info("rag 无候选且未开兜底 collection=%s", collection_name)
-            return []
-
-        # 精排只在候选上跑：交叉编码器逐条推理，条数直接决定耗时
-        reranked = await RerankManager.get_reranker().acompress_documents(candidates, question)
-        # 精排的 top_n 是"保留几条候选"，这里是"最终给模型几条"，两者不同：
-        # 前者给人工复查留余量，后者直接决定上下文长度
-        result = reranked[: settings.RETRIEVE_FINAL_TOP_K]
+    # 阈值可能把所有候选都筛掉：知识库确实没有相关内容，或者块切得太碎导致分数被稀释
+    if not candidates and settings.RETRIEVE_FALLBACK_ON_EMPTY:
+        # 兜底分支不再比阈值，纯按相似度取最相近的若干块，让模型至少有东西可参考
+        candidates = await vector_store.asimilarity_search(question, k=settings.RETRIEVE_FALLBACK_TOP_K)
         logger.info(
-            "rag 检索完成 collection=%s 候选 %s 条 → 精排 %s 条 → 送模型 %s 条",
-            collection_name, len(candidates), len(reranked), len(result),
+            "阈值 %.2f 无命中，兜底取最相近 %s 条 collection=%s 实际 %s 条",
+            settings.RETRIEVE_SCORE_THRESHOLD, settings.RETRIEVE_FALLBACK_TOP_K, collection_name, len(candidates),
         )
-        return result
 
-    finally:
-        # 释放失败不能覆盖真正的检索异常，所以单独吃掉只记日志
-        try:
-            await milvus_client.release_collection(collection_name)
-        except Exception as e:
-            logger.warning("release_collection 失败 collection=%s: %s", collection_name, e)
+    if not candidates:
+        logger.info("rag 无候选且未开兜底 collection=%s", collection_name)
+        return []
+
+    # 精排只在候选上跑：交叉编码器逐条推理，条数直接决定耗时
+    reranked = await RerankManager.get_reranker().acompress_documents(candidates, question)
+    # 精排的 top_n 是"保留几条候选"，这里是"最终给模型几条"，两者不同：
+    # 前者给人工复查留余量，后者直接决定上下文长度
+    result = reranked[: settings.RETRIEVE_FINAL_TOP_K]
+    logger.info(
+        "rag 检索完成 collection=%s 候选 %s 条 → 精排 %s 条 → 送模型 %s 条",
+        collection_name, len(candidates), len(reranked), len(result),
+    )
+    return result

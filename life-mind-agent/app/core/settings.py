@@ -31,7 +31,9 @@ class Settings(BaseSettings):
     MILVUS_DIMENSION: int = 2560
 
     # =================== 记忆相关配置 ==========================
-    # 会话记忆统一存放的 collection，所有用户共用一张表，靠 user_id / conversation_id 过滤
+    # 会话记忆集合名前缀（不再是完整集合名）：一会话一集合，完整名为
+    # {前缀}_{user_id}_{conversation_id}，由 nodes.py 的 _session_collection_name 生成。
+    # 保留原配置项名是为了兼容 Nacos 上已有的 key，值也不变。
     SESSION_MEMORY_COLLECTION: str = "life_mind_session_memory"
 
     # =================== agent 相关配置 ==========================
@@ -42,6 +44,8 @@ class Settings(BaseSettings):
     CHAT_MODEL_API_KEY: str = ""
     # 回答类型分类模型
     GATE_MODEL_NAME: str = ""
+    # 任务计划模型
+    PLANNER_MODEL_NAME: str = ""
 
     # =================== RAG 相关配置 =====================
     # 文本切分相关配置

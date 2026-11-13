@@ -1,5 +1,6 @@
 import logging
 
+from langchain_core.documents import Document
 from langgraph.store.base import SearchItem
 
 logger = logging.getLogger(__name__)
@@ -65,3 +66,49 @@ def user_memories_to_str(
         logger.warning("记忆文本超过 %s 字（实际 %s 字），已截断", max_chars, len("\n\n".join(blocks)))
 
     return merged
+
+
+def session_memories_to_str(documents: list[Document] | None) -> str:
+    """
+    把「会话记忆集合」召回的片段拼成一段可直接注入提示词的纯文本。
+
+    专用工具，不是通用的 List[Document] 转换器。唯一数据源是 Milvus 会话记忆集合
+    （life_mind_session_memory_{user_id}_{conversation_id}），唯一调用方是 recall 节点，
+    结果写进 State.relevant_session_memories，最终填 SYSTEM_PROMPT_TEMPLATE 的
+    {session_recall}。以下几类结果都不要往这里传：
+
+    - llm_memory_processor 切出来的块：带 metadata，写库必须用原始 Document；
+    - embedding_docs 的入参：需要原始 Document 才能生成向量行；
+    - retriever / reranker 的中间候选：还带着相似度分数，转成文本就没了；
+    - 通用知识库检索结果，以及 PG store 的 SearchItem（后者另见 user_memories_to_str）。
+
+    转换是有损且单向的：只取 page_content，丢掉 metadata、分数和来源；片段之间空一行，
+    顺序沿用召回结果的相似度顺序（不重排）；不加小标题，也不限长 —— 长度由调用侧的
+    RETRIEVE_FINAL_TOP_K 控制。空白片段跳过；page_content 不是字符串时记 warn 跳过，
+    不让一条脏数据打断整轮对话。
+
+    与 user_memories_to_str 的分工：那边处理 PG store 的 SearchItem（用户级长期记忆，
+    带 "## key" 小标题、可用 max_chars 限长），这里处理会话记忆集合的 Document；
+    两者分别对应模板的 {memories} 与 {session_recall}。
+
+    输入契约：可迭代的 Document 集合（list / tuple / generator 均可），元素需有
+    page_content: str。类型不符的元素只记 warn 并跳过，不抛异常；全都不合规时返回空串。
+
+    :param documents: 会话记忆集合的召回结果，允许为 None 或空列表
+    :return: 拼接后的文本，没有任何有效内容时返回空字符串
+    """
+    if not documents:
+        return ""
+
+    blocks: list[str] = []
+    for doc in documents:
+        text = getattr(doc, "page_content", None)
+        if not isinstance(text, str):
+            logger.warning("检索片段 page_content 不是字符串，已跳过：%r", type(text))
+            continue
+
+        content = text.strip()
+        if content:
+            blocks.append(content)
+
+    return "\n\n".join(blocks)

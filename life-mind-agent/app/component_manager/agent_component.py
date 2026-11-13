@@ -16,7 +16,7 @@ from langchain_openai import ChatOpenAI
 
 from app.agent.tools import save_user_memory
 from app.core.settings import settings
-from app.schemas.graph.output import GateOutput
+from app.schemas.graph.output import GateOutput, PlannerOutput
 
 
 def _create_chat_llm() -> ChatOpenAI:
@@ -125,7 +125,6 @@ class GateLlmManager:
 
     @classmethod
     def get_gate_llm(cls) -> Runnable:
-
         sig = settings.GATE_MODEL_NAME
 
         if sig not in cls._cache:
@@ -140,3 +139,21 @@ class GateLlmManager:
 
         return cls._cache[sig]
 
+class PlannerLlmManager:
+    _cache: dict[str, Runnable] = {}
+
+    @classmethod
+    def get_planner_llm(cls) -> Runnable:
+        sig = settings.PLANNER_MODEL_NAME
+
+        if sig not in cls._cache:
+            planner_llm = ChatOllama(
+                model=settings.PLANNER_MODEL_NAME,
+                temperature=0.2
+            )
+            # 模型结构化输出
+            planner_llm_structured = planner_llm.with_structured_output(schema=PlannerOutput)
+
+            cls._cache = {sig: planner_llm_structured}
+
+        return cls._cache[sig]

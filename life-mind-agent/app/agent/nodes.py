@@ -12,15 +12,15 @@ Agent 图节点集合。
    这意味着记忆写失败会让这一轮请求整体失败（前端收到错误、可整轮重试），而不是静默只存一半。
 2. 节点手动开 MySQL 会话（session_scope）：图节点拿不到 FastAPI 的请求级 session，
    只有 config，只能自己管一段会话的事务边界。
-3. 所有会话共用一张 collection，靠 user_id / conversation_id 做标量过滤。Aura 是
-   「一个 agent 一张 collection」（aura_agent_{agent_id}_session_memory），会话量一大就会堆出
-   成百上千个 collection，每个都要独立建索引并常驻 load，元数据和内存开销都很高。
+3. 一会话一 collection（物理隔离）：集合名 = {SESSION_MEMORY_COLLECTION}_{user_id}_{conversation_id}，
+   写入侧首次落库时懒建表并 load，检索侧只认这一个集合；取错名字读不到别人的行。
+   user_id / conversation_id 标量仍写进 metadata 作冗余校验，但不再承担隔离。
+   代价是集合为重资源（独立索引 + 常驻 load），删除会话时要 drop、长期空闲可 release。
 4. 主键由 Milvus 生成（auto_id），节点不构造、不传 id：一条消息切多少块就有多少行，
    每行拿到自己的主键，不会互相覆盖。业务侧的回溯键是标量字段 message_id / chunk_index。
    代价是主键不承载业务含义，`upsert` 无从下手——节点重放会重复写行，要收口只能按
    message_id 过滤删除后重写，或从 MySQL 全量重建索引。
 """
-import asyncio
 import logging
 from typing import List, Dict
 
@@ -31,11 +31,12 @@ from langgraph.types import Command, interrupt
 from pymilvus import CollectionSchema, DataType, FieldSchema
 from pymilvus.milvus_client import IndexParams
 
-from app.agent.prompts import VIOLATION_REPLY
-from app.component_manager.agent_component import ChatLlmWithToolsManager, GateLlmManager
+from app.agent.prompts import VIOLATION_REPLY, SYSTEM_PROMPT_TEMPLATE, TASK_EXECUTION_SYSTEM_PROMPT
+from app.component_manager.agent_component import ChatLlmWithToolsManager, GateLlmManager, PlannerLlmManager
 from app.core.settings import settings
 from app.db.milvus.client import get_milvus_client
 from app.db.mysql import ChatMessageEntity
+from app.db.mysql.entities import AgentTaskEntity
 from app.db.mysql.session import session_scope
 from app.db.postgresql.session import get_store
 from app.rag import rag_flow
@@ -43,7 +44,7 @@ from app.rag.document_processor import llm_memory_processor
 from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
 from app.schemas.graph.state import State
-from app.util.any_to_str import user_memories_to_str
+from app.util.any_to_str import session_memories_to_str, user_memories_to_str
 
 from app.agent.tools import save_user_memory
 
@@ -63,9 +64,11 @@ USER_MEMORY_NAMESPACE = "users_memory"
 # 语义检索按相似度降序，取前几条就够。
 USER_MEMORY_TOP_K = 5
 
-# collection 只需建一次；建表并发保护用锁，避免首个请求并发打进来重复建表
-_collection_ready = False
-_collection_lock = asyncio.Lock()
+# 每个会话一个 collection，按名字记住哪些已建表并 load。
+# 用集合而不是单个 bool：新会话第一次写入时不能因为「别的会话建过了」就跳过建表。
+# 不加锁：集合已按会话物理隔离，不同会话的首次写入落在不同的集合上，
+# 一把全局锁只会把所有会话的首次写入串行化，挡不住任何真实冲突。
+_ready_collections: set = set()
 
 # 会话记忆 collection 的字段定义。写成模块级常量而不是函数里的局部变量：
 # 它是 schema 的唯一来源，和 MEMORY_TEXT_MAX_BYTES、settings.MILVUS_DIMENSION 属于同一类东西——
@@ -86,6 +89,11 @@ _SESSION_MEMORY_FIELDS = [
     FieldSchema(name="role", dtype=DataType.VARCHAR, max_length=16),
     FieldSchema(name="create_time", dtype=DataType.VARCHAR, max_length=32),
 ]
+
+
+def _session_collection_name(user_id: int, conversation_id: int) -> str:
+    """会话专属集合名：写入与检索共用这一个生成规则，取错名字就读不到别人的行。"""
+    return f"{settings.SESSION_MEMORY_COLLECTION}_{user_id}_{conversation_id}"
 
 
 # ============================== 内部工具函数 ==================================
@@ -141,7 +149,7 @@ async def _save_session_memory(
     :param message_type: 要保存的消息类型，HumanMessage / AIMessage
     :return: 状态更新字典；本节点不改状态，恒返回 {}
     """
-    global _collection_ready
+    global _ready_collections
 
     # 倒序取最后一条目标消息：工具轮次等场景下 messages[-1] 未必就是本轮要存的那条
     message = next((m for m in reversed(state.messages) if isinstance(m, message_type)), None)
@@ -173,6 +181,8 @@ async def _save_session_memory(
         logger.error("user_id/conversation_id 不是合法整数，跳过：user_id=%r conversation_id=%r",
                      user_id, conversation_id)
         return {}
+
+    collection_name = _session_collection_name(user_id, conversation_id)
 
     async with session_scope() as db:
         entity = ChatMessageEntity(
@@ -209,33 +219,31 @@ async def _save_session_memory(
                 logger.warning("消息 message_id=%s 有 %s/%s 块超出 %s 字节被截断",
                                entity.id, truncated_chunks, len(documents), MEMORY_TEXT_MAX_BYTES)
 
-            # 确保 collection 存在且已 load。锁里做双重检查：等锁期间别的协程可能已经建好了
-            if not _collection_ready:
-                async with _collection_lock:
-                    if not _collection_ready:
-                        milvus_client = get_milvus_client()
-                        collection_name = settings.SESSION_MEMORY_COLLECTION
+            # 每个会话一个集合：首次写入时懒建表并 load，按集合名记住已就绪的那些。
+            # 不加锁：不同会话写不同集合，同一会话的消息逐条写入，不会有跨集合的争用。
+            if collection_name not in _ready_collections:
+                milvus_client = get_milvus_client()
 
-                        if not await milvus_client.has_collection(collection_name=collection_name):
-                            # AUTOINDEX 由 Milvus 按数据量自动选索引，省掉手工调 nlist、
-                            # 以及换环境后重建索引的麻烦
-                            index_params = IndexParams()
-                            index_params.add_index(field_name="vector", index_type="AUTOINDEX",
-                                                   metric_type="COSINE")
-                            await milvus_client.create_collection(
-                                collection_name=collection_name,
-                                schema=CollectionSchema(_SESSION_MEMORY_FIELDS,
-                                                        description="会话记忆向量集合"),
-                                index_params=index_params,
-                            )
-                            logger.info("会话记忆 collection 创建完成：%s", collection_name)
+                if not await milvus_client.has_collection(collection_name=collection_name):
+                    # AUTOINDEX 由 Milvus 按数据量自动选索引，省掉手工调 nlist、
+                    # 以及换环境后重建索引的麻烦
+                    index_params = IndexParams()
+                    index_params.add_index(field_name="vector", index_type="AUTOINDEX",
+                                           metric_type="COSINE")
+                    await milvus_client.create_collection(
+                        collection_name=collection_name,
+                        schema=CollectionSchema(_SESSION_MEMORY_FIELDS,
+                                                description="会话记忆向量集合"),
+                        index_params=index_params,
+                    )
+                    logger.info("会话记忆 collection 创建完成：%s", collection_name)
 
-                        # 检索/写入前必须 load；对已 load 的集合重复调用是幂等的
-                        await milvus_client.load_collection(collection_name=collection_name)
-                        _collection_ready = True
+                # 检索/写入前必须 load；对已 load 的集合重复调用是幂等的
+                await milvus_client.load_collection(collection_name=collection_name)
+                _ready_collections.add(collection_name)
 
             embed = await embedding_docs(documents)
-            await vector_store(embed, settings.SESSION_MEMORY_COLLECTION)
+            await vector_store(embed, collection_name)
 
             # 向量写完才提交：MySQL 与 Milvus 至少保证「要么都写、要么都不写」这个方向
             await db.commit()
@@ -246,8 +254,8 @@ async def _save_session_memory(
                          conversation_id, role, len(content), exc_info=True)
             raise
 
-    logger.info("会话记忆写入成功：conversation_id=%s role=%s message_id=%s chunks=%s",
-                conversation_id, role, entity.id, len(documents))
+    logger.info("会话记忆写入成功：collection=%s conversation_id=%s role=%s message_id=%s chunks=%s",
+                collection_name, conversation_id, role, entity.id, len(documents))
     return {}
 
 
@@ -302,14 +310,13 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
     return {"relevant_user_memories": user_memories}
 
 
-async def llm_node(state: State) -> Command:
+async def llm_node(state: State) -> Dict:
     """
     调用用户交互大模型。
 
     根据模型返回里有没有 tool_calls 决定下一步走向：
     - 有工具调用 → run_tool（工具执行完再回到本节点）
     - 无工具调用 → save_ai_session_memory（这一轮答复定稿，落记忆）
-    用 Command 而不是条件边，是因为走向依赖模型输出本身，写在节点里比拆成路由函数更直观。
 
     Args:
         state: 图状态，messages 携带完整对话历史。
@@ -327,16 +334,11 @@ async def llm_node(state: State) -> Command:
         # 流式一个 chunk 都没拿到：补一条空 AI 消息，避免后面拿 messages[-1] 时取到人类消息
         response = AIMessage(content="")
 
-    if response.tool_calls:
-        return Command(
-            update={"messages": response},
-            goto="run_tool"
-        )
-    else:
-        return Command(
-            update={"messages": response},
-            goto="save_ai_session_memory"
-        )
+    task_messages = state.task_messages.append(response)
+
+    return {
+        "task_messages": task_messages,
+    }
 
 
 async def save_human_session_memory(state: State, config: RunnableConfig) -> dict:
@@ -374,7 +376,7 @@ async def save_ai_session_memory(state: State, config: RunnableConfig) -> dict:
         dict: 空更新，本节点只做外部写入，不改状态。
 
     Note:
-        与 save_human_session_memory 共用同一套写入实现和同一个 collection，
+        与 save_human_session_memory 共用同一套写入实现和同一个会话集合，
         role 字段区分 user / assistant，检索时才能按角色过滤（例如只召回用户自己的话）。
     """
     return await _save_session_memory(state, config, role="assistant", message_type=AIMessage)
@@ -459,5 +461,104 @@ async def violation_reply(state: State) -> Dict:
         "messages": AIMessage(content=VIOLATION_REPLY)
     }
 
-async def recall(state: State) -> Dict:
-    rag_flow.rag_search(question=state.messages[-1].content,collection_name=)
+async def recall(state: State, config: RunnableConfig) -> Dict:
+    """召回本会话的向量切片，渲染成纯文本写回 State（不碰 messages）。"""
+    configurable = config.get("configurable", {})
+    user_id = configurable.get("user_id")
+    conversation_id = configurable.get("conversation_id") or configurable.get("thread_id")
+    if user_id is None or conversation_id is None:
+        logger.error("会话回忆缺少 user_id/conversation_id，跳过：configurable=%s", configurable)
+        return {}
+
+    try:
+        collection_name = _session_collection_name(int(user_id), int(conversation_id))
+    except (TypeError, ValueError):
+        logger.error("会话回忆的 user_id/conversation_id 不是整数，跳过：%r / %r", user_id, conversation_id)
+        return {}
+
+    documents = await rag_flow.rag_search(
+        question=_message_text(state.messages[-1]),
+        collection_name=collection_name,
+    )
+    return {"relevant_session_memories": session_memories_to_str(documents)}
+
+async def context_build(state: State) -> Dict:
+    """整合两个并行节点返回的记忆，并判断是否为纯对话，若是直接跳到文本模型处"""
+    relevant_user_memories = state.relevant_user_memories
+    relevant_session_memories = state.relevant_session_memories
+
+    system_message = state.messages[0]
+
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.ainvoke(
+        {
+            "memories": relevant_user_memories,
+            "session_recall": relevant_session_memories,
+        }
+    )
+
+    new_system_message = SystemMessage(
+        content=system_prompt,
+        id=system_message.id
+    )
+
+    return {
+        "messages": [new_system_message]
+    }
+
+async def assemble(state: State) -> Dict:
+    """装配下一个任务"""
+    tasks = state.task_list
+    for task in tasks:
+        if task.status in ["pending","retrying"]:
+            task_messages = state.task_messages.append(HumanMessage(
+                content=task.goal,
+            ))
+
+            return {
+                "task_messages": task_messages
+            }
+
+    logger.warning("任务已全部结束")
+    return {}
+
+async def planner(state: State,config: RunnableConfig) -> Dict:
+    """更具用户的问题计划任务"""
+    configurable = config.get("configurable", {})
+    conversation_id = configurable.get("conversation_id") or configurable.get("thread_id")
+    task_list = state.task_list
+
+    planner_llm = PlannerLlmManager.get_planner_llm()
+    output = await planner_llm.ainvoke(state.messages[-1])
+
+    # 添加任务
+    async with session_scope() as db:
+        for task_content in output.task_list:
+            try:
+                task = AgentTaskEntity(
+                    conversation_id=conversation_id,
+                    goal=task_content,
+                    status="pending",
+                )
+                db.add(task)
+                await db.commit()
+                await db.refresh(task)
+
+                task_list.append(task)
+            except Exception as e:
+                await db.rollback()
+                logger.error(e)
+
+    # 初始化任务临时对话记忆
+    task_messages = state.task_messages.append(
+        SystemMessage(content=TASK_EXECUTION_SYSTEM_PROMPT)
+    )
+
+    return {
+        "task_list": task_list,
+        "task_messages": task_messages,
+    }
+
+
+async def approval_gate(state: State) -> Dict:
+    """人工确认环节"""
+    pass
