@@ -43,7 +43,7 @@ from app.rag import rag_flow
 from app.rag.document_processor import llm_memory_processor
 from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
-from app.schemas.graph.state import State
+from app.schemas.graph.state import State, TaskItem
 from app.util.any_to_str import session_memories_to_str, user_memories_to_str
 
 from app.agent.tools import save_user_memory
@@ -522,7 +522,7 @@ async def assemble(state: State) -> Dict:
     return {}
 
 async def planner(state: State,config: RunnableConfig) -> Dict:
-    """更具用户的问题计划任务"""
+    """根据用户的问题计划任务"""
     configurable = config.get("configurable", {})
     conversation_id = configurable.get("conversation_id") or configurable.get("thread_id")
     task_list = state.task_list
@@ -543,7 +543,13 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
                 await db.commit()
                 await db.refresh(task)
 
-                task_list.append(task)
+                # ORM 实体只留在 db 会话里；额外创建纯数据对象放进 State 的任务清单
+                task_list.append(TaskItem(
+                    id=task.id,
+                    conversation_id=conversation_id,
+                    goal=task_content,
+                    status="pending",
+                ))
             except Exception as e:
                 await db.rollback()
                 logger.error(e)
@@ -559,6 +565,34 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
     }
 
 
-async def approval_gate(state: State) -> Dict:
+async def approval_gate(state: State,config: RunnableConfig) -> Dict:
     """人工确认环节"""
-    pass
+    last_message = state.messages[-1]
+    last_ai_message = last_message if isinstance(last_message, AIMessage) else None
+    messages = []
+
+    if not last_ai_message:
+        logger.info("工具运行节点获取到的最后一条消息对象不为AI发的消息")
+        return {}
+
+    tool_calls = last_ai_message.tool_calls
+    for i,tool_call in enumerate(tool_calls):
+        tool_id = tool_call.get("id")
+        tool_name = tool_call.get("name")
+        tool_args = tool_call.get("args")
+
+        # 调用用户级记忆保存工具
+        if tool_name == "save_user_memory":
+            user_choice = interrupt({
+                "question": f"是否同意将:\n {tool_args["content"]} \n添加进用户级记忆？",
+                "options": ["approve", "reject", "edit"]
+            })
+
+            if user_choice["choice"] == "approve":
+                continue
+            elif user_choice["choice"] == "reject":
+
+
+
+
+    return {"messages": messages}
