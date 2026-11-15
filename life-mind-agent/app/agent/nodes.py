@@ -24,15 +24,18 @@ Agent 图节点集合。
 import logging
 from typing import List, Dict
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langchain_core.runnables import RunnableConfig
 
 from langgraph.types import Command, interrupt
 from pymilvus import CollectionSchema, DataType, FieldSchema
 from pymilvus.milvus_client import IndexParams
+from sqlalchemy import Select
 
 from app.agent.prompts import VIOLATION_REPLY, SYSTEM_PROMPT_TEMPLATE, TASK_EXECUTION_SYSTEM_PROMPT
-from app.component_manager.agent_component import ChatLlmWithToolsManager, GateLlmManager, PlannerLlmManager
+from app.component_manager.agent_component import ChatLlmWithToolsManager, GateLlmManager, PlannerLlmManager, \
+    ChatLlmManager
 from app.core.settings import settings
 from app.db.milvus.client import get_milvus_client
 from app.db.mysql import ChatMessageEntity
@@ -44,7 +47,7 @@ from app.rag.document_processor import llm_memory_processor
 from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
 from app.schemas.graph.state import State, TaskItem
-from app.util.any_to_str import session_memories_to_str, user_memories_to_str
+from app.util.any_to_str import session_memories_to_str, user_memories_to_str, task_list_to_str
 
 from app.agent.tools import save_user_memory
 
@@ -326,7 +329,7 @@ async def llm_node(state: State) -> Dict:
     """
     response = None
     chat_llm_with_tools = ChatLlmWithToolsManager.get_chat_llm_with_tools()
-    async for chunk in chat_llm_with_tools.astream(state.messages):
+    async for chunk in chat_llm_with_tools.astream(state.task_messages):
         # 这边的AIMessage对象相加等价于content拼接
         response = chunk if response is None else response + chunk
 
@@ -409,6 +412,7 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
     """
     last_message = state.messages[-1]
     last_ai_message = last_message if isinstance(last_message ,AIMessage) else None
+    tool_approval = state.tool_approval
     messages = []
 
     if not last_ai_message:
@@ -420,32 +424,36 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
         tool_id = tool_call.get("id")
         tool_name = tool_call.get("name")
         tool_args = tool_call.get("args")
-
+        # ==============================================================================================================
         # 调用用户级记忆保存工具
         if tool_name == "save_user_memory":
-            user_choice = interrupt({
-                "question": f"是否同意将:\n {tool_args["content"]} \n添加进用户级记忆？",
-                "options": ["approve", "reject", "edit"]
-            })
+            if tool_approval[str(tool_id)] == "approve":
 
-            if user_choice["choice"] == "approve":
-
-                result = await save_user_memory.ainvoke(tool_args, config=config)
-            elif user_choice["choice"] == "reject":
+                result = await save_user_memory.ainvoke(
+                    tool_args,
+                    config=config
+                )
+            elif tool_approval[str(tool_id)] == "reject":
 
                 result = "用户拒绝将该内容添加进用户级记忆"
-            elif user_choice["choice"] == "edit":
+            elif tool_approval[str(tool_id)].startswith("edit"):
 
-                result = await save_user_memory.ainvoke({"content": user_choice["edit"]}, config=config)
+                result = await save_user_memory.ainvoke(
+                    {
+                        "content": tool_approval[str(tool_id)].spilt(":")[1]
+                    },
+                    config=config,
+                )
             else:
 
-                result = "用户的选择异常，不符合规范"
+                result = "用户的工具调用认证异常，不符合规范"
 
             messages.append(ToolMessage(tool_call_id=tool_id, content=result))
 
         # 无匹配工具的兜底操作
         else:
             messages.append(ToolMessage(tool_call_id=tool_id,content="工具库中并没有你想调用的工具"))
+        # ==============================================================================================================
 
     return {"messages": messages}
 
@@ -508,15 +516,31 @@ async def context_build(state: State) -> Dict:
 async def assemble(state: State) -> Dict:
     """装配下一个任务"""
     tasks = state.task_list
-    for task in tasks:
-        if task.status in ["pending","retrying"]:
-            task_messages = state.task_messages.append(HumanMessage(
-                content=task.goal,
-            ))
+    async with session_scope() as db:
+        for i,task in enumerate(tasks):
+            if task.status == "pending":
 
-            return {
-                "task_messages": task_messages
-            }
+                query = Select(AgentTaskEntity).where(AgentTaskEntity.id == task.id)
+                db_task = (await db.execute(query)).scalar_one_or_none()
+
+                if not db_task:
+                    logger.error(f"数据库中没有id为${task.id}的任务")
+                    return {}
+
+                db_task.status = "running"
+                await db.commit()
+
+                tasks[i].status = "running"
+
+                task_messages = state.task_messages.append(HumanMessage(
+                    content=task.goal,
+                ))
+
+                return {
+                    "task_list": tasks,
+                    "task_messages": task_messages,
+                    "running_task_id": task.id,
+                }
 
     logger.warning("任务已全部结束")
     return {}
@@ -569,18 +593,31 @@ async def approval_gate(state: State,config: RunnableConfig) -> Dict:
     """人工确认环节"""
     last_message = state.messages[-1]
     last_ai_message = last_message if isinstance(last_message, AIMessage) else None
-    messages = []
+    configurable = config.get("configurable", {})
+    agent_permission = configurable.get("agent_permission", "normal")
+    tool_approval = {}
+
+    # 敏感工具集合
+    sensitive_tools = [
+        "save_user_memory",
+    ]
 
     if not last_ai_message:
         logger.info("工具运行节点获取到的最后一条消息对象不为AI发的消息")
         return {}
 
     tool_calls = last_ai_message.tool_calls
-    for i,tool_call in enumerate(tool_calls):
-        tool_id = tool_call.get("id")
+    for tool_call in tool_calls:
         tool_name = tool_call.get("name")
+        tool_id = tool_call.get("id")
         tool_args = tool_call.get("args")
 
+        # 完全信任agent的判断逻辑
+        if agent_permission == "full" and tool_name in sensitive_tools:
+            tool_approval[str(tool_id)] = "approve"
+            continue
+
+        # ==============================================================================================================
         # 调用用户级记忆保存工具
         if tool_name == "save_user_memory":
             user_choice = interrupt({
@@ -588,11 +625,178 @@ async def approval_gate(state: State,config: RunnableConfig) -> Dict:
                 "options": ["approve", "reject", "edit"]
             })
 
-            if user_choice["choice"] == "approve":
-                continue
-            elif user_choice["choice"] == "reject":
+            if user_choice["choice"] in ["approve","reject"]:
+                tool_approval[str(tool_id)] = user_choice["choice"]
+
+            elif user_choice["choice"] == "edit":
+                tool_approval[str(tool_id)] = "edit:"+user_choice["edit"]
+
+            else:
+                logger.warning("用户的确认信息异常")
+                tool_approval[str(tool_id)] = "reject"
+
+        # ==============================================================================================================
+
+    return {"tool_approval": tool_approval}
+
+async def check_step(state: State) -> Dict:
+    """检查任务是否都已完成"""
+    over_task_id = state.running_task_id
+    task_list = state.task_list
+    result = state.task_messages[-1].content
+
+    async with session_scope() as db:
+        query = Select(AgentTaskEntity).where(AgentTaskEntity.id == over_task_id)
+        db_task = (await db.execute(query)).scalar_one_or_none()
+
+        if not db_task:
+            logger.error(f"数据库中没有id为${over_task_id}的任务")
+
+        db_task.status = "done"
+        db_task.result = result
+        await db.commit()
+
+    for i,task in enumerate(task_list):
+        if task.id == over_task_id:
+            task_list[i].status = "done"
+            task_list[i].result = result
+
+        if task.status == "pending" and task.id != over_task_id:
+            return {
+                "has_tasks": True,
+                "task_list": task_list,
+            }
+
+    return {
+        "has_tasks": False,
+        "task_list": task_list,
+    }
+
+async def finalize(state: State) -> Dict:
+    """总结任务执行结果,并清除state任务执行相关状态"""
+    tasks = state.task_list
+    tasks_result = task_list_to_str(tasks)
+
+    return {
+        "messages": AIMessage(content=tasks_result),
+        "relevant_user_memories": "",
+        "relevant_session_memories": "",
+        "task_list": [],
+        "tool_approval": {},
+        "task_messages": [],
+        "has_tasks": True,
+        "running_task_id": ""
+    }
+
+async def responder(state: State, config: RunnableConfig) -> Dict:
+    """ai对话节点"""
+    chat_llm = ChatLlmManager.get_chat_llm()
+    response = None
+
+    async for chunk in chat_llm.astream(state.messages):
+        # 这边的AIMessage对象相加等价于content拼接
+        response = chunk if response is None else response + chunk
+
+    if not response:
+        response = AIMessage(content="")
+
+    return {
+        "messages": response,
+    }
 
 
+# ================================ N16 · 对话压缩节点 ================================
+
+# 主 messages 保留的 token 上限。按所用模型的上下文窗口留 25~30% 余量来取，
+# 别直接顶到窗口上限；压完会明显低于阈值，所以天然只压一次、不会每轮重复压。
+CONVERSATION_MAX_TOKENS = 4000
 
 
-    return {"messages": messages}
+async def compress_conversation(state: State) -> Dict:
+    """按 token 阈值压缩主 messages：只删 PG checkpoint 里的旧消息副本。
+
+    位置：全路径末端（save_ai_session_memory 之后、END 之前），纯聊天 / 违规 /
+    任务三条分支都汇聚到这里。此时本轮回复已经落完 MySQL + Milvus，删除只影响
+    下一轮带进模型的上下文，不会干扰落库节点倒序取 AIMessage 的逻辑。
+
+    设计取舍：
+    1. 只做「裁剪」，不做「摘要」。摘要要么额外调一次模型（拖慢已经结束的这轮、
+       多一个失败点），要么要加 State 新字段 + 系统提示词第三占位符 + N6 渲染；
+       而 N5 recall 本来就负责把本会话较早片段从 Milvus 捞回来，数据并不丢，
+       缺的只是一段连贯梗概，不值得为此扩大改动面。
+    2. 零副作用：不写库、不调模型、不 interrupt，也绝不返回 task_list / has_tasks
+       等任务态字段（压缩节点不负责重置任务状态）。
+    3. 项目恒一条 SystemMessage：include_system=True 保留它，且按 id 差集删除，
+       双保险保住 messages[0]；start_on="human" 保证裁剪后从用户消息开始。
+    4. 只删 checkpoint 的 messages 副本，MySQL chat_message（展示层）与 Milvus
+       会话切片都不动；展示层历史与会话召回因此完全不受影响。
+
+    Note:
+        1. 主 messages 里不该出现工具流水（都在 task_messages）。万一出现，本节点
+           直接跳过压缩：拆散 AIMessage(tool_calls) 与 ToolMessage 会让上游模型
+           拒绝继续对话。
+        2. RemoveMessage 的 id 必须来自当前 messages 里真实存在的消息；删不存在的
+           id 会抛 ValueError。LangGraph 的 add_messages 会给无 id 的消息补 uuid，
+           这里仍显式跳过无 id 的消息，宁可少删也不冒异常。
+        3. 单条消息本身就超过阈值时，allow_partial=False 不会截断内容，而是把
+           这条消息整体排除在裁剪结果之外 —— 实测过：一条超长用户消息会被直接
+           删掉。所以下面额外守住「本轮最近一条消息必须留下」和「保留结果里
+           必须有用户消息」，任一不满足就整轮跳过：宁可不压，也不删用户原话。
+        4. 依赖 State.messages 上的 add_messages reducer 才能生效（当前 State 已有）。
+
+    :param state: 当前图状态，messages 是主对话历史
+    :return: 未超阈值 / 含工具流水 / 无法安全裁剪时返回 {}；
+             否则返回 {"messages": [RemoveMessage, ...]}，只删被裁掉的旧消息
+    """
+    messages = state.messages
+    if not messages:
+        return {}
+
+    # 防御：主 messages 一旦混入工具流水就不压，避免把成对的消息拆开
+    if any(isinstance(m, ToolMessage) or getattr(m, "tool_calls", None) for m in messages):
+        logger.warning("主 messages 含工具流水，跳过本轮压缩，避免拆散 tool_calls / ToolMessage")
+        return {}
+
+    total_tokens = count_tokens_approximately(messages)
+    if total_tokens <= CONVERSATION_MAX_TOKENS:
+        return {}
+
+    try:
+        kept = trim_messages(
+            messages,
+            max_tokens=CONVERSATION_MAX_TOKENS,
+            strategy="last",
+            token_counter=count_tokens_approximately,
+            include_system=True,
+            start_on="human",
+            allow_partial=False,
+        )
+    except (ValueError, TypeError) as exc:
+        logger.warning("对话压缩无法安全裁剪，本轮跳过：%s", exc)
+        return {}
+
+    # 裁剪结果必须留下本轮最近一条消息，且至少还要有用户消息。
+    # 否则说明阈值太小 / 单条消息超长，压下去会丢掉用户刚说的话，整轮放弃。
+    last_id = getattr(messages[-1], "id", None)
+    if last_id and not any(getattr(m, "id", None) == last_id for m in kept):
+        logger.warning("裁剪会删掉本轮最近一条消息，跳过本轮压缩")
+        return {}
+    if not any(isinstance(m, HumanMessage) for m in kept):
+        logger.warning("裁剪结果不含用户消息，跳过本轮压缩")
+        return {}
+
+    kept_ids = {m.id for m in kept if getattr(m, "id", None)}
+    to_remove = [
+        RemoveMessage(id=m.id)
+        for m in messages
+        if getattr(m, "id", None) and m.id not in kept_ids
+    ]
+    if not to_remove:
+        return {}
+
+    logger.info(
+        "对话压缩：%s 条约 %s token → 保留 %s 条，删除 %s 条",
+        len(messages), total_tokens, len(kept), len(to_remove),
+    )
+    return {"messages": to_remove}
+

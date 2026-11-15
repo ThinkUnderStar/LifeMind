@@ -3,6 +3,8 @@ import logging
 from langchain_core.documents import Document
 from langgraph.store.base import SearchItem
 
+from app.schemas.graph.state import TaskItem
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,3 +114,57 @@ def session_memories_to_str(documents: list[Document] | None) -> str:
             blocks.append(content)
 
     return "\n\n".join(blocks)
+
+
+def task_list_to_str(tasks: list[TaskItem] | None) -> str:
+    """
+    把 State.task_list（本会话的任务清单）拼成一段可直接注入提示词的纯文本。
+
+    专用工具，不是通用的对象列表转字符串：唯一数据源是 State.task_list 里的
+    TaskItem（字段同构的 AgentTaskEntity 也能用），典型调用方是 planner 节点 ——
+    把「本会话已经有哪些任务、各自跑到哪一步、结果是什么」作为只读输入喂给模型，
+    它才知道该重写哪一条、在末尾追加哪一条。以下几类结果都不要往这里传：
+
+    - messages / task_messages：BaseMessage 列表，走各自的上下文装配；
+    - List[Document] / SearchItem：另见 session_memories_to_str / user_memories_to_str。
+
+    输出沿用清单顺序连续编号，不按 id 重排（与「按 id 升序展示」以及 PlannerOutput
+    「完整清单整表覆盖」的顺序口径一致），被跳过的脏数据不占编号。每条先一行
+    "序号. [状态] 目标"，result 有内容时再另起一行缩进写执行结果。
+    状态只有 pending / running / done
+    三值，done 只表示「本条执行已结束」、不代表成功，成败看结果文本；本函数
+    不做任何判断，也不替调用方裁决任务是否完成。
+
+    输入契约：元素需有 goal: str；status / result 可以缺，分别按 pending / 无处理。
+    goal 不是字符串或为空白时记 warn 跳过，不让一条脏数据打断整轮对话；
+    tasks 为 None / 空列表 / 全都不合规时返回空字符串，由调用方判断「暂无任务」。
+    转换是有损且单向的，只用于提示词注入，不要拿这段文本还原 TaskItem 或落库。
+
+    :param tasks: State.task_list，允许为 None 或空列表
+    :return: 拼接后的文本，没有有效任务时返回空字符串
+    """
+    if not tasks:
+        return ""
+
+    lines: list[str] = []
+    seq = 0
+    for index, task in enumerate(tasks, start=1):
+        goal = getattr(task, "goal", None)
+        if not isinstance(goal, str) or not goal.strip():
+            logger.warning("任务目标为空或不是字符串，已跳过：第 %s 条 %r", index, type(goal))
+            continue
+
+        status = getattr(task, "status", None)
+        if not isinstance(status, str) or not status.strip():
+            status = "pending"
+
+        # 编号按「有效任务」连续递增：被跳过的脏数据不留空洞，
+        # 否则模型看到 "4." 却只有一条任务，指代会错位。
+        seq += 1
+        lines.append(f"{seq}. [{status}] {goal.strip()}")
+
+        result = getattr(task, "result", None)
+        if isinstance(result, str) and result.strip():
+            lines.append(f"   执行结果：{result.strip()}")
+
+    return "\n".join(lines)

@@ -1,5 +1,5 @@
 #创建节点间的通讯类
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Dict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
@@ -20,9 +20,9 @@ class TaskItem(BaseModel):
     conversation_id: Optional[int] = None
     # 本任务目标
     goal: str
-    # 任务状态：pending / running / done / failed / retrying
+    # 任务状态只有三档：pending / running / done；done 只表示本条执行已结束，不代表成功
     status: str = "pending"
-    # 本任务的执行结果，未执行完为 None
+    # 本任务的执行结果，成功或失败都写文本；未执行完为 None
     result: Optional[str] = None
 
 
@@ -34,8 +34,13 @@ class State(BaseModel):
     relevant_user_memories: str
     # 相关的会话级记忆
     relevant_session_memories: str
-    #任务列表
+    # 任务列表
     task_list: List[TaskItem]
-    #临时任务记忆
+    # 临时任务记忆
     task_messages: List[BaseMessage]
-
+    # 工具调用确认结果
+    tool_approval: Dict
+    # 是否有未执行的任务
+    has_tasks: bool = True
+    # 当前正在运行的task
+    running_task_id: str

@@ -42,8 +42,8 @@ class AgentTaskEntity(Base):
     conversation_id = Column(BigInteger, nullable=False, comment="会话ID，关联 conversation.id；判断同一对话的任务只靠这一列")
     goal = Column(String(1000), nullable=False, comment="任务目标，由 planner 从用户原话转写")
     status = Column(String(20), nullable=False, default="pending",
-                    comment="任务状态：pending-开始/待执行 running-执行中 done-已完成 failed-失败或中断 retrying-重试中（原样再跑一次，不改 goal）")
-    result = Column(Text, nullable=True, comment="本任务的执行结果（工具产出 / AI 结论）；未执行完为 NULL，改任务或重试重跑时清空")
+                    comment="任务状态：pending-开始/待执行 running-执行中 done-本条执行已结束（成败见 result，不再区分 failed / retrying）")
+    result = Column(Text, nullable=True, comment="本任务的执行结果（工具产出 / AI 结论，成功或失败都写文本）；未执行完为 NULL。改任务或重跑时清空")
     create_time = Column(DateTime, nullable=True, server_default=func.now(), comment="创建时间")
     update_time = Column(DateTime, nullable=True, server_default=func.now(), onupdate=func.now(), comment="更新时间")
     deleted = Column(SmallInteger, nullable=False, default=0, comment="0-未删 1-已删")
