@@ -4,26 +4,55 @@ from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.agent.nodes import (llm_node, relevant_user_memories,
-                             save_human_session_memory, save_ai_session_memory)
+                             save_human_session_memory, save_ai_session_memory, run_tool, gate, violation_reply, recall,
+                             context_build, assemble, planner, approval_gate, check_step, finalize, responder,
+                             compress_conversation)
 from app.db.postgresql.session import get_saver, get_store
 from app.schemas.graph.state import State
 
+# 条件边判断函数
+#=======================================================================================================================
+def route_after_gate(state: State) -> str:
+    """判断此次对话的类型"""
+    # 0:违规对话 1:纯对话 2:需要执行任务
+    chat_type = state.type
+    if chat_type == 0:
+        return "violation_reply"
+    else:
+        return
+#=======================================================================================================================
+
 # 创建图，添加节点，构建agent流程图
+#=======================================================================================================================
 graph = StateGraph(State)
+#=======================================================================================================================
 
 #添加节点
+#=======================================================================================================================
 graph.add_node("save_human_session_memory", save_human_session_memory)
 graph.add_node("relevant_user_memories", relevant_user_memories)
 graph.add_node("llm_node", llm_node)
 graph.add_node("save_ai_session_memory", save_ai_session_memory)
+graph.add_node("run_tool",run_tool)
+graph.add_node("gate",gate)
+graph.add_node("violation_reply",violation_reply)
+graph.add_node("recall",recall)
+graph.add_node("context_build",context_build)
+graph.add_node("assemble",assemble)
+graph.add_node("planner",planner)
+graph.add_node("approval_gate",approval_gate)
+graph.add_node("check_step",check_step)
+graph.add_node("finalize",finalize)
+graph.add_node("responder",responder)
+graph.add_node("compress_conversation",compress_conversation)
+#=======================================================================================================================
 
 #创建边
-# 先注入用户记忆再落库：relevant_user_memories 替换 messages[0] 的 SystemMessage，
-# 之后保存用户消息、调用模型时，整个 state 都已带最新记忆
-graph.add_edge(START, "relevant_user_memories")
-graph.add_edge("relevant_user_memories", "save_human_session_memory")
-graph.add_edge("save_human_session_memory", "llm_node")
-graph.add_edge("save_ai_session_memory", END)
+#=======================================================================================================================
+graph.add_edge(START,"save_human_session_memory")
+graph.add_edge("save_human_session_memory","gate")
+graph.add_conditional_edges("gate",route_after_gate)
+#=======================================================================================================================
 
 
 def get_graph(app: FastAPI) -> CompiledStateGraph[State]:
