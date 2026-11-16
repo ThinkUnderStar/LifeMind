@@ -1,10 +1,17 @@
 """
-Agent 图节点集合。
+Agent 图节点集合（N1–N16，共 16 个节点；拓扑与条件边见 graph.py）。
 
-当前实现三个节点：
-- relevant_user_memories：检索用户级长期记忆，替换系统提示词（读路径，失败不影响对话）
-- save_human_session_memory：把本轮用户消息写入 MySQL + Milvus
-- save_ai_session_memory：把本轮 AI 回复写入 MySQL + Milvus
+按职责分组：
+- 入口与分流：save_human_session_memory（用户消息落库）、gate（三分类 0违规/1纯对话/2任务）、
+  violation_reply（违规写死回复，不调模型）
+- 记忆装配：relevant_user_memories（用户级记忆，读 PG store）与 recall（本会话切片，读 Milvus）
+  由 gate 的条件边并行触发，context_build 汇合后统一渲染进唯一那条 SystemMessage
+- 任务分支：planner（结构化输出任务清单并落库）、assemble（挑 pending 任务置 running）、
+  llm_node（带工具的执行模型，只看 task_messages）、approval_gate（人工确认，唯一 interrupt）、
+  run_tool（回填 ToolMessage，只写 task_messages）、check_step（队列推进 + 写 result）、
+  finalize（任务分支收尾压缩）
+- 收尾与压缩：responder（给用户看的回复，不绑工具）、save_ai_session_memory（AI 回复落库）、
+  compress_conversation（N16，全路径末端按 token 阈值裁剪 checkpoint 里的旧消息）
 
 设计约定：
 1. 节点内双写，且两库要么都写、要么都不写：MySQL 用 flush 拿自增 id 与库时间（向量行的回溯键），
@@ -267,33 +274,27 @@ async def _save_session_memory(
 
 async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
     """
-    检索用户级长期记忆，全量注入系统提示词。
+    检索用户级长期记忆，写成文本放进 State 字段，交给 context_build 统一渲染。
 
-    位置：图里第一个节点（START 直连），必须早于 llm_node，且与 llm_node 之间不夹会改 messages 的节点。
-    它替换 messages[0] 的 SystemMessage，模型这一轮调用才会读到最新的用户记忆。
+    位置：与 recall 并行（gate 条件边同时触发），两者写不同 State 字段，不冲突；
+    汇合点 context_build 读本字段填进 SYSTEM_PROMPT_TEMPLATE 的 {memories}。
+    本节点不碰 messages —— 渲染系统提示词是 N6 的职责，避免并行分支写同一 channel。
 
-    注入方式：从 PG store 的 ("users_memory", user_id) 命名空间把记忆全量取出，拼成一段文本填进
-    SYSTEM_PROMPT_TEMPLATE 的 {memories}，再用原 SystemMessage 的 id 写回 messages。
-    不做语义检索（store 未配置 index_config 时 query 会被忽略），注入的是该用户当前全部记忆。
-
-    前置条件缺失（messages[0] 不是 SystemMessage、config 里没有 user_id）不算异常：
-    只记日志并返回 {}，系统提示词保持接口服务给的那份，对话照常继续。
+    取法：PG store 的 ("users_memory", user_id) 命名空间 asearch，不做语义检索
+    （store 未配 index_config 时 query 会被忽略），按更新时间取前若干条。
 
     Note:
-        1. 写回时沿用 old_system.id 是硬要求：add_messages 按 id 覆盖，id 变了会追加出第二条
-           SystemMessage，模型会同时看到两份互相冲突的系统提示。
-        2. asearch 不带 query 时实际是 ORDER BY updated_at DESC LIMIT 1000，超过 1000 条最早的
-           记忆会被静默丢弃，不是严格意义的「全量」；要真全量得按 offset 分页。
-        3. 这里没有 try/except：store 异常会直接冒到全局异常处理器，整轮对话失败，
+        1. limit=200 是取最近 200 条，不是「全量」；条目一多会把系统提示撑大，
+           真按本轮提问检索需要先给 store 配 index_config。
+        2. 这里没有 try/except：store 异常会直接冒到全局异常处理器，整轮对话失败，
            与「记忆读失败不影响回答」的 fail-open 约定相反。
-        4. user_id 用 == "" 判空判不出 None，显式传 None 时会往下拼出 ("users_memory", "None")
-           这个命名空间，表现是静默读不到任何记忆而不是报错。
-        5. ainvoke 返回的是 StringPromptValue 而非 str，必须 to_string()，
-           直接塞进 SystemMessage(content=...) 会抛 pydantic ValidationError。
+        3. user_id 用 == "" 判空判不出 None，显式传 None 时会拼出 ("users_memory", "None")
+           这个命名空间，表现是静默读不到记忆而不是报错。
+        4. state.messages[0] 仍校验是不是 SystemMessage，但只用于前置检查，本节点不改它。
 
-    :param state: 当前图状态，messages[0] 应是接口服务初始化的 SystemMessage
+    :param state: 当前图状态
     :param config: 运行时配置，需带 configurable.user_id
-    :return: 状态更新字典；注入成功时是 {"messages": [替换后的 SystemMessage]}，跳过时是 {}
+    :return: {"relevant_user_memories": 文本}；前置条件缺失时是 {}
     """
     old_system = state.messages[0]
     if not isinstance(old_system, SystemMessage):
@@ -315,17 +316,21 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
 
 async def llm_node(state: State) -> Dict:
     """
-    调用用户交互大模型。
+    调用带工具的执行模型，跑一个任务步。
 
-    根据模型返回里有没有 tool_calls 决定下一步走向：
-    - 有工具调用 → run_tool（工具执行完再回到本节点）
-    - 无工具调用 → save_ai_session_memory（这一轮答复定稿，落记忆）
+    只把 task_messages（临时任务记忆）喂给模型，不读主 messages ——
+    任务执行层看不到原始闲聊，结论也不会混进给用户看的历史。
+
+    走向由 graph.py 的 route_after_llm 条件边按本节点写回的 AIMessage 判断：
+    - 带 tool_calls → approval_gate → run_tool → 回到本节点
+    - 不带 tool_calls → check_step（本任务收尾，推进队列）
 
     Args:
-        state: 图状态，messages 携带完整对话历史。
+        state: 图状态，只读 task_messages。
 
     Returns:
-        Command: update 写入本轮 AI 回复（add_messages 按 id 合并），goto 指定下一个节点。
+        dict: {"task_messages": [...原消息, 本轮 AIMessage]}。task_messages 无 reducer，
+        必须整表覆盖；不走 Command，分支由条件边决定。
     """
     response = None
     chat_llm_with_tools = ChatLlmWithToolsManager.get_chat_llm_with_tools()
@@ -336,8 +341,7 @@ async def llm_node(state: State) -> Dict:
     if response is None:
         # 流式一个 chunk 都没拿到：补一条空 AI 消息，避免后面拿 messages[-1] 时取到人类消息
         response = AIMessage(content="")
-
-    task_messages = state.task_messages.append(response)
+    task_messages = [*state.task_messages, response]
 
     return {
         "task_messages": task_messages,
@@ -397,7 +401,8 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
                 只会静默返回「未取到当前用户身份」，不报错也不落库。
 
     Returns:
-        dict: {"messages": [ToolMessage, ...]}，每个 tool_call 一条，顺序与调用顺序一致。
+        dict: {"task_messages": [...原消息, ToolMessage, ...]}，每个 tool_call 一条，
+        顺序与调用顺序一致。写 task_messages 而非主 messages（后者是给用户看的历史）。
 
     Note:
         1. 确认环节用 interrupt 实现，前端 resume 必须回 {"choice": ...}：
@@ -410,8 +415,10 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
         4. ToolMessage 的 tool_call_id 必须与 tool_call 的 id 严格对应，
            少回一条，下一轮上游就会以「tool_calls 没有对应响应」拒绝继续对话。
     """
-    last_message = state.messages[-1]
-    last_ai_message = last_message if isinstance(last_message ,AIMessage) else None
+    # 任务流水只进 task_messages（llm_node 把带 tool_calls 的 AIMessage 写在这里），
+    # 不能读主 messages —— 那是给用户看的历史，两处不是同一个列表
+    last_message = state.task_messages[-1] if state.task_messages else None
+    last_ai_message = last_message if isinstance(last_message, AIMessage) else None
     tool_approval = state.tool_approval
     messages = []
 
@@ -440,7 +447,7 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
 
                 result = await save_user_memory.ainvoke(
                     {
-                        "content": tool_approval[str(tool_id)].spilt(":")[1]
+                        "content": tool_approval[str(tool_id)].split(":")[1]
                     },
                     config=config,
                 )
@@ -455,9 +462,17 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
             messages.append(ToolMessage(tool_call_id=tool_id,content="工具库中并没有你想调用的工具"))
         # ==============================================================================================================
 
-    return {"messages": messages}
+    # ToolMessage 必须回写 task_messages：下一轮 llm_node 读它才能看到工具结果；
+    # 写进主 messages 会污染给用户看的历史。task_messages 无 reducer，整表覆盖
+    return {"task_messages": [*state.task_messages, *messages]}
 
 async def gate(state: State) -> Dict:
+    """意图分流：把本轮用户原话交给 gate 模型做三分类，只写 type 字段。
+
+    判据（0违规 / 1纯对话 / 2任务）写在 GateOutput 的 Field(description) 里，
+    本节点用 with_structured_output 拿实例、取 out.type，不做任何分流判断 ——
+    分流是 graph.py 里 route_after_gate 条件边的事。零副作用，不写库、不改 messages。
+    """
     human_message = state.messages[-1]
     gate_llm = GateLlmManager.get_gate_llm()
     output = await gate_llm.ainvoke(human_message)
@@ -465,6 +480,11 @@ async def gate(state: State) -> Dict:
     return {"type": output.type}
 
 async def violation_reply(state: State) -> Dict:
+    """违规轮次的回复：写死 VIOLATION_REPLY，不调模型、不复述违规原因。
+
+    只往主 messages 追加一条 AIMessage，随后直接走 save_ai 落库；
+    不进记忆装配和任务分支，因此不会产生会话召回或任务记录。
+    """
     return {
         "messages": AIMessage(content=VIOLATION_REPLY)
     }
@@ -491,13 +511,22 @@ async def recall(state: State, config: RunnableConfig) -> Dict:
     return {"relevant_session_memories": session_memories_to_str(documents)}
 
 async def context_build(state: State) -> Dict:
-    """整合两个并行节点返回的记忆，并判断是否为纯对话，若是直接跳到文本模型处"""
+    """汇合两个并行记忆分支，把结果渲染进唯一那条 SystemMessage。
+
+    读 relevant_user_memories / relevant_session_memories 两个字段，填进
+    SYSTEM_PROMPT_TEMPLATE 的 {memories} / {session_recall}；沿用原 SystemMessage 的 id
+    覆盖而非追加，保证项目恒一条 system（add_messages 按 id 合并，id 变了会多出第二条）。
+
+    是否纯对话不在这里判断 —— 那是 graph.py 里 route_after_context 条件边的职责，
+    按 state.type 分 responder（1）或 planner（2）。本节点不碰 messages 里的其他消息。
+    """
     relevant_user_memories = state.relevant_user_memories
     relevant_session_memories = state.relevant_session_memories
 
     system_message = state.messages[0]
 
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.ainvoke(
+    # ainvoke 是异步的，必须 await；返回 StringPromptValue，要 .to_string() 才是 str
+    system_prompt = await SYSTEM_PROMPT_TEMPLATE.ainvoke(
         {
             "memories": relevant_user_memories,
             "session_recall": relevant_session_memories,
@@ -505,7 +534,7 @@ async def context_build(state: State) -> Dict:
     )
 
     new_system_message = SystemMessage(
-        content=system_prompt,
+        content=system_prompt.to_string(),
         id=system_message.id
     )
 
@@ -514,7 +543,15 @@ async def context_build(state: State) -> Dict:
     }
 
 async def assemble(state: State) -> Dict:
-    """装配下一个任务"""
+    """从任务清单里挑下一条 pending 任务，置为 running 并装成执行模型的输入。
+
+    双写：MySQL 先改 status 并 commit，再改 State 里的 TaskItem，最后把任务目标作为
+    HumanMessage 追加进 task_messages（只放临时记忆，不进主 messages）。
+    running_task_id 记下当前任务 id，供 check_step 收尾时定位。
+
+    task_list 是普通 List 无 reducer，这里原地改对象后整表返回；找不到库行或没有 pending
+    任务时返回 {}，不会破坏现有状态。
+    """
     tasks = state.task_list
     async with session_scope() as db:
         for i,task in enumerate(tasks):
@@ -532,9 +569,9 @@ async def assemble(state: State) -> Dict:
 
                 tasks[i].status = "running"
 
-                task_messages = state.task_messages.append(HumanMessage(
+                task_messages = [*state.task_messages, HumanMessage(
                     content=task.goal,
-                ))
+                )]
 
                 return {
                     "task_list": tasks,
@@ -546,7 +583,15 @@ async def assemble(state: State) -> Dict:
     return {}
 
 async def planner(state: State,config: RunnableConfig) -> Dict:
-    """根据用户的问题计划任务"""
+    """按用户原话规划任务清单，落库后写进 State 并初始化任务临时记忆。
+
+    PlannerOutput 的口径是「输出完整清单、整表覆盖」，一条 goal 一行；本节点只负责
+    把每条 goal 插成 agent_task 的 pending 行（归属只靠 conversation_id），refresh 拿到
+    自增 id 后另建纯数据 TaskItem —— ORM 实体不进 State。
+
+    落库成功后把 State.task_list 整表返回（planning 会重建整张表，不追加到旧表），
+    task_messages 重置为一条 TASK_EXECUTION_SYSTEM_PROMPT，后续执行只读这份临时记忆。
+    """
     configurable = config.get("configurable", {})
     conversation_id = configurable.get("conversation_id") or configurable.get("thread_id")
     task_list = state.task_list
@@ -578,10 +623,9 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
                 await db.rollback()
                 logger.error(e)
 
-    # 初始化任务临时对话记忆
-    task_messages = state.task_messages.append(
-        SystemMessage(content=TASK_EXECUTION_SYSTEM_PROMPT)
-    )
+    # 初始化任务临时对话记忆（append() 返回 None，用整表覆盖）
+    task_messages = [*state.task_messages,
+                     SystemMessage(content=TASK_EXECUTION_SYSTEM_PROMPT)]
 
     return {
         "task_list": task_list,
@@ -591,7 +635,8 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
 
 async def approval_gate(state: State,config: RunnableConfig) -> Dict:
     """人工确认环节"""
-    last_message = state.messages[-1]
+    # 与 run_tool 对齐：带 tool_calls 的 AIMessage 在 task_messages，不在主 messages
+    last_message = state.task_messages[-1] if state.task_messages else None
     last_ai_message = last_message if isinstance(last_message, AIMessage) else None
     configurable = config.get("configurable", {})
     agent_permission = configurable.get("agent_permission", "normal")
@@ -640,7 +685,15 @@ async def approval_gate(state: State,config: RunnableConfig) -> Dict:
     return {"tool_approval": tool_approval}
 
 async def check_step(state: State) -> Dict:
-    """检查任务是否都已完成"""
+    """收尾刚跑完的那条任务，再决定队列是否还有下一条。
+
+    取 running_task_id 定位任务，把 task_messages 最后一条（执行模型的简短结果文本）
+    写进 agent_task.result 和 State 的 TaskItem.result，状态置 done —— done 只表示
+    「本条执行已结束」，成败都在 result 文本里，不做语义判定、不调模型。
+
+    然后看还有没有 pending：有则 has_tasks=True（条件边回 assemble），否则 False
+    （去 finalize）。库里查不到该行时只记日志、跳过写库，但 State 侧照常推进，避免卡队列。
+    """
     over_task_id = state.running_task_id
     task_list = state.task_list
     result = state.task_messages[-1].content
@@ -651,10 +704,10 @@ async def check_step(state: State) -> Dict:
 
         if not db_task:
             logger.error(f"数据库中没有id为${over_task_id}的任务")
-
-        db_task.status = "done"
-        db_task.result = result
-        await db.commit()
+        else:
+            db_task.status = "done"
+            db_task.result = result
+            await db.commit()
 
     for i,task in enumerate(task_list):
         if task.id == over_task_id:
@@ -673,7 +726,15 @@ async def check_step(state: State) -> Dict:
     }
 
 async def finalize(state: State) -> Dict:
-    """总结任务执行结果,并清除state任务执行相关状态"""
+    """任务分支收尾：把任务清单压成文本、清空任务态，交给 responder 出最终回复。
+
+    注意（已知待修，用户要求暂不动）：
+    - 任务清单被塞成一条 AIMessage 进主 messages，会被 save_ai 当成回复落库展示；
+      不过 save_ai 取的是最后一条 AIMessage，responder 的回复排在它后面，实际落库的是回复。
+    - has_tasks 重置为 True，与 route_after_step 的「False 才进 finalize」判据语义冲突；
+      但 finalize 之后不再回到该条件边，本轮不受影响。
+    这里只清 State 里的任务态字段，不动 agent_task 表（结论已由 check_step 落库）。
+    """
     tasks = state.task_list
     tasks_result = task_list_to_str(tasks)
 
@@ -685,7 +746,7 @@ async def finalize(state: State) -> Dict:
         "tool_approval": {},
         "task_messages": [],
         "has_tasks": True,
-        "running_task_id": ""
+        "running_task_id": None
     }
 
 async def responder(state: State, config: RunnableConfig) -> Dict:

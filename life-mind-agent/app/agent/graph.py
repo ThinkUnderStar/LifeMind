@@ -1,3 +1,5 @@
+from typing import List
+
 from fastapi import FastAPI
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
@@ -11,15 +13,61 @@ from app.db.postgresql.session import get_saver, get_store
 from app.schemas.graph.state import State
 
 # 条件边判断函数
+# 约定：只读 State、返回下一个（或下一批）节点名，不调模型、不写库、不改 State。
+# 返回 list[str] = 这些节点在同一 superstep 并行执行；返回 str = 单节点。
+# 返回的名字必须是 add_node 注册过的，拼错会在运行时才暴露（这里没给 path_map）。
 #=======================================================================================================================
-def route_after_gate(state: State) -> str:
-    """判断此次对话的类型"""
+def route_after_gate(state: State) -> List[str]:
+    """按 gate 写的 type 分流：违规单走回复节点，正常两路并行取记忆。
+
+    返回 list 是刻意的：relevant_user_memories 与 recall 只读各自的库、写不同 State
+    字段，可安全并行；汇合点 context_build 会等两条都完成才执行。
+    """
     # 0:违规对话 1:纯对话 2:需要执行任务
     chat_type = state.type
     if chat_type == 0:
-        return "violation_reply"
+        return ["violation_reply"]
     else:
-        return
+        return ["relevant_user_memories","recall"]
+
+def route_after_context(state: State) -> str:
+    """记忆装配完成后分流：type=1 纯对话走 responder，其余（2 任务）走 planner。
+
+    chat 与 task 共用 N4/N5/N6 三层上下文，不能在 gate 处提前拆开。
+    """
+    # 0:违规对话 1:纯对话 2:需要执行任务
+    chat_type = state.type
+    if chat_type == 1:
+        return "responder"
+    else:
+        return "planner"
+
+def route_after_llm(state: State) -> str:
+    """按 llm_node 写回 task_messages 的最后一条 AIMessage 是否带 tool_calls 分流。
+
+    有 → approval_gate（确认后进 run_tool 回填 ToolMessage，再回到 llm_node）；
+    无 → check_step（本任务收尾）。读 task_messages 而非主 messages，和 llm_node 写入一致。
+    不设 route_after_approval：approve / reject 都要进 run_tool 回填 ToolMessage。
+    """
+    last_message = state.task_messages[-1]
+    tool_calls = getattr(last_message, "tool_calls", None)
+
+    if tool_calls:
+        return "approval_gate"
+    else:
+        return "check_step"
+
+def route_after_step(state: State) -> str:
+    """按 check_step 写的 has_tasks 决定是否继续：True 回 assemble 取下一条，False 去 finalize。
+
+    只有两向 —— failed / retrying 状态已砍掉，不设「失败重规划」第三向；
+    has_tasks 是 bool，装不下三态。
+    """
+    has_tasks = state.has_tasks
+    if has_tasks:
+        return "assemble"
+    else:
+        return "finalize"
 #=======================================================================================================================
 
 # 创建图，添加节点，构建agent流程图
@@ -52,6 +100,20 @@ graph.add_node("compress_conversation",compress_conversation)
 graph.add_edge(START,"save_human_session_memory")
 graph.add_edge("save_human_session_memory","gate")
 graph.add_conditional_edges("gate",route_after_gate)
+graph.add_edge("violation_reply","save_ai_session_memory")
+graph.add_edge("relevant_user_memories","context_build")
+graph.add_edge("recall","context_build")
+graph.add_conditional_edges("context_build",route_after_context)
+graph.add_edge("planner","assemble")
+graph.add_edge("assemble","llm_node")
+graph.add_conditional_edges("llm_node",route_after_llm)
+graph.add_edge("approval_gate","run_tool")
+graph.add_edge("run_tool","llm_node")
+graph.add_conditional_edges("check_step",route_after_step)
+graph.add_edge("finalize","responder")
+graph.add_edge("responder","save_ai_session_memory")
+graph.add_edge("save_ai_session_memory","compress_conversation")
+graph.add_edge("compress_conversation",END)
 #=======================================================================================================================
 
 

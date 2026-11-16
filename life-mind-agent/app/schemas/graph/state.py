@@ -3,7 +3,7 @@ from typing import Annotated, List, Optional, Dict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TaskItem(BaseModel):
@@ -27,20 +27,21 @@ class TaskItem(BaseModel):
 
 
 class State(BaseModel):
-    messages: Annotated[List[BaseMessage],add_messages]
-    # 0:违规对话 1:纯对话 2:需要执行任务
-    type: int
+    # add_messages 是 reducer；default_factory 让 invoke({"messages":[...]}) 不必传齐所有字段
+    messages: Annotated[List[BaseMessage], add_messages] = Field(default_factory=list)
+    # 0:违规对话 1:纯对话 2:需要执行任务；gate 节点必定覆盖，默认按违规 fail-closed
+    type: int = 0
     # 相关得端用户级记忆
-    relevant_user_memories: str
+    relevant_user_memories: str = ""
     # 相关的会话级记忆
-    relevant_session_memories: str
+    relevant_session_memories: str = ""
     # 任务列表
-    task_list: List[TaskItem]
+    task_list: List[TaskItem] = Field(default_factory=list)
     # 临时任务记忆
-    task_messages: List[BaseMessage]
+    task_messages: List[BaseMessage] = Field(default_factory=list)
     # 工具调用确认结果
-    tool_approval: Dict
+    tool_approval: Dict = Field(default_factory=dict)
     # 是否有未执行的任务
     has_tasks: bool = True
-    # 当前正在运行的task
-    running_task_id: str
+    # 当前正在运行的 task（agent_task.id，自增整数）；无任务时为 None
+    running_task_id: Optional[int] = None
