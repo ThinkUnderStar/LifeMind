@@ -8,7 +8,7 @@ from langgraph.graph.state import CompiledStateGraph
 from app.agent.nodes import (llm_node, relevant_user_memories,
                              save_human_session_memory, save_ai_session_memory, run_tool, gate, violation_reply, recall,
                              context_build, assemble, planner, approval_gate, check_step, finalize, responder,
-                             compress_conversation)
+                             compress_conversation, generate_task_bind_id)
 from app.db.postgresql.session import get_saver, get_store
 from app.schemas.graph.state import State
 
@@ -78,6 +78,7 @@ graph = StateGraph(State)
 #添加节点
 #=======================================================================================================================
 graph.add_node("save_human_session_memory", save_human_session_memory)
+graph.add_node("generate_task_bind_id", generate_task_bind_id)
 graph.add_node("relevant_user_memories", relevant_user_memories)
 graph.add_node("llm_node", llm_node)
 graph.add_node("save_ai_session_memory", save_ai_session_memory)
@@ -98,7 +99,8 @@ graph.add_node("compress_conversation",compress_conversation)
 #创建边
 #=======================================================================================================================
 graph.add_edge(START,"save_human_session_memory")
-graph.add_edge("save_human_session_memory","gate")
+graph.add_edge("save_human_session_memory","generate_task_bind_id")
+graph.add_edge("generate_task_bind_id","gate")
 graph.add_conditional_edges("gate",route_after_gate)
 graph.add_edge("violation_reply","save_ai_session_memory")
 graph.add_edge("relevant_user_memories","context_build")

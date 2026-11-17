@@ -24,6 +24,7 @@ class ChatMessageEntity(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="消息ID")
     conversation_id = Column(BigInteger, nullable=False, index=True, comment="会话ID")
     role = Column(String(20), nullable=False, comment="消息角色: user-用户 assistant-AI system-系统")
+    task_bind_id = Column(String(36), nullable=True, comment="任务绑定ID：一轮对话的UUID，仅AI(assistant)消息有值，user/system消息为NULL")
     content = Column(Text, nullable=False, comment="消息内容")
     status = Column(SmallInteger, nullable=False, default=0, index=True, comment="0-正常 1-失败")
     create_time = Column(DateTime, nullable=True, server_default=func.now(), comment="创建时间")
@@ -40,6 +41,7 @@ class AgentTaskEntity(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="任务ID，主键；展示顺序按 id 升序")
     conversation_id = Column(BigInteger, nullable=False, comment="会话ID，关联 conversation.id；判断同一对话的任务只靠这一列")
+    task_bind_id = Column(String(36), nullable=True, comment="任务绑定ID：与生成本任务的AI消息(chat_message.task_bind_id)共用一个UUID；conversation_id仍保留作会话归属")
     goal = Column(String(1000), nullable=False, comment="任务目标，由 planner 从用户原话转写")
     status = Column(String(20), nullable=False, default="pending",
                     comment="任务状态：pending-开始/待执行 running-执行中 done-本条执行已结束（成败见 result，不再区分 failed / retrying）")

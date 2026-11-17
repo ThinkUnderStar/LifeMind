@@ -1,12 +1,16 @@
 -- AI 任务表：life_mind_agent.agent_task
 -- 一行 = 一个任务（任务就是步骤）。一个会话只有几条任务行，按 id 升序展示。
--- 归属只认 conversation_id：判断哪些任务属于同一个对话，只看这一列；没有计划ID、步骤编号、版本号之类的分组键。
+-- 归属两列：conversation_id 保留作会话归属；task_bind_id 是本任务实际绑定的「对话」——
+--   与生成本任务的 AI 消息（chat_message.task_bind_id）共用一个 UUID，一轮对话一个值。
+--   task_bind_id 为 NULL 表示历史数据 / 未走新链路，仍按 conversation_id 归属。
+-- 没有计划ID、步骤编号、版本号之类的分组键。
 -- 改任务 = 原地改那一行（status 改回 pending「开始」、重写 goal）；追加任务 = 插一条 status=pending 的新行。
 -- 不做版本、不做变更记录、不做历史快照：表里只有这个会话当前的任务清单。
 -- MySQL 存任务清单 + 每条任务的执行结果，供前端展示与断线重连；不存中间流水与逐 token 输出。
 CREATE TABLE IF NOT EXISTS `agent_task` (
   `id` bigint NOT NULL AUTO_INCREMENT COMMENT '任务ID，主键；展示顺序按 id 升序',
-  `conversation_id` bigint NOT NULL COMMENT '会话ID，关联 conversation.id；判断同一对话的任务只靠这一列',
+  `conversation_id` bigint NOT NULL COMMENT '会话ID，关联 conversation.id；保留作会话归属',
+  `task_bind_id` varchar(36) DEFAULT NULL COMMENT '任务绑定ID：与生成本任务的AI消息(chat_message.task_bind_id)共用一个UUID；conversation_id仍保留作会话归属',
   `goal` varchar(1000) NOT NULL COMMENT '任务目标，由 planner 从用户原话转写',
   `status` varchar(20) NOT NULL DEFAULT 'pending' COMMENT '任务状态：pending-开始/待执行 running-执行中 done-本条执行已结束（成败见 result，不再区分 failed / retrying）',
   `result` text COMMENT '本任务的执行结果（工具产出 / AI 结论，成功或失败都写文本）；未执行完为 NULL。改任务或重跑时清空',

@@ -2,7 +2,8 @@
 Agent 图节点集合（N1–N16，共 16 个节点；拓扑与条件边见 graph.py）。
 
 按职责分组：
-- 入口与分流：save_human_session_memory（用户消息落库）、gate（三分类 0违规/1纯对话/2任务）、
+- 入口与分流：save_human_session_memory（用户消息落库）、generate_task_bind_id（本轮对话的任务绑定 UUID，
+  写进 State，供 AI 消息与任务共用）、gate（三分类 0违规/1纯对话/2任务）、
   violation_reply（违规写死回复，不调模型）
 - 记忆装配：relevant_user_memories（用户级记忆，读 PG store）与 recall（本会话切片，读 Milvus）
   由 gate 的条件边并行触发，context_build 汇合后统一渲染进唯一那条 SystemMessage
@@ -29,6 +30,7 @@ Agent 图节点集合（N1–N16，共 16 个节点；拓扑与条件边见 grap
    message_id 过滤删除后重写，或从 MySQL 全量重建索引。
 """
 import logging
+import uuid
 from typing import List, Dict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
@@ -195,10 +197,14 @@ async def _save_session_memory(
     collection_name = _session_collection_name(user_id, conversation_id)
 
     async with session_scope() as db:
+        # 任务绑定 UUID 只标在 AI 消息上：user / system 行一律留 NULL。
+        # 这样 chat_message 里凡是 task_bind_id 非空的行，都是某一轮对话的 AI 回复，
+        # agent_task.task_bind_id 与它相等的行就是这一轮产生的任务。
         entity = ChatMessageEntity(
             conversation_id=conversation_id,
             role=role,
             content=content,
+            task_bind_id=state.task_bind_id if role == "assistant" else None,
         )
         db.add(entity)
 
@@ -346,6 +352,27 @@ async def llm_node(state: State) -> Dict:
     return {
         "task_messages": task_messages,
     }
+
+
+async def generate_task_bind_id(state: State) -> dict:
+    """为本轮对话生成任务绑定 UUID，写进 State.task_bind_id。
+
+    位置：紧跟 save_human_session_memory 之后、gate 之前，即入口落库完成后、
+    任何分支判断之前。这样三条路径（违规 / 纯聊天 / 任务）都带着同一个 UUID：
+    - save_ai 落 AI 消息时把它写进 chat_message.task_bind_id（仅 assistant 行有值）；
+    - planner 建任务时把它写进 agent_task.task_bind_id。
+
+    两者相等即表示「这条任务由这条 AI 回复那一轮产生」，从而实现任务绑到对话而非会话。
+    每轮生成一次（uuid4），一轮内所有任务共用一个值；不同轮次互不串。
+
+    零副作用：只生成一个 UUID 字符串写进 State，不读库、不调模型、不改 messages。
+
+    :param state: 当前图状态，只读不需要；签名符合节点约定
+    :return: {"task_bind_id": "<uuid4 字符串>"}
+    """
+    task_bind_id = str(uuid.uuid4())
+    logger.info("本轮任务绑定 UUID 生成：%s", task_bind_id)
+    return {"task_bind_id": task_bind_id}
 
 
 async def save_human_session_memory(state: State, config: RunnableConfig) -> dict:
@@ -586,14 +613,19 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
     """按用户原话规划任务清单，落库后写进 State 并初始化任务临时记忆。
 
     PlannerOutput 的口径是「输出完整清单、整表覆盖」，一条 goal 一行；本节点只负责
-    把每条 goal 插成 agent_task 的 pending 行（归属只靠 conversation_id），refresh 拿到
-    自增 id 后另建纯数据 TaskItem —— ORM 实体不进 State。
+    把每条 goal 插成 agent_task 的 pending 行（conversation_id 作会话归属，
+    task_bind_id 绑到本轮 AI 回复那条对话），refresh 拿到自增 id 后另建纯数据 TaskItem
+    —— ORM 实体不进 State。
+
+    task_bind_id 来自入口 generate_task_bind_id 写进 State 的本轮 UUID，与随后 save_ai
+    落库的那条 AI 消息共用同一个值，据此把任务绑到具体对话而不只是会话。
 
     落库成功后把 State.task_list 整表返回（planning 会重建整张表，不追加到旧表），
     task_messages 重置为一条 TASK_EXECUTION_SYSTEM_PROMPT，后续执行只读这份临时记忆。
     """
     configurable = config.get("configurable", {})
     conversation_id = configurable.get("conversation_id") or configurable.get("thread_id")
+    task_bind_id = state.task_bind_id
     task_list = state.task_list
 
     planner_llm = PlannerLlmManager.get_planner_llm()
@@ -605,6 +637,7 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
             try:
                 task = AgentTaskEntity(
                     conversation_id=conversation_id,
+                    task_bind_id=task_bind_id,
                     goal=task_content,
                     status="pending",
                 )
@@ -616,6 +649,7 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
                 task_list.append(TaskItem(
                     id=task.id,
                     conversation_id=conversation_id,
+                    task_bind_id=task_bind_id,
                     goal=task_content,
                     status="pending",
                 ))
