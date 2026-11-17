@@ -13,11 +13,13 @@ uuid 保证并发生成时不撞 key，时间部分让人能直接看出这条�
 import logging
 import uuid
 from datetime import datetime
+from typing import List
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
 from app.db.postgresql.session import get_store
+from app.schemas.graph.state import TaskItem, State
 
 logger = logging.getLogger(__name__)
 
@@ -96,4 +98,8 @@ async def save_user_memory(content: str, config: RunnableConfig) -> str:
     logger.info("用户记忆已保存：user_id=%s key=%s content_len=%s", user_id, key, len(fact))
     return f"已记住：{fact}"
 
+@tool(name_or_callable="update_tasks")
+async def update_tasks(state: State,updated_tasks: List[TaskItem]) -> List[TaskItem]:
+    old_tasks = state.task_list
+    for updated_task in updated_tasks:
 
