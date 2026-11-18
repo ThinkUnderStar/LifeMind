@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # 查询变体相关配置
     MULTI_QUERY_MODEL: str = ""
 
+    # =================== 联网搜索相关配置 =====================
+    # Tavily API Key：具体值由 Nacos agent.yaml 注入
+    TAVILY_API_KEY: str = ""
+
     # ==================== Pydantic 配置加载规则 ====================
     model_config = SettingsConfigDict(
         env_file=".env",

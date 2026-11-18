@@ -34,3 +34,6 @@ psycopg[binary]==3.3.6
 
 # milvus 向量数据库
 pymilvus==2.6.3
+
+# Tavily 联网搜索
+tavily-python==0.7.26

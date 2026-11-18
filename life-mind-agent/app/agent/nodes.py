@@ -56,9 +56,9 @@ from app.rag.document_processor import llm_memory_processor
 from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
 from app.schemas.graph.state import State, TaskItem
-from app.util.any_to_str import session_memories_to_str, user_memories_to_str, task_list_to_str
+from app.util.any_to_str import session_memories_to_str, user_memories_to_str, task_list_to_str, task_list_to_executor_prompt
 
-from app.agent.tools import save_user_memory
+from app.agent.tools import save_user_memory, update_tasks, recall_memory, web_search
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,19 @@ def _session_collection_name(user_id: int, conversation_id: int) -> str:
 
 
 # ============================== 内部工具函数 ==================================
+
+
+async def _render_task_system_message(task_list: List[TaskItem]) -> SystemMessage:
+    """把当前任务清单渲染成执行层的那条系统消息（task_messages[0]）。
+
+    planner 初始化、assemble 每装配一步都会调它，用当时的 task_list 重新渲染：
+    未完成任务带 id / 状态，已完成任务带结果，执行层模型据此知道还能调哪些任务。
+    返回全新的 SystemMessage（无 id），调用方整表替换 task_messages[0] 即可。
+    """
+    rendered = await TASK_EXECUTION_SYSTEM_PROMPT.ainvoke(
+        {"task_list": task_list_to_executor_prompt(task_list)}
+    )
+    return SystemMessage(content=rendered.to_string())
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -444,6 +457,8 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
     """
     # 任务流水只进 task_messages（llm_node 把带 tool_calls 的 AIMessage 写在这里），
     # 不能读主 messages —— 那是给用户看的历史，两处不是同一个列表
+    task_list = state.task_list
+    task_messages = state.task_messages
     last_message = state.task_messages[-1] if state.task_messages else None
     last_ai_message = last_message if isinstance(last_message, AIMessage) else None
     tool_approval = state.tool_approval
@@ -484,6 +499,28 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
 
             messages.append(ToolMessage(tool_call_id=tool_id, content=result))
 
+        # 新增任务或修改未动的任务
+        elif tool_name == "update_tasks":
+            # state 是 InjectedToolArg：模型看不到也不用传，必须放进 input dict 显式注入；
+            # 用 kwargs 传 state= 不会生效（LangChain 只认 input dict 里的同名字段）。
+            task_list = await update_tasks.ainvoke(
+                {**tool_args, "state": state},
+                config=config,
+            )
+            system_info = await _render_task_system_message(task_list)
+            task_messages[0] = system_info
+            messages.append(ToolMessage(tool_call_id=tool_id, content="已更新任务列表"))
+
+        # 主动回忆本会话的历史内容：只读、非敏感，结果作为工具返回值回填给模型
+        elif tool_name == "recall_memory":
+            result = await recall_memory.ainvoke(tool_args, config=config)
+            messages.append(ToolMessage(tool_call_id=tool_id, content=result))
+
+        # 联网搜索：只读、非敏感；能否真正联网由工具内部读 config 开关决定
+        elif tool_name == "web_search":
+            result = await web_search.ainvoke(tool_args, config=config)
+            messages.append(ToolMessage(tool_call_id=tool_id, content=result))
+
         # 无匹配工具的兜底操作
         else:
             messages.append(ToolMessage(tool_call_id=tool_id,content="工具库中并没有你想调用的工具"))
@@ -491,7 +528,10 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
 
     # ToolMessage 必须回写 task_messages：下一轮 llm_node 读它才能看到工具结果；
     # 写进主 messages 会污染给用户看的历史。task_messages 无 reducer，整表覆盖
-    return {"task_messages": [*state.task_messages, *messages]}
+    return {
+        "task_messages": [*task_messages, *messages],
+        "task_list": task_list,
+    }
 
 async def gate(state: State) -> Dict:
     """意图分流：把本轮用户原话交给 gate 模型做三分类，只写 type 字段。
@@ -576,6 +616,9 @@ async def assemble(state: State) -> Dict:
     HumanMessage 追加进 task_messages（只放临时记忆，不进主 messages）。
     running_task_id 记下当前任务 id，供 check_step 收尾时定位。
 
+    每装配一步都会用最新 tasks 重渲染 task_messages 第一条 SystemMessage（热更新任务清单），
+    其余执行流水保留：模型每步都看得到未完成任务及其 id、已完成任务的结论。
+
     task_list 是普通 List 无 reducer，这里原地改对象后整表返回；找不到库行或没有 pending
     任务时返回 {}，不会破坏现有状态。
     """
@@ -596,7 +639,12 @@ async def assemble(state: State) -> Dict:
 
                 tasks[i].status = "running"
 
-                task_messages = [*state.task_messages, HumanMessage(
+                # 热更新第一条系统消息：用刚改过的 tasks（本条已是 running）重渲染任务清单，
+                # 让执行模型每步都看到最新的未完成/已完成分组和各自 id；其余执行流水原样保留。
+                # task_messages 无 reducer，整表覆盖；state.task_messages 为空时 rest 为空。
+                rest = state.task_messages[1:] if state.task_messages else []
+                system_message = await _render_task_system_message(tasks)
+                task_messages = [system_message, *rest, HumanMessage(
                     content=task.goal,
                 )]
 
@@ -621,7 +669,8 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
     落库的那条 AI 消息共用同一个值，据此把任务绑到具体对话而不只是会话。
 
     落库成功后把 State.task_list 整表返回（planning 会重建整张表，不追加到旧表），
-    task_messages 重置为一条 TASK_EXECUTION_SYSTEM_PROMPT，后续执行只读这份临时记忆。
+    task_messages 重置为一条渲染好任务清单的 TASK_EXECUTION_SYSTEM_PROMPT 系统消息，
+    后续执行只读这份临时记忆；清单由 assemble 每步热更新。
     """
     configurable = config.get("configurable", {})
     conversation_id = configurable.get("conversation_id") or configurable.get("thread_id")
@@ -657,9 +706,11 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
                 await db.rollback()
                 logger.error(e)
 
-    # 初始化任务临时对话记忆（append() 返回 None，用整表覆盖）
-    task_messages = [*state.task_messages,
-                     SystemMessage(content=TASK_EXECUTION_SYSTEM_PROMPT)]
+    # 初始化任务临时对话记忆。planner 是任务分支入口，这里 state.task_messages 通常是空的
+    # （无需保留历史），所以直接以渲染好的系统消息作为第一条即可。旧写法是把静态文案用
+    # [*state.task_messages, ...] 追加，现在文案改成带清单的模板，必须经 helper 渲染成 str。
+    system_message = await _render_task_system_message(task_list)
+    task_messages = [system_message]
 
     return {
         "task_list": task_list,
@@ -727,6 +778,10 @@ async def check_step(state: State) -> Dict:
 
     然后看还有没有 pending：有则 has_tasks=True（条件边回 assemble），否则 False
     （去 finalize）。库里查不到该行时只记日志、跳过写库，但 State 侧照常推进，避免卡队列。
+
+    本条置 done 后会热更新 task_messages 第一条系统消息，把最新的完成态与 result
+    渲染进清单快照。这一步不能省：最后一条任务完成后直接去 finalize、不再回 assemble，
+    若只靠 assemble 热更新，完成态就永远进不了系统消息。
     """
     over_task_id = state.running_task_id
     task_list = state.task_list
@@ -743,20 +798,27 @@ async def check_step(state: State) -> Dict:
             db_task.result = result
             await db.commit()
 
-    for i,task in enumerate(task_list):
+    # 先完整更新本条状态，再单独判断队列：不在同一个循环里提前 return，
+    # 否则本条排在 pending 之后时 State 侧的 done / result 会被跳过，热更新拿到旧状态。
+    for i, task in enumerate(task_list):
         if task.id == over_task_id:
             task_list[i].status = "done"
             task_list[i].result = result
 
-        if task.status == "pending" and task.id != over_task_id:
-            return {
-                "has_tasks": True,
-                "task_list": task_list,
-            }
+    has_pending = any(
+        task.status == "pending" and task.id != over_task_id
+        for task in task_list
+    )
+
+    # 用刚置好的最新清单热更新第一条系统消息，其余执行流水（含本条结果消息）保留。
+    rest = state.task_messages[1:] if state.task_messages else []
+    system_message = await _render_task_system_message(task_list)
+    task_messages = [system_message, *rest]
 
     return {
-        "has_tasks": False,
+        "has_tasks": has_pending,
         "task_list": task_list,
+        "task_messages": task_messages,
     }
 
 async def finalize(state: State) -> Dict:

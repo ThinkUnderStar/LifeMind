@@ -1,4 +1,5 @@
 import logging
+from typing import Any, Dict
 
 from langchain_core.documents import Document
 from langgraph.store.base import SearchItem
@@ -168,3 +169,127 @@ def task_list_to_str(tasks: list[TaskItem] | None) -> str:
             lines.append(f"   执行结果：{result.strip()}")
 
     return "\n".join(lines)
+
+
+def task_list_to_executor_prompt(tasks: list[TaskItem] | None) -> str:
+    """把任务清单拼成给「执行层模型」看的提示词文本，按状态分成未完成 / 已完成两组。
+
+    与 task_list_to_str 的分工：那个是给 planner 看的全量清单（含 result），
+    输出连续序号、按清单顺序；这个是每执行完一步热更新进 task_messages 第一条
+    SystemMessage 的快照，重点是让执行层模型知道「还有哪些没跑、每条的 id 是多少、
+    已经完成的结论是什么」，以便它在执行中按 id 调整后续未运行任务。
+
+    分组口径（按 State 约定，status 只有 pending / running / done）：
+    - 【未完成任务】：pending（待执行）+ running（执行中）。这两类的 id 是可调整目标，
+      每条给出「id / 状态 / 目标」，模型据此在任务工具里指定改哪条。
+    - 【已完成任务】：done。每条额外带执行结果（result），供模型判断重试时卡在哪，
+      但这组的任务一律不可再改。
+    两组各自内部沿用清单顺序（即 agent_task.id 升序），编号直接用数据库 id，
+    不再另编 1/2/3 序号——因为模型要拿这个数字去调任务工具，必须是真实 id。
+
+    输入契约：元素需有 goal: str；id / status / result 可缺，分别按「未知 / pending / 无」处理。
+    goal 非字符串或空白的脏数据记 warn 跳过。全空时返回明确文案，不留空串让模型瞎猜。
+
+    :param tasks: State.task_list，允许 None / 空列表
+    :return: 可直接填进提示词占位符的纯文本
+    """
+    if not tasks:
+        return "（当前没有任务）"
+
+    pending_lines: list[str] = []
+    done_lines: list[str] = []
+
+    for index, task in enumerate(tasks, start=1):
+        goal = getattr(task, "goal", None)
+        if not isinstance(goal, str) or not goal.strip():
+            logger.warning("任务目标为空或不是字符串，已跳过：第 %s 条 %r", index, type(goal))
+            continue
+
+        task_id = getattr(task, "id", None)
+        id_text = f"id={task_id}" if task_id is not None else "id=未知"
+
+        status = getattr(task, "status", None)
+        if not isinstance(status, str) or not status.strip():
+            status = "pending"
+
+        line = f"- [{id_text}] [{status}] {goal.strip()}"
+        if status == "done":
+            result = getattr(task, "result", None)
+            if isinstance(result, str) and result.strip():
+                line += f"\n    结果：{result.strip()}"
+            done_lines.append(line)
+        else:
+            pending_lines.append(line)
+
+    if not pending_lines and not done_lines:
+        return "（当前没有有效任务）"
+
+    blocks: list[str] = []
+    if pending_lines:
+        blocks.append("【未完成任务 · 仅这些可按 id 调整】\n" + "\n".join(pending_lines))
+    if done_lines:
+        blocks.append("【已完成任务 · 不可再改，结果供参考】\n" + "\n".join(done_lines))
+
+    return "\n\n".join(blocks)
+
+
+def format_tavily_response(response: Dict[str, Any] | None) -> str:
+    """把 Tavily search() 的原始响应拼成可直接注入提示词的纯文本。
+
+    唯一调用方是 web_search 工具：Tavily 返回的是一个 dict，直接丢给模型会带一堆
+    无关字段（维度、token 用量等），这里只留三段有用信息——answer（直接答案）、
+    results（标题 / 摘要 / 链接 / 发布日期）、images（图片链接 / 描述）。
+
+    纯文本、不带 emoji（这是提示词注入文本，不是给用户看的富文本）。字段缺失、
+    类型不对的条目记 warn 跳过，不让一条脏数据打断整轮；answer 与 results 都没有时
+    返回明确的「未找到」文案，而不是空串让模型自由发挥。
+
+    :param response: tavily_client.search() 的返回，允许 None
+    :return: 可直接回填 ToolMessage 的纯文本
+    """
+    if not response:
+        return "未找到相关搜索结果。"
+
+    blocks: list[str] = []
+
+    answer = response.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        blocks.append(f"直接答案：{answer.strip()}")
+
+    results = response.get("results")
+    if isinstance(results, list) and results:
+        lines: list[str] = []
+        for index, item in enumerate(results, start=1):
+            if not isinstance(item, dict):
+                logger.warning("Tavily 搜索结果第 %s 条不是 dict，已跳过：%r", index, type(item))
+                continue
+            title = item.get("title") or "无标题"
+            content = item.get("content") or "无摘要"
+            url = item.get("url") or ""
+            published = item.get("published_date") or ""
+            date_text = f"（发布于 {published}）" if published else ""
+            lines.append(
+                f"{index}. {title}{date_text}\n"
+                f"   {content}\n"
+                f"   链接：{url}"
+            )
+        if lines:
+            blocks.append("搜索结果：\n" + "\n".join(lines))
+
+    images = response.get("images")
+    if isinstance(images, list) and images:
+        image_lines: list[str] = []
+        for index, img in enumerate(images[:3], start=1):
+            if not isinstance(img, dict):
+                logger.warning("Tavily 图片第 %s 条不是 dict，已跳过：%r", index, type(img))
+                continue
+            img_url = img.get("url") or ""
+            img_desc = img.get("description") or ""
+            image_lines.append(f"{index}. {img_desc}（{img_url}）")
+        if image_lines:
+            blocks.append("相关图片：\n" + "\n".join(image_lines))
+
+    if not blocks:
+        return "未找到相关搜索结果。"
+
+    return "\n\n".join(blocks)

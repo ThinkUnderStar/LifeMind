@@ -14,7 +14,7 @@ from langchain_core.runnables import Runnable
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
-from app.agent.tools import save_user_memory
+from app.agent.tools import save_user_memory, update_tasks, recall_memory, web_search
 from app.core.settings import settings
 from app.schemas.graph.output import GateOutput, PlannerOutput
 
@@ -114,6 +114,12 @@ class ChatLlmWithToolsManager:
             chat_llm_with_tools = chat_llm.bind_tools([
                 # 保存为用户级记忆
                 save_user_memory,
+                # 新增任务或修改未完成的任务
+                update_tasks,
+                # 主动回忆本会话之前聊过的具体内容
+                recall_memory,
+                # Tavily 实时联网搜索（受 config.enable_web_search 开关控制）
+                web_search,
             ])
             # 整体替换而非新增，缓存只留当前配置一份
             cls._cache = {sig: chat_llm_with_tools}
