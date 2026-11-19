@@ -50,7 +50,9 @@ class MessageDto(BaseModel):
     id: int = Field(description="消息ID；回溯接口要用的就是 user 消息的这个 id")
     role: str = Field(description="消息角色：user / assistant / system")
     content: str = Field(description="消息正文")
-    status: int = Field(description="0-正常 1-生成失败")
+    status: int = Field(
+        description="消息状态，预留字段：当前写入路径恒为 0，尚无「生成失败」的落库逻辑",
+    )
     task_bind_id: Optional[str] = Field(
         default=None, description="任务绑定ID：仅 assistant 消息有值，与 agent_task 同值",
     )

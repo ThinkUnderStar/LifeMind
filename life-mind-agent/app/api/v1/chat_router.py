@@ -1,8 +1,9 @@
 """聊天与记忆操作接口。
 
-分三类：
+共 7 个接口，分四类：
 - 流式（SSE）：send / resume / backtrack，都会触达图，所以返回 text/event-stream；
-- 普通 JSON：删除会话记忆，只动存储不动图。
+- 只读查询：messages / tasks / pending，读 MySQL 或读一次图状态快照，不推进图；
+- 存储维护：删除会话记忆，只动存储不动图。
 
 归属校验一律放在构造 StreamingResponse 之前：流已经开始后再抛异常，
 前端收到的是半截 SSE 帧而不是 404，无法按状态码处理。

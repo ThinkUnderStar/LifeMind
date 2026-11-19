@@ -1,5 +1,6 @@
 """
-Agent 图节点集合（N1–N16，共 16 个节点；拓扑与条件边见 graph.py）。
+Agent 图节点集合（add_node 注册 17 个：编号 N1–N16，外加 gate 的分支节点 violation_reply；
+拓扑与条件边见 graph.py）。
 
 按职责分组：
 - 入口与分流：save_human_session_memory（用户消息落库）、generate_task_bind_id（本轮对话的任务绑定 UUID，
@@ -58,7 +59,7 @@ from app.rag.vector_store import vector_store
 from app.schemas.graph.state import State, TaskItem
 from app.util.any_to_str import session_memories_to_str, user_memories_to_str, task_list_to_str, task_list_to_executor_prompt
 
-from app.agent.tools import save_user_memory, update_tasks, recall_memory, web_search
+from app.agent.tools import save_user_memory, update_tasks, recall_memory, web_search, USER_MEMORY_NAMESPACE
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +68,9 @@ logger = logging.getLogger(__name__)
 # 正常切分后的 chunk 远小于这个值，这里只是最后一道保险。
 MEMORY_TEXT_MAX_BYTES = 16384
 
-# 用户级长期记忆在 store 里的命名空间首段，第二段是 user_id。
-# 写成常量是为了让「写记忆」和「搜记忆」用同一个值——这两处一旦不一致，
+# 用户级长期记忆在 store 里的命名空间，常量由 tools.py 唯一定义、这里 import。
+# 不在本模块另立一份：「写记忆」在 tools、「读记忆」在这里，两份各写一次漏改其中一处，
 # 表现是「记忆写进去了但永远搜不到」，且不会报错。
-USER_MEMORY_NAMESPACE = "users_memory"
-
-# 每轮注入系统提示词的相关记忆条数上限。多了会挤占上下文且稀释重点，
-# 语义检索按相似度降序，取前几条就够。
-USER_MEMORY_TOP_K = 5
 
 # 每个会话一个 collection，按名字记住哪些已建表并 load。
 # 用集合而不是单个 bool：新会话第一次写入时不能因为「别的会话建过了」就跳过建表。
@@ -357,7 +353,7 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
     汇合点 context_build 读本字段填进 SYSTEM_PROMPT_TEMPLATE 的 {memories}。
     本节点不碰 messages —— 渲染系统提示词是 N6 的职责，避免并行分支写同一 channel。
 
-    取法：PG store 的 ("users_memory", user_id) 命名空间 asearch，不做语义检索
+    取法：PG store 的 (USER_MEMORY_NAMESPACE, user_id) 命名空间 asearch，不做语义检索
     （store 未配 index_config 时 query 会被忽略），按更新时间取前若干条。
 
     Note:
@@ -365,7 +361,7 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
            真按本轮提问检索需要先给 store 配 index_config。
         2. 这里没有 try/except：store 异常会直接冒到全局异常处理器，整轮对话失败，
            与「记忆读失败不影响回答」的 fail-open 约定相反。
-        3. user_id 用 == "" 判空判不出 None，显式传 None 时会拼出 ("users_memory", "None")
+        3. user_id 用 == "" 判空判不出 None，显式传 None 时会拼出 (USER_MEMORY_NAMESPACE, "None")
            这个命名空间，表现是静默读不到记忆而不是报错。
         4. state.messages[0] 仍校验是不是 SystemMessage，但只用于前置检查，本节点不改它。
 
@@ -384,7 +380,7 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
         logger.error("未传入user_id")
         return {}
 
-    name_space = ("users_memory",str(user_id))
+    name_space = (USER_MEMORY_NAMESPACE, str(user_id))
     items = await get_store().asearch(name_space, limit=200)
     user_memories = user_memories_to_str(items, with_key=True, max_chars=None)
 
