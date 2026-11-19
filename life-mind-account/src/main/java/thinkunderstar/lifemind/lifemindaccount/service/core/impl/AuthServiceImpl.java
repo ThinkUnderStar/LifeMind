@@ -35,6 +35,7 @@ import thinkunderstar.lifemind.lifemindaccount.entity.UserIdentity;
 import thinkunderstar.lifemind.lifemindaccount.event.NotificationEvent;
 import thinkunderstar.lifemind.lifemindaccount.security.LifeMindUserDetails;
 import thinkunderstar.lifemind.lifemindaccount.service.core.AuthService;
+import thinkunderstar.lifemind.lifemindaccount.service.core.PluginService;
 import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.IdentityService;
 import thinkunderstar.lifemind.lifemindaccount.service.wrapper.LoginAuditService;
@@ -200,8 +201,9 @@ public class AuthServiceImpl implements AuthService {
      * 两条路径共用同一份 Redis key 与过期时间，避免 key 拼接在多处各存一份。
      */
     private final UserInfoService userInfoService;
+    private final PluginService pluginService;
 
-    public AuthServiceImpl(RedisTokenBucketLimiter rateLimiter, UserService userService, UserIdentityService userIdentityService, IdentityService identityService, PasswordEncoder passwordEncoder, StringRedisTemplate stringRedisTemplate, CaptchaVerifier captchaVerifier, LoginAuditService loginAuditService, RocketMQTemplate rocketMQTemplate, UserInfoService userInfoService, RedisTemplate<Object, Object> redisTemplate) {
+    public AuthServiceImpl(RedisTokenBucketLimiter rateLimiter, UserService userService, UserIdentityService userIdentityService, IdentityService identityService, PasswordEncoder passwordEncoder, StringRedisTemplate stringRedisTemplate, CaptchaVerifier captchaVerifier, LoginAuditService loginAuditService, RocketMQTemplate rocketMQTemplate, UserInfoService userInfoService, RedisTemplate<Object, Object> redisTemplate, PluginService pluginService) {
         this.rateLimiter = rateLimiter;
         this.userService = userService;
         this.userIdentityService = userIdentityService;
@@ -213,6 +215,7 @@ public class AuthServiceImpl implements AuthService {
         this.rocketMQTemplate = rocketMQTemplate;
         this.userInfoService = userInfoService;
         this.redisTemplate = redisTemplate;
+        this.pluginService = pluginService;
     }
 
     /**
@@ -912,6 +915,10 @@ public class AuthServiceImpl implements AuthService {
         //与网关回查时的读取必须完全一致）
         String scopes = userInfoService.loadScopesByIdentityIds(identityIds);
         userInfoService.cacheScopes(user.getId(), scopes);
+
+        //获取启用的插件并存入redis中（key 与过期时间由 PluginService 统一负责，
+        //网关读取的是同一份；登录时不算错，避免首个请求还要回源一次）
+        pluginService.cachePluginKeys(user.getId(), pluginService.queryEnabledPluginKeys(user.getId()));
 
         //取当前令牌版本号：同样是先读缓存、未命中才回查数据库并回填（由 UserInfoService 统一负责），
         //网关校验时读的是同一份缓存。改密会把版本号 +1，这里签发出来的下一个令牌才会带上新值

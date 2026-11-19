@@ -108,6 +108,59 @@ def _session_collection_name(user_id: int, conversation_id: int) -> str:
     return f"{settings.SESSION_MEMORY_COLLECTION}_{user_id}_{conversation_id}"
 
 
+async def drop_session_memory_collection(user_id: int, conversation_id: int) -> bool:
+    """
+    删除一个会话的向量集合（会话记忆清除 / 回溯重建时使用）。
+
+    必须同时清掉 `_ready_collections`：那是个进程内缓存，drop 之后若还留着名字，
+    下次写入会认为"表已建好"而跳过建表，随后写进一个不存在的集合里直接报错。
+
+    多实例部署时其他进程的缓存无法同步，属于该缓存本身的已知局限；
+    这里只保证当前进程的一致性。
+
+    :param user_id: 用户ID
+    :param conversation_id: 会话ID
+    :return: 集合原本是否存在（不存在时是幂等成功，返回 False）
+    """
+    collection_name = _session_collection_name(user_id, conversation_id)
+    client = get_milvus_client()
+
+    existed = await client.has_collection(collection_name=collection_name)
+    if existed:
+        await client.drop_collection(collection_name=collection_name)
+
+    _ready_collections.discard(collection_name)
+    logger.info("会话记忆集合已清理：%s existed=%s", collection_name, existed)
+    return existed
+
+
+async def delete_session_memory_since(user_id: int, conversation_id: int, create_time_text: str) -> None:
+    """
+    删除某时间点及之后写入的会话切片（时间回溯用）。
+
+    create_time 字段存的是 `isoformat(sep=" ")` 字符串，字典序等价于时间序，
+    因此可以直接用 >= 比较，不必解析成时间类型。
+    集合不存在时直接返回：说明这个会话还没产生过任何记忆，没什么可删。
+
+    :param user_id: 用户ID
+    :param conversation_id: 会话ID
+    :param create_time_text: 分界时间，格式 "YYYY-MM-DD HH:MM:SS[.ffffff]"
+    """
+    collection_name = _session_collection_name(user_id, conversation_id)
+    client = get_milvus_client()
+
+    if not await client.has_collection(collection_name=collection_name):
+        return
+
+    # 双引号包住时间值：表达式里出现空格和冒号，不加引号会被当成运算符
+    await client.delete(
+        collection_name=collection_name,
+        filter=f'create_time >= "{create_time_text}"',
+    )
+    logger.info("会话记忆切片已按时间清理：%s since=%s", collection_name, create_time_text)
+
+
+
 # ============================== 内部工具函数 ==================================
 
 
@@ -200,6 +253,10 @@ async def _save_session_memory(
         logger.error("会话记忆写入缺少 user_id/conversation_id，跳过：configurable=%s", configurable)
         return {}
 
+    # 只有用户消息记录分支点：它是"这一轮从哪个快照开始"的锚，AI 回复用不上。
+    # 值来自请求入口的 aget_state（见 chat_service._load_thread_state），首轮为空。
+    from_checkpoint_id = configurable.get("from_checkpoint_id") if role == "user" else None
+
     try:
         user_id, conversation_id = int(user_id), int(conversation_id)
     except (TypeError, ValueError):
@@ -217,6 +274,7 @@ async def _save_session_memory(
             conversation_id=conversation_id,
             role=role,
             content=content,
+            from_checkpoint_id=from_checkpoint_id,
             task_bind_id=state.task_bind_id if role == "assistant" else None,
         )
         db.add(entity)
@@ -333,7 +391,7 @@ async def relevant_user_memories(state: State, config: RunnableConfig) -> dict:
     return {"relevant_user_memories": user_memories}
 
 
-async def llm_node(state: State) -> Dict:
+async def llm_node(state: State, config: RunnableConfig) -> Dict:
     """
     调用带工具的执行模型，跑一个任务步。
 
@@ -346,13 +404,19 @@ async def llm_node(state: State) -> Dict:
 
     Args:
         state: 图状态，只读 task_messages。
+        config: 运行时配置，这里只取 configurable.enabled_plugins，
+            决定本次绑给模型的工具集（内置工具 + 已启用插件的服务工具）。
 
     Returns:
         dict: {"task_messages": [...原消息, 本轮 AIMessage]}。task_messages 无 reducer，
         必须整表覆盖；不走 Command，分支由条件边决定。
     """
+    # 插件集合来自网关注入的请求头，由服务层写进 configurable；
+    # 缺失时为空串，此时只绑定内置工具（fail-closed：宁可少一个插件）
+    enabled_plugins = (config.get("configurable") or {}).get("enabled_plugins", "")
+
     response = None
-    chat_llm_with_tools = ChatLlmWithToolsManager.get_chat_llm_with_tools()
+    chat_llm_with_tools = ChatLlmWithToolsManager.get_chat_llm_with_tools(enabled_plugins)
     async for chunk in chat_llm_with_tools.astream(state.task_messages):
         # 这边的AIMessage对象相加等价于content拼接
         response = chunk if response is None else response + chunk

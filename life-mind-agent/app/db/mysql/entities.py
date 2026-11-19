@@ -24,6 +24,8 @@ class ChatMessageEntity(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="消息ID")
     conversation_id = Column(BigInteger, nullable=False, index=True, comment="会话ID")
     role = Column(String(20), nullable=False, comment="消息角色: user-用户 assistant-AI system-系统")
+    from_checkpoint_id = Column(String(255), nullable=True,
+                               comment="分支源快照ID：本条user消息所在轮的父checkpoint，回溯重生成时从它分叉；仅user消息有值，首轮为NULL")
     task_bind_id = Column(String(36), nullable=True, comment="任务绑定ID：一轮对话的UUID，仅AI(assistant)消息有值，user/system消息为NULL")
     content = Column(Text, nullable=False, comment="消息内容")
     status = Column(SmallInteger, nullable=False, default=0, index=True, comment="0-正常 1-失败")

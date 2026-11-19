@@ -31,6 +31,8 @@ public class SpringSecurityConfig {
                     //查询权限、查询令牌版本属于内部接口不接受调用
                     .pathMatchers("/life-mind/account/user/internal/permissions").denyAll()
                     .pathMatchers("/life-mind/account/user/internal/token-version").denyAll()
+                    //插件集合内部接口：只允许网关自己回源调用，外部一律拒绝
+                    .pathMatchers("/life-mind/account/user/internal/plugins").denyAll()
                     .pathMatchers("/**").authenticated();
         });
 

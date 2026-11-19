@@ -8,13 +8,13 @@ Agent 组件：聊天大模型。
 「怎么造实例」在下面的 _create_chat_llm，「造好的实例怎么复用」在各自的签名缓存里。
 调用方一律走 Manager 取实例，不要自己 new。
 """
-from typing import Tuple
+from typing import Any, Optional, Tuple
 
 from langchain_core.runnables import Runnable
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
-from app.agent.tools import save_user_memory, update_tasks, recall_memory, web_search
+from app.agent.service_catalog import resolve_tools, tools_fingerprint
 from app.core.settings import settings
 from app.schemas.graph.output import GateOutput, PlannerOutput
 
@@ -81,48 +81,61 @@ class ChatLlmWithToolsManager:
     而是返回 tool_calls，由节点决定是去执行工具还是继续往下走。
 
     核心机制与 ChatLlmManager 一致（懒加载 + 签名缓存），
-    区别只是这里的实例多了一层 bind_tools。
+    区别是这里有两层签名：
+    - 配置签名（模型名 / 温度 / base_url / api_key）：变了就整体清空缓存，
+      保证 Nacos 热更新后不会继续用旧模型；
+    - 工具签名（用户启用的插件集合）：不同用户启用不同插件，工具集不同，
+      所以同一个模型配置下会有多份 bind 结果，按插件集合分别缓存。
     """
 
-    # 缓存：{ (模型名, 温度, base_url, api_key): 已绑定工具的模型 }
-    _cache: dict[Tuple[str, str, str, float], Runnable] = {}
+    # 缓存：{ 配置签名 + 插件指纹: 已绑定工具的模型 }
+    _cache: dict[Tuple[str, str, str, float, Tuple[str, ...]], Runnable] = {}
+
+    # 上一次使用的模型配置签名：变化时整体清空缓存
+    _config_sig: Optional[Tuple[str, str, str, float]] = None
+
+    # 缓存条目上限：插件组合数是 2^n（n 为插件种数，个位数），
+    # 正常远达不到这个数；设上限只为防止脏数据（请求头里塞几百个 key）把内存撑爆
+    _MAX_CACHE_SIZE = 32
 
     @classmethod
-    def get_chat_llm_with_tools(cls) -> Runnable:
+    def get_chat_llm_with_tools(cls, enabled_plugins: Any = "") -> Runnable:
         """
         获取绑定了工具集的模型实例。
 
-        注意：工具列表是在这里 bind 进 Runnable 的，属于实例的一部分；
-        而签名只取自模型配置、不含工具列表，所以增删工具不会触发重建，
-        改完工具集需要重启或清缓存才生效。
+        Args:
+            enabled_plugins: 用户启用的插件集合，或 `LifeMind-User-Plugins` 原始串。
+                网关注入、服务层透传；缺失时为空，此时只绑定内置工具（fail-closed）。
 
         Returns:
             Runnable: 已绑定工具的模型，支持 astream / ainvoke，输出里可能带 tool_calls。
         """
-        # 签名与 ChatLlmManager 保持一致，同样是四个模型配置项
-        sig = (
+        # 配置签名只取模型四项：与 ChatLlmManager 保持一致
+        config_sig = (
             settings.CHAT_MODEL_NAME,
             settings.CHAT_MODEL_TEMPERATURE,
             settings.CHAT_MODEL_BASE_URL,
             settings.CHAT_MODEL_API_KEY,
         )
 
+        # 配置变了：旧实例全部作废，连同按插件分出来的多份 bind 结果一起清掉
+        if cls._config_sig != config_sig:
+            cls._cache.clear()
+            cls._config_sig = config_sig
+
+        # 工具签名：同一组插件不管请求头里顺序如何，都命中同一条缓存
+        sig = config_sig + (tools_fingerprint(enabled_plugins),)
+
         if sig not in cls._cache:
-            # 先取底层模型再绑工具：两层缓存各自独立，热更新时一起失效
+            if len(cls._cache) >= cls._MAX_CACHE_SIZE:
+                cls._cache.clear()
+
+            # 先取底层模型再绑工具：两层缓存各自独立，配置热更新时一起失效
             chat_llm = ChatLlmManager.get_chat_llm()
-            # 工具集暂为空，待注册；bind 阶段不报错，但请求时 tools=[] 会被多数接口拒绝
-            chat_llm_with_tools = chat_llm.bind_tools([
-                # 保存为用户级记忆
-                save_user_memory,
-                # 新增任务或修改未完成的任务
-                update_tasks,
-                # 主动回忆本会话之前聊过的具体内容
-                recall_memory,
-                # Tavily 实时联网搜索（受 config.enable_web_search 开关控制）
-                web_search,
-            ])
-            # 整体替换而非新增，缓存只留当前配置一份
-            cls._cache = {sig: chat_llm_with_tools}
+
+            # 工具集 = 内置工具 + 已启用插件的服务工具；未启用的服务工具不会出现在这里，
+            # 模型看不到它就不会去调用，这比"调用了再拒绝"少一轮无效往返
+            cls._cache[sig] = chat_llm.bind_tools(resolve_tools(enabled_plugins))
 
         return cls._cache[sig]
 

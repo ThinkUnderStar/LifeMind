@@ -16,6 +16,7 @@ import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByEmail
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByOriginalRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByPhoneRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeUsernameRequest;
+import thinkunderstar.lifemind.lifemindaccount.service.core.PluginService;
 import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 
 @RestController
@@ -23,9 +24,11 @@ import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 public class UserInfoController {
 
     private final UserInfoService userInfoService;
+    private final PluginService pluginService;
 
-    public UserInfoController(UserInfoService userInfoService) {
+    public UserInfoController(UserInfoService userInfoService, PluginService pluginService) {
         this.userInfoService = userInfoService;
+        this.pluginService = pluginService;
     }
 
     /*
@@ -224,5 +227,23 @@ public class UserInfoController {
     @GetMapping("/internal/token-version")
     public Result<Integer> internalTokenVersion(@RequestParam("userId") Long userId) {
         return userInfoService.getTokenVersionByUserId(userId);
+    }
+
+    /**
+     * 获取指定用户当前启用的插件标识（内部接口）。
+     *
+     * <p>与 {@code /user/internal/permissions} 同一用途：网关在 Redis 读不到
+     * 插件集合时回查这里，回源成功后由网关回填缓存。
+     * 同样在 {@code SpringSecurityConfig} 与 {@code HeaderAuthenticationFilter} 中放行，
+     * 网关对 {@code /life-mind/account/user/internal/plugins} 是 denyAll，外部调不进来。
+     *
+     * <p>返回的 data 是逗号分隔的插件标识串，与 {@code LifeMind-User-Plugins}
+     * 请求头格式一致；用户一个插件都没启用时 data 为空串。
+     *
+     * @param userId 用户 ID
+     */
+    @GetMapping("/internal/plugins")
+    public Result<String> internalPlugins(@RequestParam("userId") Long userId) {
+        return pluginService.getPluginKeysByUserId(userId);
     }
 }

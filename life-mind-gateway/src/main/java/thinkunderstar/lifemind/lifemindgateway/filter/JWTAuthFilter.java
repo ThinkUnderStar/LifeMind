@@ -96,6 +96,27 @@ public class JWTAuthFilter implements WebFilter {
     private static final String SCOPES_NOT_CACHED = "none";
 
     /**
+     * 插件集合缓存的 key 后缀，完整 key 为 {@code life-mind:{userId}:plugins}，
+     * 必须与 account 服务写入的 key 完全一致。
+     */
+    private static final String USER_PLUGINS_KEY_SUFFIX = ":plugins";
+
+    /**
+     * 插件集合缓存有效期，与 account 服务写入时保持一致。
+     */
+    private static final Duration PLUGINS_TTL = Duration.ofDays(7);
+
+    /**
+     * account 服务插件集合接口的路径部分（注意不含 scheme 和 host）。
+     */
+    private static final String PLUGINS_QUERY_PATH = "/user/internal/plugins";
+
+    /**
+     * 回源 account 服务查询插件集合的超时时间，与权限一致。
+     */
+    private static final Duration PLUGINS_QUERY_TIMEOUT = Duration.ofSeconds(3);
+
+    /**
      * 负载均衡的 URI scheme。设成 "lb" 后由 ReactiveLoadBalancerClientFilter
      * 把它替换成真实的服务实例地址。
      */
@@ -158,6 +179,15 @@ public class JWTAuthFilter implements WebFilter {
     private static final String INTERNAL_TOKEN_VERSION_PATH = "/life-mind/account/user/internal/token-version";
 
     /**
+     * account 服务的查询插件集合接口（内部接口），跳过 JWT 校验。
+     *
+     * <p>与 {@link #INTERNAL_PERMISSIONS_PATH} 同理：网关自己在缓存未命中时回源调用它，
+     * 走的是 {@code lb://} 到服务实例，不经过这条过滤器链；
+     * 外部请求由网关 Security 里的 denyAll 挡掉。
+     */
+    private static final String INTERNAL_PLUGINS_PATH = "/life-mind/account/user/internal/plugins";
+
+    /**
      * 访问MinIO的公开的桶的路径前缀
      */
     private static final String MINIO_PUBLIC_PATH_PREFIX = "/minio/life-mind-public";
@@ -183,6 +213,7 @@ public class JWTAuthFilter implements WebFilter {
         if (path.equals(REGISTER_PATH)
                 || path.equals(INTERNAL_PERMISSIONS_PATH)
                 || path.equals(INTERNAL_TOKEN_VERSION_PATH)
+                || path.equals(INTERNAL_PLUGINS_PATH)
                 || path.startsWith(LOGIN_PATH_PREFIX)
                 || path.startsWith(SEND_CODE_PATH_PREFIX)
                 || path.startsWith(CAPTCHA_PATH_PREFIX)
@@ -364,7 +395,8 @@ public class JWTAuthFilter implements WebFilter {
                 .flatMap(cached -> {
                     //缓存命中：直接用缓存里的权限
                     if (!SCOPES_NOT_CACHED.equals(cached.toString())) {
-                        return passThrough(exchange, filterChain, jwt, userId, securityContext, cached.toString());
+                        return passThroughWithPlugins(exchange, filterChain, jwt, userId, securityContext,
+                                cached.toString());
                     }
 
                     //缓存未命中：回源 account 服务查权限
@@ -391,7 +423,7 @@ public class JWTAuthFilter implements WebFilter {
                                             log.warn("回填用户权限缓存失败, userId={}", userId, e);
                                             return Mono.just(scopes);
                                         })
-                                        .flatMap(loaded -> passThrough(
+                                        .flatMap(loaded -> passThroughWithPlugins(
                                                 exchange, filterChain, jwt, userId, securityContext, loaded));
                             });
                 });
@@ -575,16 +607,18 @@ public class JWTAuthFilter implements WebFilter {
     }
 
     /**
-     * 把用户信息与权限写入请求头，交给后续过滤器处理。
+     * 把用户信息、权限与插件集合写入请求头，交给后续过滤器处理。
      *
-     * @param scopes 权限标识串，逗号分隔；空串表示该用户没有任何权限
+     * @param scopes  权限标识串，逗号分隔；空串表示该用户没有任何权限
+     * @param plugins 启用的插件标识，逗号分隔；空串表示一个插件都没启用
      */
     private Mono<Void> passThrough(ServerWebExchange exchange,
                                    WebFilterChain filterChain,
                                    DecodedJWT jwt,
                                    String userId,
                                    SecurityContext securityContext,
-                                   String scopes) {
+                                   String scopes,
+                                   String plugins) {
         ServerHttpRequest mutate = exchange.getRequest().mutate().headers(
                 headers -> {
                     //添加用户ID
@@ -598,12 +632,145 @@ public class JWTAuthFilter implements WebFilter {
                     //添加用户权限
                     headers.remove("LifeMind-User-Scopes");
                     headers.set("LifeMind-User-Scopes", scopes);
+
+                    //添加用户启用的插件：agent 侧按它过滤可用的服务工具
+                    headers.remove("LifeMind-User-Plugins");
+                    headers.set("LifeMind-User-Plugins", plugins);
                 }
         ).build();
 
         return filterChain.filter(exchange.mutate().request(mutate).build())
                 //把上面构造好的 SecurityContext 写进 Reactor Context，后面的过滤器就认为已认证
                 .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(securityContext)));
+    }
+
+    /**
+     * 先解析该用户启用的插件集合，再连同权限一起注入请求头放行。
+     *
+     * <p>抽这一层是为了不改动 {@code checkScopes} 里两处放行分支的结构：
+     * 它们只关心「权限是多少」，插件集合在这里补齐。
+     *
+     * @param scopes 权限标识串，逗号分隔
+     */
+    private Mono<Void> passThroughWithPlugins(ServerWebExchange exchange,
+                                              WebFilterChain filterChain,
+                                              DecodedJWT jwt,
+                                              String userId,
+                                              SecurityContext securityContext,
+                                              String scopes) {
+        return resolvePlugins(userId)
+                .flatMap(plugins -> passThrough(
+                        exchange, filterChain, jwt, userId, securityContext, scopes, plugins));
+    }
+
+    /**
+     * 取用户启用的插件集合：先读 Redis，未命中回源 account 并回填。
+     *
+     * <p>与权限的关键差异：<b>这里失败不拒绝请求，降级成空串放行。</b>
+     * 原因有两个：
+     * <ul>
+     *     <li>插件是增强能力。插件集合取不到时，用户至少还能正常聊天，
+     *         只是服务类工具不可用；为此把整个对话打回 503 的代价明显更大。</li>
+     *     <li>真正必需的身份与权限在前面已经校验过（那一层是 fail-closed），
+     *         能走到这里说明用户本身是合法的。</li>
+     * </ul>
+     *
+     * <p>降级为空串而不是返回错误，agent 侧拿到空集合就会只绑定内置工具，
+     * 行为是安全的：宁可少一个插件，也不能把未启用的服务工具绑给模型。
+     *
+     * @param userId 用户 ID
+     * @return 逗号分隔的插件标识；取不到时为空串
+     */
+    private Mono<String> resolvePlugins(String userId) {
+        return reactiveRedisTemplate.opsForValue().get(pluginsKey(userId))
+                .map(Object::toString)
+                //缓存未命中：回源 account，成功后回填
+                .switchIfEmpty(Mono.defer(() -> fetchPluginsFromAccount(userId)
+                        .flatMap(plugins -> reactiveRedisTemplate.opsForValue()
+                                .set(pluginsKey(userId), plugins, PLUGINS_TTL)
+                                .thenReturn(plugins)
+                                //回填失败不影响本次请求：插件集合已经拿到了
+                                .onErrorResume(e -> {
+                                    log.warn("回填用户插件缓存失败, userId={}", userId, e);
+                                    return Mono.just(plugins);
+                                }))))
+                //Redis 异常 / 回源失败：降级为空集合，放行
+                .onErrorResume(e -> {
+                    log.warn("获取用户插件集合失败，降级为空集合放行, userId={}", userId, e);
+                    return Mono.just("");
+                })
+                .defaultIfEmpty("");
+    }
+
+    /**
+     * 回源 account 服务查询用户启用的插件集合。
+     *
+     * <p>返回空 Mono 表示「回源失败」（服务不可用、超时、响应结构不符合预期），
+     * 由 {@link #resolvePlugins(String)} 统一降级成空串；
+     * 返回空串表示「回源成功，但该用户一个插件都没启用」，属于正常结果，要缓存。
+     *
+     * <p>业务码非 200 时按「没有插件」处理：这是 account 给出的权威答复
+     * （用户不存在、账号被禁用），与权限接口的处理口径一致。
+     *
+     * @param userId 用户 ID
+     * @return 逗号分隔的插件标识；回源失败时返回空 Mono
+     */
+    private Mono<String> fetchPluginsFromAccount(String userId) {
+        return webClient.get()
+                .uri(uriBuilder -> uriBuilder
+                        //scheme 与 host 必须分别设置，原因见 fetchScopesFromAccount 的注释
+                        .scheme(LB_SCHEME)
+                        .host(ACCOUNT_SERVICE_ID)
+                        .path(PLUGINS_QUERY_PATH)
+                        .queryParam("userId", userId)
+                        .build())
+                .retrieve()
+                .bodyToMono(new ParameterizedTypeReference<Result<String>>() {
+                })
+                .map(this::resolvePluginsResponse)
+                .timeout(PLUGINS_QUERY_TIMEOUT)
+                //用 null 作为「回源失败」的标记，空串是「该用户没有插件」的有效值
+                .flatMap(Mono::justOrEmpty)
+                .onErrorResume(e -> {
+                    log.error("回源查询用户插件集合失败, userId={}", userId, e);
+                    return Mono.empty();
+                });
+    }
+
+    /**
+     * 校验 account 服务返回的插件响应体，取出插件标识串。
+     *
+     * @param result account 服务的响应
+     * @return 插件标识串；响应结构不符合预期或业务失败时返回 null（表示按无插件处理）
+     */
+    private String resolvePluginsResponse(Result<String> result) {
+        if (result == null || result.getCode() == null) {
+            log.error("回源查询用户插件集合返回结构不符合预期");
+            return null;
+        }
+
+        //业务码非 200：用户不存在 / 账号被禁用，本来就不该有插件，按空集合处理
+        if (!result.isSuccess()) {
+            log.warn("回源查询用户插件集合业务失败, code={}, message={}",
+                    result.getCode(), result.getMessage());
+            return "";
+        }
+
+        String data = result.getData();
+        if (data == null) {
+            log.error("回源查询用户插件集合返回空数据, 响应结构不符合预期");
+            return null;
+        }
+
+        return data;
+    }
+
+    /**
+     * 拼接插件集合在 Redis 中的 key，必须与 account 服务写入时完全一致，
+     * 否则每个请求都会回源查一次库。
+     */
+    private String pluginsKey(String userId) {
+        return USER_KEY_PREFIX + userId + USER_PLUGINS_KEY_SUFFIX;
     }
 
     /**
