@@ -30,6 +30,7 @@ Agent 图节点集合（add_node 注册 17 个：编号 N1–N16，外加 gate �
    代价是主键不承载业务含义，`upsert` 无从下手——节点重放会重复写行，要收口只能按
    message_id 过滤删除后重写，或从 MySQL 全量重建索引。
 """
+import json
 import logging
 import uuid
 from typing import List, Dict
@@ -60,6 +61,7 @@ from app.schemas.graph.state import State, TaskItem
 from app.util.any_to_str import session_memories_to_str, user_memories_to_str, task_list_to_str, task_list_to_executor_prompt
 
 from app.agent.tools import save_user_memory, update_tasks, recall_memory, web_search, USER_MEMORY_NAMESPACE
+from app.agent.service_catalog import find_tool, is_plugin_enabled, is_sensitive_tool, plugin_of_tool
 
 logger = logging.getLogger(__name__)
 
@@ -490,13 +492,22 @@ async def save_ai_session_memory(state: State, config: RunnableConfig) -> dict:
 
 async def run_tool(state: State, config: RunnableConfig) -> Dict:
     """
-    执行上一轮模型给出的工具调用，把每个结果包成 ToolMessage 回填到消息列表。
+    执行上一轮模型给出的工具调用，把每个结果包成 ToolMessage 回填到 task_messages。
 
     位置：llm_node 判断有 tool_calls 时 goto 到这里，执行完再回到 llm_node，
     所以工具轮次可以连续多轮，直到模型不再要求调用工具为止。
 
+    分发方式：只有两个内置工具需要特判，其余一律查表（service_catalog.find_tool）。
+    - save_user_memory：有 edit 语义（用户可以把内容改掉再存），参数不能原样透传；
+    - update_tasks：要把 State 注入进去，且改完得重渲染任务清单那条系统消息；
+    - 其余（内置只读工具 + 服务插件工具）：同一套模板——查实现 → 复核插件 → 看审批 → 执行。
+
+    为什么不给每个服务工具写一个 elif：服务工具是插件，接一个新组件就要加一批分支，
+    if/elif 会让这个节点每接一个服务就长一截。更糟的是漏写一个分支的表现是
+    「模型调了但只回一句『工具库中并没有你想调用的工具』」，从日志里看不出是漏了代码。
+
     Args:
-        state: 图状态，messages 的最后一条必须是带 tool_calls 的 AIMessage。
+        state: 图状态，task_messages 的最后一条必须是带 tool_calls 的 AIMessage。
         config: 运行时配置，原样转交给工具。必须传，否则工具取不到 configurable.user_id，
                 只会静默返回「未取到当前用户身份」，不报错也不落库。
 
@@ -505,15 +516,15 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
         顺序与调用顺序一致。写 task_messages 而非主 messages（后者是给用户看的历史）。
 
     Note:
-        1. 确认环节用 interrupt 实现，前端 resume 必须回 {"choice": ...}：
-           approve 按原参数执行、reject 不执行、edit 时取同级的 "edit" 字段替换内容。
-           整个节点没有 try/except，resume 回来的不是 dict 会直接抛 TypeError。
-        2. 未知工具不抛异常，只回一条说明：让模型知道这个工具不存在，
-           比让整轮请求失败可控。
-        3. 已知隐患：interrupt 在 for 循环里，而循环体内有写入副作用。resume 会从节点开头重放，
-           一次返回多个 tool_call 时，前面已执行的工具会被重复执行（同一条记忆会写两次）。
-        4. ToolMessage 的 tool_call_id 必须与 tool_call 的 id 严格对应，
-           少回一条，下一轮上游就会以「tool_calls 没有对应响应」拒绝继续对话。
+        1. 敏感工具必须先由 approval_gate 写好审批结果；这里读不到 approve 就跳过。
+           缺省按「拒绝」处理而不是「放行」：漏一次确认只是让用户重说一遍，
+           漏一次拦截就是模型擅自删掉了用户的日程。
+        2. 服务工具的插件在这里复查一次：绑定是在请求开始时算的，一轮任务跑很久，
+           中途用户停用了插件，不复查就会继续操作下去。
+        3. 工具抛出的非预期异常在这里兜住并回填提示，不让单个工具崩掉整轮任务；
+           可预期的失败（下游 4xx、服务连不上）已在工具内部转成中文文案。
+        4. 已知隐患：approval_gate 的 interrupt 在 for 循环里，resume 会从节点开头重放，
+           一次返回多个 tool_call 时，前面已执行的工具会被重复执行。
     """
     # 任务流水只进 task_messages（llm_node 把带 tool_calls 的 AIMessage 写在这里），
     # 不能读主 messages —— 那是给用户看的历史，两处不是同一个列表
@@ -522,6 +533,7 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
     last_message = state.task_messages[-1] if state.task_messages else None
     last_ai_message = last_message if isinstance(last_message, AIMessage) else None
     tool_approval = state.tool_approval
+    enabled_plugins = config.get("configurable", {}).get("enabled_plugins", "")
     messages = []
 
     if not last_ai_message:
@@ -532,37 +544,32 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
     for tool_call in tool_calls:
         tool_id = tool_call.get("id")
         tool_name = tool_call.get("name")
-        tool_args = tool_call.get("args")
-        # ==============================================================================================================
-        # 调用用户级记忆保存工具
+        tool_args = tool_call.get("args") or {}
+
+        # ==============================================================================
+        # 内置工具一：保存用户级记忆。多一种 edit 选择，参数不能原样透传
         if tool_name == "save_user_memory":
-            if tool_approval[str(tool_id)] == "approve":
+            decision = tool_approval.get(str(tool_id))
 
-                result = await save_user_memory.ainvoke(
-                    tool_args,
-                    config=config
-                )
-            elif tool_approval[str(tool_id)] == "reject":
-
+            if decision == "approve":
+                result = await save_user_memory.ainvoke(tool_args, config=config)
+            elif decision == "reject":
                 result = "用户拒绝将该内容添加进用户级记忆"
-            elif tool_approval[str(tool_id)].startswith("edit"):
-
+            elif isinstance(decision, str) and decision.startswith("edit:"):
                 result = await save_user_memory.ainvoke(
-                    {
-                        "content": tool_approval[str(tool_id)].split(":")[1]
-                    },
+                    {"content": decision.split(":", 1)[1]},
                     config=config,
                 )
             else:
-
                 result = "用户的工具调用认证异常，不符合规范"
 
             messages.append(ToolMessage(tool_call_id=tool_id, content=result))
+            continue
 
-        # 新增任务或修改未动的任务
-        elif tool_name == "update_tasks":
-            # state 是 InjectedToolArg：模型看不到也不用传，必须放进 input dict 显式注入；
-            # 用 kwargs 传 state= 不会生效（LangChain 只认 input dict 里的同名字段）。
+        # ==============================================================================
+        # 内置工具二：任务清单。state 是 InjectedToolArg，模型看不到也不用传，
+        # 必须放进 input dict 显式注入；用 kwargs 传 state= 不会生效
+        if tool_name == "update_tasks":
             task_list = await update_tasks.ainvoke(
                 {**tool_args, "state": state},
                 config=config,
@@ -570,21 +577,50 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
             system_info = await _render_task_system_message(task_list)
             task_messages[0] = system_info
             messages.append(ToolMessage(tool_call_id=tool_id, content="已更新任务列表"))
+            continue
 
-        # 主动回忆本会话的历史内容：只读、非敏感，结果作为工具返回值回填给模型
-        elif tool_name == "recall_memory":
-            result = await recall_memory.ainvoke(tool_args, config=config)
-            messages.append(ToolMessage(tool_call_id=tool_id, content=result))
+        # ==============================================================================
+        # 其余工具：内置只读工具与服务插件工具共用这一条路径
+        tool = find_tool(tool_name)
+        if tool is None:
+            messages.append(ToolMessage(tool_call_id=tool_id, content="工具库中并没有你想调用的工具"))
+            continue
 
-        # 联网搜索：只读、非敏感；能否真正联网由工具内部读 config 开关决定
-        elif tool_name == "web_search":
-            result = await web_search.ainvoke(tool_args, config=config)
-            messages.append(ToolMessage(tool_call_id=tool_id, content=result))
+        # 服务工具属于某个插件：本次请求没启用就不执行。正常情况下它不会被绑定给模型，
+        # 这里兜的是「绑定之后用户又停用了」以及模型凭记忆调出旧工具名两种情况
+        plugin_key = plugin_of_tool(tool_name)
+        if plugin_key is not None and not is_plugin_enabled(plugin_key, enabled_plugins):
+            logger.warning("工具 %s 所属插件 %s 未启用，跳过执行", tool_name, plugin_key)
+            messages.append(ToolMessage(
+                tool_call_id=tool_id,
+                content=f"当前用户没有启用「{plugin_key}」插件，这个操作没有执行。",
+            ))
+            continue
 
-        # 无匹配工具的兜底操作
-        else:
-            messages.append(ToolMessage(tool_call_id=tool_id,content="工具库中并没有你想调用的工具"))
-        # ==============================================================================================================
+        # 敏感工具必须拿到明确的 approve；reject 与「压根没审批记录」都算拒绝
+        if is_sensitive_tool(tool_name):
+            decision = tool_approval.get(str(tool_id))
+            if decision != "approve":
+                messages.append(ToolMessage(
+                    tool_call_id=tool_id,
+                    content="用户拒绝执行该操作。" if decision == "reject" else "这个操作没有获得用户确认，已跳过。",
+                ))
+                continue
+
+        try:
+            result = await tool.ainvoke(tool_args, config=config)
+        except Exception:
+            logger.error("工具执行出现非预期异常：tool=%s", tool_name, exc_info=True)
+            messages.append(ToolMessage(
+                tool_call_id=tool_id,
+                content=f"执行「{tool_name}」时出错了，请换个方式再试。",
+            ))
+            continue
+
+        messages.append(ToolMessage(
+            tool_call_id=tool_id,
+            content=result if isinstance(result, str) else str(result),
+        ))
 
     # ToolMessage 必须回写 task_messages：下一轮 llm_node 读它才能看到工具结果；
     # 写进主 messages 会污染给用户看的历史。task_messages 无 reducer，整表覆盖
@@ -778,19 +814,47 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
     }
 
 
-async def approval_gate(state: State,config: RunnableConfig) -> Dict:
-    """人工确认环节"""
+def _describe_tool_call(tool_name: str, tool_args: Dict) -> str:
+    """
+    为敏感的服务工具调用生成确认文案。
+
+    取工具描述的第一行当动作说明（`@tool` 的 docstring 首句本来就是「这个工具干什么」），
+    再附上模型给出的参数，让用户能自己判断要不要同意。参数截断到 300 字：
+    确认框是给人看的，长参数只会让用户不看完就点同意。
+    """
+    tool = find_tool(tool_name)
+    summary = "执行服务操作"
+    if tool is not None and tool.description:
+        first_line = tool.description.strip().splitlines()[0].strip() if tool.description.strip() else ""
+        if first_line:
+            summary = first_line.rstrip("。")
+
+    args_text = json.dumps(tool_args or {}, ensure_ascii=False)
+    if len(args_text) > 300:
+        args_text = args_text[:300] + "…"
+
+    return f"是否允许执行「{summary}」？\n参数：{args_text}"
+
+
+async def approval_gate(state: State, config: RunnableConfig) -> Dict:
+    """人工确认环节：敏感工具逐个确认，只读工具直接放行。
+
+    敏感性由 `service_catalog.is_sensitive_tool` 判断，名单不在本节点维护：
+    服务工具是插件，把名单写进图节点等于把插件的知识漏进编排层，
+    接一个新服务就要改两处（工具定义 + 这里），漏一处就是「新加的写操作不弹确认」。
+    口径：服务工具默认敏感，登记在 READONLY_TOOL_NAMES 的免确认。
+
+    权限：agent_permission=full 的用户完全信任 agent，敏感工具也不弹窗，直接记 approve；
+    normal（默认）才逐次确认。取值缺失或未知时按 normal 处理（fail-closed）。
+
+    只处理敏感工具，非敏感工具既不弹窗也不写审批表——run_tool 那边同样不查表，两边口径一致。
+    """
     # 与 run_tool 对齐：带 tool_calls 的 AIMessage 在 task_messages，不在主 messages
     last_message = state.task_messages[-1] if state.task_messages else None
     last_ai_message = last_message if isinstance(last_message, AIMessage) else None
     configurable = config.get("configurable", {})
     agent_permission = configurable.get("agent_permission", "normal")
     tool_approval = {}
-
-    # 敏感工具集合
-    sensitive_tools = [
-        "save_user_memory",
-    ]
 
     if not last_ai_message:
         logger.info("工具运行节点获取到的最后一条消息对象不为AI发的消息")
@@ -800,34 +864,51 @@ async def approval_gate(state: State,config: RunnableConfig) -> Dict:
     for tool_call in tool_calls:
         tool_name = tool_call.get("name")
         tool_id = tool_call.get("id")
-        tool_args = tool_call.get("args")
+        tool_args = tool_call.get("args") or {}
 
-        # 完全信任agent的判断逻辑
-        if agent_permission == "full" and tool_name in sensitive_tools:
+        # 只读工具直接放行：查询日程不需要用户点同意，否则每问一句都弹窗
+        if not is_sensitive_tool(tool_name):
+            continue
+
+        # 完全信任 agent：不弹窗，直接记成 approve 交给 run_tool
+        if agent_permission == "full":
             tool_approval[str(tool_id)] = "approve"
             continue
 
-        # ==============================================================================================================
-        # 调用用户级记忆保存工具
+        # ==============================================================================
+        # 内置工具：保存用户级记忆。多一个 edit 选项，用户可以先改内容再存
         if tool_name == "save_user_memory":
             user_choice = interrupt({
                 "question": f"是否同意将:\n {tool_args["content"]} \n添加进用户级记忆？",
                 "options": ["approve", "reject", "edit"]
             })
 
-            if user_choice["choice"] in ["approve","reject"]:
+            if user_choice["choice"] in ["approve", "reject"]:
                 tool_approval[str(tool_id)] = user_choice["choice"]
-
             elif user_choice["choice"] == "edit":
-                tool_approval[str(tool_id)] = "edit:"+user_choice["edit"]
-
+                tool_approval[str(tool_id)] = "edit:" + user_choice["edit"]
             else:
                 logger.warning("用户的确认信息异常")
                 tool_approval[str(tool_id)] = "reject"
+            continue
 
-        # ==============================================================================================================
+        # ==============================================================================
+        # 服务插件工具：通用确认。不给 edit —— 改参数是「让模型重做一次」的语义，
+        # 和「改一句要记住的话」不是一回事，硬做成 edit 只会让用户以为能直接改库
+        user_choice = interrupt({
+            "question": _describe_tool_call(tool_name, tool_args),
+            "options": ["approve", "reject"],
+        })
+
+        choice = user_choice.get("choice") if isinstance(user_choice, dict) else None
+        if choice in ("approve", "reject"):
+            tool_approval[str(tool_id)] = choice
+        else:
+            logger.warning("服务工具的确认信息异常：tool=%s choice=%s", tool_name, choice)
+            tool_approval[str(tool_id)] = "reject"
 
     return {"tool_approval": tool_approval}
+
 
 async def check_step(state: State) -> Dict:
     """收尾刚跑完的那条任务，再决定队列是否还有下一条。

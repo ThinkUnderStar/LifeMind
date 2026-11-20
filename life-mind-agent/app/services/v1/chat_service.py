@@ -7,9 +7,15 @@
 - resume    : input=Command(resume=...)，图从 interrupt 处继续，不新增用户消息
 - backtrack : input={"messages": [新 HumanMessage]}，config 带 checkpoint_id 从历史快照分叉
 
-向外只推 `responder` 节点产生的文本。任务分支里 `llm_node` 也在流式产出，
+向外推三类东西：
+1. `responder` 节点产生的文本——这是给用户看的话；
+2. 服务插件工具的开始/结束，以及「该打开哪个面板、定位到哪条数据」；
+3. 人工确认中断与结束标记。
+
+第 2 类必须按工具归属过滤：内置工具（记忆、联网搜索）只在 agent 内部发生，
+推给前端只会多出一种「无插件」的空状态要处理。任务分支里 `llm_node` 也在流式产出，
 但那是任务执行的中间流水（只该落到 agent_task.result），不是给用户看的话，
-所以必须按节点名过滤，不能像普通聊天项目那样见 chunk 就发。
+所以文本必须按节点名过滤，不能见 chunk 就发。
 """
 import json
 import logging
@@ -21,6 +27,7 @@ from langgraph.types import Command
 from sqlalchemy import func, select, update
 
 from app.agent.nodes import delete_session_memory_since, drop_session_memory_collection
+from app.agent.service_catalog import plugin_of_tool, tool_label, ui_panel_of
 from app.db.mysql.entities import AgentTaskEntity, ChatMessageEntity
 from app.db.mysql.session import session_scope
 from app.db.postgresql.session import get_saver
@@ -44,7 +51,7 @@ def _sse(event_type: str, data: Any = None) -> str:
     把一条事件包成 SSE 帧。
 
     统一成 {"type": ..., "data": ...} 的 JSON，前端按 type 分派：
-    text / interrupt / done / error。文本片段也放在 data 里，
+    text / tool / ui / interrupt / done / error。文本片段也放在 data 里，
     而不是裸字符串，避免前端要为不同事件写两套解析。
 
     :param event_type: 事件类型
@@ -151,9 +158,15 @@ async def _stream_graph(
 
     事件类型：
     - text      普通的回复片段，前端追加显示
+    - tool      服务插件工具开始/结束，前端可显示「正在创建事项」
+    - ui        该打开哪个服务面板以及定位到什么数据，前端据此渲染子页面
     - interrupt approval_gate 触发人工确认，前端弹窗后用恢复接口继续
     - done      本轮结束
     - error     执行失败，前端提示
+
+    tool 与 ui 的取舍：内置工具（联网搜索、记忆检索）不推这两个事件。
+    它们是 agent 自己的能力，不属于任何插件，推了只会让前端多一种要处理的空插件状态。
+    `plugin_of_tool` 返回 None 即跳过。
 
     :param graph: 已编译的图
     :param graph_input: 图输入，普通字典或 Command(resume=...)
@@ -176,6 +189,31 @@ async def _stream_graph(
                 content = getattr(chunk, "content", "")
                 if content:
                     yield _sse("text", content)
+
+            # 服务插件工具：开始与结束成对推送，两端带同一个 id，前端据此配对
+            # （开始显示进度、结束收起）。只给工具名派生的动作名，不给入参——
+            # 入参里有用户的原始话术，前端用不上，没必要复制一份进事件流。
+            if event_name in ("on_tool_start", "on_tool_end"):
+                tool_name = event.get("name") or ""
+                plugin_key = plugin_of_tool(tool_name)
+
+                # 内置工具（记忆、联网搜索、任务清单）不属于任何插件，不推
+                if plugin_key:
+                    run_id = str(event.get("run_id") or "")
+                    started = event_name == "on_tool_start"
+                    yield _sse("tool", {
+                        "id": run_id,
+                        "phase": "start" if started else "end",
+                        "plugin": plugin_key,
+                        "action": tool_label(tool_name),
+                    })
+
+                    # 面板只在开始推一次：这时参数齐全，能定位到具体日期或具体那条数据。
+                    # 结束时不重推，否则前端同一块面板会被刷新两遍，用户看到闪一下
+                    if started:
+                        panel = ui_panel_of(tool_name, (event.get("data") or {}).get("input"))
+                        if panel:
+                            yield _sse("ui", {"id": run_id, **panel})
 
             # 人工确认中断：把确认信息原样交给前端，由前端决定 approve / reject
             if event_name == "on_chain_stream":

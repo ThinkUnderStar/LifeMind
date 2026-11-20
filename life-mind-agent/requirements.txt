@@ -22,6 +22,10 @@ langchain-ollama==1.1.0
 # LLM 与 API 客户端
 openai==2.51.0
 ollama==0.6.2
+# 组件服务调用：agent 内部要打 schedule 等 Java 微服务。
+# 之前 httpx 是被 fastapi 间接带进来的，没写在这里——一旦上游依赖调整就无声消失，
+# 所以显式声明版本。
+httpx==0.28.1
 
 # MYSQL数据库相关依赖
 SQLAlchemy==2.1.6

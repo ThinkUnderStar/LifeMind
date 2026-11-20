@@ -40,7 +40,7 @@ async def current_plugins(
     取当前用户启用的插件标识串。
 
     这个请求头由网关在 Redis 查不到时回源 account 服务后注入，格式是逗号分隔的
-    plugin_key（如 `todo,schedule`）。**它不参与鉴权，缺失也不报错**：
+    plugin_key（如 `schedule`）。**它不参与鉴权，缺失也不报错**：
     插件是增强能力，没有插件时 agent 只绑定内置工具，对话仍可正常进行。
 
     这里只做清洗（去空白），不校验每个 key 是否存在：

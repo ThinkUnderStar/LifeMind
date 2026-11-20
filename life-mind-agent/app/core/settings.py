@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     # Tavily API Key：具体值由 Nacos agent.yaml 注入
     TAVILY_API_KEY: str = ""
 
+    # =================== 组件服务地址 ==========================
+    # 日程服务的直连地址（含 context-path）。
+    #
+    # 为什么直连而不经网关：网关的 JWT 过滤器会用 token 里的声明覆盖
+    # LifeMind-User-Id，而 agent 手上没有用户 token，走网关反而注入不进正确身份；
+    # 下游服务本就是内网部署、只信任注入头，所以 service-to-service 直接打端口。
+    # 换机器或上容器时改 Nacos 上的 schedule_service_url 即可，不用改代码。
+    SCHEDULE_SERVICE_URL: str = "http://127.0.0.1:8005/life-mind/schedule"
+
     # ==================== Pydantic 配置加载规则 ====================
     model_config = SettingsConfigDict(
         env_file=".env",

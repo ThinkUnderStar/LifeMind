@@ -8,6 +8,7 @@ from v2.nacos import RegisterInstanceParam, DeregisterInstanceParam, ConfigParam
 
 from app.core.nacos_client import get_nacos_service, get_nacos_config, on_config_changed
 from app.core.settings import settings
+from app.client.base import close_client
 from app.db.milvus.client import init_milvus_client
 from app.db.mysql.session import init_mysql_db
 from app.db.postgresql.session import connect_postgresql_db, close_postgresql_db
@@ -105,3 +106,6 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
 
     # ========================关闭postgresql连接 =================================
     await close_postgresql_db()
+
+    # ========================关闭下游服务连接池 =================================
+    await close_client()
