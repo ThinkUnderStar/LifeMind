@@ -60,6 +60,14 @@ public class NotificationEvent {
     private Integer level;
 
     /**
+     * 是否需要弹窗提醒：0-否 1-是；null 按 0 处理
+     *
+     * <p>由生产方按业务语义决定，不要从 level 推导：级别表达「多要紧」，
+     * 本字段表达「要不要打断用户当前操作」，两者不总是同向。
+     */
+    private Integer needPopup;
+
+    /**
      * 扩展数据，JSON 格式字符串，存放业务附加参数
      */
     private String extra;

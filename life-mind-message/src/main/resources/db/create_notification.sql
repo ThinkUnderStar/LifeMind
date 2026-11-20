@@ -10,6 +10,7 @@ CREATE TABLE `notification` (
   `biz_id` varchar(64) DEFAULT NULL COMMENT '关联业务ID，字符串形式以兼容各类业务主键',
   `jump_url` varchar(255) DEFAULT NULL COMMENT '点击通知后的跳转地址',
   `level` tinyint NOT NULL DEFAULT '0' COMMENT '通知级别：0-普通 1-重要 2-紧急',
+  `need_popup` tinyint NOT NULL DEFAULT '0' COMMENT '是否需要弹窗提醒：0-否 1-是；只决定网页内是否打断用户，不涉及短信/邮件等外部渠道',
   `is_read` tinyint NOT NULL DEFAULT '0' COMMENT '是否已读：0-未读 1-已读',
   `read_time` datetime DEFAULT NULL COMMENT '已读时间',
   `extra` varchar(1000) DEFAULT NULL COMMENT '扩展数据，JSON格式字符串，存放业务附加参数',

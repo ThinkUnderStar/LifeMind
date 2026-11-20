@@ -73,6 +73,15 @@ public class Notification {
     private Integer level;
 
     /**
+     * 是否需要弹窗提醒：0-否 1-是
+     *
+     * <p>与 {@link #level} 不是一回事：level 表达「多要紧」，本字段表达
+     * 「要不要打断用户当前操作」。系统公告可以 level=1 但不弹，
+     * 日程提醒可以 level=0 但必须弹——到点这件事本身就是提醒的全部意义。
+     */
+    private Integer needPopup;
+
+    /**
      * 是否已读：0-未读 1-已读
      */
     private Integer isRead;
@@ -105,6 +114,12 @@ public class Notification {
     @TableField(fill = FieldFill.INSERT_UPDATE)
     private LocalDateTime updateTime;
 
+    /**
+     * 便捷构造器：只填生产方决定的内容字段。
+     *
+     * <p>注意不含 {@code needPopup}，走列默认值 0（不弹窗）。需要弹窗的通知
+     * 请显式 {@code setNeedPopup(1)}，不要指望这个构造器——它保持「安静通知」的语义。
+     */
     public Notification(
             Long userId,
             String type,

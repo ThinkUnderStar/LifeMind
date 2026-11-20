@@ -69,6 +69,13 @@ public class NotificationServiceImpl implements NotificationService {
         notification.setIsRead(0);
         notification.setDeleted(0);
 
+        // 老消息体里没有 needPopup（发布前已投递、还在队列里或重试中的），
+        // 反序列化后为 null。这里显式归 0：null 是「没声明」，语义上等于「不弹」，
+        // 不能让它落库后看起来像第三种状态
+        if (notification.getNeedPopup() == null) {
+            notification.setNeedPopup(0);
+        }
+
         //落库
         notificationWrapperService.save(notification);
     }
@@ -112,6 +119,9 @@ public class NotificationServiceImpl implements NotificationService {
                 // 已读状态过滤，可选
                 .eq(queryRequest.getIsRead() != null,
                         Notification::getIsRead, queryRequest.getIsRead())
+                // 弹窗标记过滤，可选：前端轮询用 isRead=0&needPopup=1 只取该弹的那几条
+                .eq(queryRequest.getNeedPopup() != null,
+                        Notification::getNeedPopup, queryRequest.getNeedPopup())
                 // 新通知在前
                 .orderByDesc(Notification::getCreateTime);
 
@@ -230,6 +240,12 @@ public class NotificationServiceImpl implements NotificationService {
         // 通知级别：可空，不为空时只允许 0-普通 1-重要 2-紧急
         if (event.getLevel() != null && (event.getLevel() < 0 || event.getLevel() > 2)) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "通知级别不合法");
+        }
+
+        // 是否弹窗：可空（按 0 处理），不为空时只允许 0-否 1-是。
+        // 用 0/1 而不是布尔，与 is_read、deleted 保持一致，也方便以后扩展成多值
+        if (event.getNeedPopup() != null && (event.getNeedPopup() < 0 || event.getNeedPopup() > 1)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "弹窗标记不合法");
         }
 
         // 扩展数据：可空，长度上限 1000

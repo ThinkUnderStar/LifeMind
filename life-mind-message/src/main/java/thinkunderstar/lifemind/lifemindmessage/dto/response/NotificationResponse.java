@@ -59,6 +59,13 @@ public class NotificationResponse {
     private Integer level;
 
     /**
+     * 是否需要弹窗提醒：0-否 1-是
+     *
+     * <p>前端轮询未读列表时据此决定要不要弹窗；已读通知不再弹。
+     */
+    private Integer needPopup;
+
+    /**
      * 是否已读：0-未读 1-已读
      */
     private Integer isRead;

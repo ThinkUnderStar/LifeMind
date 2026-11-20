@@ -36,4 +36,12 @@ public class NotificationQueryRequest {
      * 已读状态过滤（可空）：0-未读 1-已读，不传查询全部
      */
     private Integer isRead;
+
+    /**
+     * 弹窗标记过滤（可空）：0-不弹 1-需要弹窗，不传查询全部
+     *
+     * <p>前端轮询用 {@code isRead=0&needPopup=1} 一次拿到所有该弹的通知，
+     * 不必把整页未读拉下来再自己筛。
+     */
+    private Integer needPopup;
 }
