@@ -84,6 +84,28 @@ class ScheduleService:
         """分页查询事项，返回 {records, total, pageNum, pageSize ...}。"""
         return await self._call(identity, "GET", "/item/page", params=params)
 
+    # ==================== 重复系列 ====================
+
+    async def create_series(self, identity: Identity, body: Dict[str, Any]) -> Dict[str, Any]:
+        """创建重复规则，下游会按规则展开成多条事项，返回 SeriesResponse。"""
+        return await self._call(identity, "POST", "/series/create", body=body)
+
+    async def update_series(self, identity: Identity, body: Dict[str, Any]) -> Dict[str, Any]:
+        """按范围（all / future）修改系列，返回 SeriesResponse。"""
+        return await self._call(identity, "PUT", "/series/update", body=body)
+
+    async def delete_series(self, identity: Identity, body: Dict[str, Any]) -> None:
+        """按范围删除系列。返回 Result<Void>，需要状态就再查一次 list。"""
+        return await self._call(identity, "POST", "/series/delete", body=body)
+
+    async def list_series(self, identity: Identity, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """我的所有重复计划（不分页，下游上限 100 条）。"""
+        return await self._call(identity, "GET", "/series/list", params=params)
+
+    async def get_series(self, identity: Identity, series_id: int) -> Dict[str, Any]:
+        """系列详情，带展开出的实例条数与首尾实例ID。"""
+        return await self._call(identity, "GET", f"/series/{int(series_id)}")
+
     # ==================== 提醒 ====================
 
     async def upcoming_reminders(self, identity: Identity, days: int = 3) -> List[Dict[str, Any]]:

@@ -41,6 +41,11 @@ STATUS_TEXT = {0: "未完成", 1: "已完成", 2: "已取消"}
 TYPE_TEXT = {"schedule": "日程", "todo": "待办"}
 PRIORITY_TEXT = {0: "低", 1: "中", 2: "高"}
 
+# 重复规则的展示用词：频率的单位 + 星期几的中文
+FREQ_UNIT_TEXT = {"DAILY": "天", "WEEKLY": "周", "MONTHLY": "月"}
+DAY_TEXT = {"MO": "周一", "TU": "周二", "WE": "周三", "TH": "周四",
+            "FR": "周五", "SA": "周六", "SU": "周日"}
+
 # 一次最多返回多少条：服务端上限 100，这里压到 50——
 # 工具结果是直接进模型上下文的，100 条格式化后能吃掉近万 token
 MAX_PAGE_SIZE = 50
@@ -53,6 +58,7 @@ NO_IDENTITY = "未取到当前用户身份，这条操作没有执行。"
 READONLY_TOOL_NAMES: FrozenSet[str] = frozenset({
     "schedule_get_item",
     "schedule_list_items",
+    "schedule_list_series",
     "schedule_overview",
     "schedule_daily_stats",
     "schedule_upcoming_reminders",
@@ -180,6 +186,58 @@ def _fmt_memo(memo: Dict[str, Any]) -> str:
     if memo.get("tags"):
         line += f" 标签={memo.get('tags')}"
     line += f"\n    内容：{memo.get('content')}"
+    return line
+
+
+def _fmt_series(series: Dict[str, Any]) -> str:
+    """
+    单条重复计划 → 一行文本。
+
+    规则部分要说人话：「每 2 周的 周一、周三」比 FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE
+    更容易被模型转述成用户听得懂的一句话。
+    """
+    if not series:
+        return "（空）"
+
+    freq = series.get("freq")
+    unit = FREQ_UNIT_TEXT.get(freq, freq or "?")
+    interval = series.get("interval") or 1
+    rule = f"每{unit}" if interval == 1 else f"每{interval}{unit}"
+
+    days = series.get("byDay") or []
+    if days:
+        rule += "的 " + "、".join(DAY_TEXT.get(d, d) for d in days)
+
+    parts = [
+        f"id={series.get('id')}",
+        f"[{TYPE_TEXT.get(series.get('itemType'), series.get('itemType'))}]",
+        series.get("title") or "(无标题)",
+        rule,
+        f"锚点 {series.get('baseTime')}",
+    ]
+    if series.get("durationMinutes"):
+        parts.append(f"每次{series.get('durationMinutes')}分钟")
+    if series.get("untilDate"):
+        parts.append(f"至 {series.get('untilDate')}")
+    if series.get("countLimit"):
+        parts.append(f"共 {series.get('countLimit')} 次")
+    if series.get("itemCount") is not None:
+        parts.append(f"已展开 {series.get('itemCount')} 条")
+    if series.get("firstItemId"):
+        parts.append(f"首次 id={series.get('firstItemId')}")
+    if series.get("lastItemId"):
+        parts.append(f"末次 id={series.get('lastItemId')}")
+    if series.get("status") == 1:
+        parts.append("已结束")
+
+    offsets = series.get("remindOffsets")
+    if offsets:
+        parts.append("提醒：" + "、".join(
+            f"提前{int(o)}分钟" if int(o) > 0 else "准时" for o in offsets))
+
+    line = " ".join(str(p) for p in parts)
+    if series.get("content"):
+        line += f"\n    内容：{series.get('content')}"
     return line
 
 
@@ -515,6 +573,276 @@ async def schedule_batch_delete(config: RunnableConfig, item_ids: List[int]) -> 
 
     logger.info("agent 批量删除事项：user_id=%s count=%s", identity.user_id, len(item_ids))
     return _fmt_batch(result, "批量删除")
+
+
+# ======================== 重复系列：写操作（敏感） ========================
+
+@tool(name_or_callable="schedule_create_series")
+async def schedule_create_series(
+        config: RunnableConfig,
+        item_type: Literal["schedule", "todo"],
+        title: str,
+        freq: Literal["DAILY", "WEEKLY", "MONTHLY"],
+        base_time: str,
+        count_limit: Optional[int] = None,
+        until_date: Optional[str] = None,
+        interval: int = 1,
+        by_day: Optional[List[str]] = None,
+        duration_minutes: Optional[int] = None,
+        location: Optional[str] = None,
+        content: Optional[str] = None,
+        priority: Optional[int] = None,
+        remind_offsets: Optional[List[int]] = None,
+        request_id: Optional[str] = None,
+) -> str:
+    """
+    新建一条重复日程 / 待办（如「每周三晚上健身」「每天八点吃药」）。
+
+    什么时候该用：用户说的是一个**会重复发生的规律**，而不是某一个具体日子——
+    「每周三」「每隔两天」「每月一号」「周一到周五」。这时不要用 schedule_create_item
+    一条条建，那条工具只建一次。
+
+    什么时候不该用：只是这一次的时间点，用 schedule_create_item。
+
+    **重复必须有终点**：count_limit 与 until_date 至少给一个。
+    用户没说重复多久时必须先问一句（「先来 12 次，还是到年底？」），
+    不要自己拍一个数——拍错了用户要一条条删。
+
+    base_time 对两种类型含义不同，这是最容易用错的地方：
+    - 日程：填每次的**开始时间**，如「2026-11-25 19:00:00」；
+    - 待办：填每次的**截止时间**。
+    展开出来的每一条都按它往后推，时分保持一致。
+
+    by_day 只在 freq=WEEKLY 时有意义，取值 MO/TU/WE/TH/FR/SA/SU。
+    用户说「周一到周五」就传 ["MO","TU","WE","TH","FR"]；
+    说「每周三」可以只传 ["WE"]，也可以不传（默认取 base_time 那天是周几）。
+
+    时间必须是绝对时间：「下周三」要先按当前日期换算成具体日期再传。
+
+    :param config: 运行时上下文，由框架注入
+    :param item_type: schedule-日程 todo-待办
+    :param title: 标题
+    :param freq: DAILY-每天 WEEKLY-每周 MONTHLY-每月
+    :param base_time: 锚点时刻，日程填开始时间、待办填截止时间，如「2026-11-25 19:00:00」
+    :param count_limit: 总次数上限（含第一次），1~100；与 until_date 至少给一个
+    :param until_date: 终止日期（含当天），如「2026-12-31」；与 count_limit 至少给一个
+    :param interval: 间隔，每 N 天/周/月，默认 1
+    :param by_day: 星期几，仅 WEEKLY 使用，如 ["MO","WE"]
+    :param duration_minutes: 每次时长（分钟），仅日程；不填则结束时间为空
+    :param location: 地点，仅日程
+    :param content: 备注
+    :param priority: 优先级 0-低 1-中 2-高
+    :param remind_offsets: 每次提前多少分钟提醒，如 [30]；最多 10 个
+    :param request_id: 幂等键，可选。只在明确重放上一次请求时传
+    """
+    identity = _identity(config)
+    if identity is None:
+        return NO_IDENTITY
+    if not count_limit and not until_date:
+        # 在本地就拦住，不留给下游报错：这句提示会直接进模型上下文，
+        # 让它知道下一步该问用户什么，而不是把 400 转述成「服务出错了」
+        return "重复必须有终点：请向用户确认是「重复几次」还是「重复到哪天」，然后传 count_limit 或 until_date。"
+
+    body: Dict[str, Any] = {
+        "itemType": item_type,
+        "title": title,
+        "freq": freq,
+        "baseTime": base_time,
+        "interval": interval,
+    }
+    optional = {
+        "countLimit": count_limit,
+        "untilDate": until_date,
+        "byDay": by_day,
+        "durationMinutes": duration_minutes,
+        "location": location,
+        "content": content,
+        "priority": priority,
+        "remindOffsets": remind_offsets,
+        "requestId": request_id,
+    }
+    body.update({k: v for k, v in optional.items() if v is not None})
+
+    try:
+        series = await schedule_service.create_series(identity, body)
+    except ServiceError as e:
+        return f"创建重复计划失败：{e.message}"
+
+    logger.info("agent 创建重复系列：user_id=%s series_id=%s count=%s",
+                identity.user_id, (series or {}).get("id"), (series or {}).get("itemCount"))
+    return f"已创建，{_fmt_series(series)}"
+
+
+@tool(name_or_callable="schedule_update_series")
+async def schedule_update_series(
+        config: RunnableConfig,
+        series_id: int,
+        scope: Literal["all", "future"],
+        anchor_item_id: Optional[int] = None,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        location: Optional[str] = None,
+        priority: Optional[int] = None,
+        tags: Optional[str] = None,
+        freq: Optional[Literal["DAILY", "WEEKLY", "MONTHLY"]] = None,
+        interval: Optional[int] = None,
+        by_day: Optional[List[str]] = None,
+        until_date: Optional[str] = None,
+        count_limit: Optional[int] = None,
+        remind_offsets: Optional[List[int]] = None,
+) -> str:
+    """
+    修改一条重复计划，改整个系列或从某一次起往后改。
+
+    scope 怎么选：
+    - all：整个系列都改（「健身这个名字改成训练」）；
+    - future：只从 anchor_item_id 那一次起改，之前的保持原样
+      （「下周三之后改成周一」——改排期用 freq / by_day）。
+
+    这个工具改不了「几点开始」：锚点时刻是系列的定义，改它等于换一个系列。
+    只是某一天改钟点（「这周三挪到八点」），用 schedule_update_item 改那一条实例。
+    要整体换时间，只能删掉这个系列按新时间重建。
+
+    只改一次（「这周这次挪到八点」）不要用这个工具，用 schedule_update_item 直接改那条实例。
+
+    规则字段（freq / interval / by_day / until_date / count_limit）只要传了一个，
+    下游会重排未来所有实例；只传内容字段则只改标题、备注这些，不动日子。
+
+    改内容只影响**未来且未完成**的实例，已经发生或已完成的保持原样。
+
+    :param config: 运行时上下文，由框架注入
+    :param series_id: 系列ID
+    :param scope: all-整个系列 future-从 anchor_item_id 起往后
+    :param anchor_item_id: 锚点实例ID，scope=future 时必填
+    :param title: 新标题
+    :param content: 新备注
+    :param location: 新地点
+    :param priority: 新优先级 0-低 1-中 2-高
+    :param tags: 新标签
+    :param freq: 新频率 DAILY / WEEKLY / MONTHLY
+    :param interval: 新间隔，每 N 天/周/月
+    :param by_day: 新星期几，仅 WEEKLY
+    :param until_date: 新终止日期，如「2026-12-31」
+    :param count_limit: 新总次数上限
+    :param remind_offsets: 新提醒偏移；空列表 [] 表示取消全部提醒；不传表示不改
+    """
+    identity = _identity(config)
+    if identity is None:
+        return NO_IDENTITY
+    if scope == "future" and anchor_item_id is None:
+        return "scope=future 时必须给出 anchor_item_id（从哪一次起改）。可以先调 schedule_list_items 按 seriesId 查出各次的 id。"
+
+    body: Dict[str, Any] = {"id": series_id, "scope": scope}
+    optional = {
+        "anchorItemId": anchor_item_id,
+        "title": title,
+        "content": content,
+        "location": location,
+        "priority": priority,
+        "tags": tags,
+        "freq": freq,
+        "interval": interval,
+        "byDay": by_day,
+        "untilDate": until_date,
+        "countLimit": count_limit,
+        "remindOffsets": remind_offsets,
+    }
+    body.update({k: v for k, v in optional.items() if v is not None})
+
+    if len(body) == 2:
+        return "没有要修改的内容，这次调用被忽略了。"
+
+    try:
+        series = await schedule_service.update_series(identity, body)
+    except ServiceError as e:
+        return f"修改重复计划失败：{e.message}"
+
+    logger.info("agent 修改重复系列：user_id=%s series_id=%s scope=%s",
+                identity.user_id, series_id, scope)
+    return f"已修改，{_fmt_series(series)}"
+
+
+@tool(name_or_callable="schedule_delete_series")
+async def schedule_delete_series(
+        config: RunnableConfig,
+        series_id: int,
+        scope: Literal["all", "future"],
+        anchor_item_id: Optional[int] = None,
+) -> str:
+    """
+    停掉一条重复计划。
+
+    scope 怎么选：
+    - all：整个系列都删掉（「以后不健身了」）；
+    - future：只从 anchor_item_id 那一次起不再发生，之前的记录还在
+      （「这学期结束就不上了」）。
+
+    已经发生过的那几次，两种范围下都保留——删规则不等于抹掉历史。
+
+    只是这一次不去（「这周三请假」）不要用这个，用 schedule_cancel_item 取消那一条实例。
+
+    :param config: 运行时上下文，由框架注入
+    :param series_id: 系列ID
+    :param scope: all-整个系列 future-从 anchor_item_id 起往后
+    :param anchor_item_id: 锚点实例ID，scope=future 时必填
+    """
+    identity = _identity(config)
+    if identity is None:
+        return NO_IDENTITY
+    if scope == "future" and anchor_item_id is None:
+        return "scope=future 时必须给出 anchor_item_id（从哪一次起不再发生）。"
+
+    body: Dict[str, Any] = {"id": series_id, "scope": scope}
+    if anchor_item_id is not None:
+        body["anchorItemId"] = anchor_item_id
+
+    try:
+        await schedule_service.delete_series(identity, body)
+    except ServiceError as e:
+        return f"停止重复计划失败：{e.message}"
+
+    logger.info("agent 删除重复系列：user_id=%s series_id=%s scope=%s",
+                identity.user_id, series_id, scope)
+    if scope == "all":
+        return f"已删除重复计划 id={series_id}，未来的安排都不会再生成。"
+    return f"已从 id={anchor_item_id} 起停止，之前的记录保留。"
+
+
+@tool(name_or_callable="schedule_list_series")
+async def schedule_list_series(
+        config: RunnableConfig,
+        item_type: Optional[Literal["schedule", "todo"]] = None,
+) -> str:
+    """
+    列出我的全部重复计划（每周几次的那种），不含单次事项。
+
+    什么时候该用：用户问「我有哪些固定安排」「我有几个重复的日程」，
+    或者要先拿到 series_id 才能改 / 停掉某一条。
+
+    返回里带每条已经展开多少条、首次和末次的实例 id：
+    「还剩几次」用 itemCount 结合今天的日期判断，别直接说 countLimit。
+
+    :param config: 运行时上下文，由框架注入
+    :param item_type: schedule / todo，不传查全部
+    """
+    identity = _identity(config)
+    if identity is None:
+        return NO_IDENTITY
+
+    params: Dict[str, Any] = {}
+    if item_type:
+        params["itemType"] = item_type
+
+    try:
+        series_list = await schedule_service.list_series(identity, params)
+    except ServiceError as e:
+        return f"查询重复计划失败：{e.message}"
+
+    if not series_list:
+        return "目前没有任何重复计划。"
+    lines = [f"共 {len(series_list)} 条重复计划："]
+    lines.extend(f"- {_fmt_series(series)}" for series in series_list)
+    return "\n".join(lines)
 
 
 # ======================== 事项：读操作（免确认） ========================
@@ -902,6 +1230,10 @@ SCHEDULE_TOOLS = (
     schedule_batch_complete,
     schedule_batch_delete,
     schedule_upcoming_reminders,
+    schedule_create_series,
+    schedule_update_series,
+    schedule_delete_series,
+    schedule_list_series,
     schedule_memo_create,
     schedule_memo_list,
     schedule_memo_get,
