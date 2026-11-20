@@ -115,6 +115,23 @@ public class ScheduleItem {
     private String source;
 
     /**
+     * 所属重复系列ID，指向 {@code schedule_series.id}；一次性事项为 null。
+     *
+     * <p>有值说明这条是「某条重复规则展开出来的某一次」。它仍然是一个完整的事项：
+     * 有自己的时间、状态、提醒，可以单独改、单独完成、单独删除——
+     * 改了不会影响系列，系列之后再重建时才会按规则把它算回来。
+     */
+    private Long seriesId;
+
+    /**
+     * 在系列里是第几次（从 1 开始，含锚点那次）；一次性事项为 null。
+     *
+     * <p>存下来而不是用 row_number() 现算：实例可以被单独删掉（「这周不练了」），
+     * 现算的序号会和用户认知错位——他心里的「第 5 次」不会因为删了第 3 次就变成第 4 次。
+     */
+    private Integer seriesIndex;
+
+    /**
      * 创建时间
      */
     @TableField(fill = FieldFill.INSERT)

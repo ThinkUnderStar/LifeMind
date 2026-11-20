@@ -96,6 +96,19 @@ public class ItemResponse {
     private String source;
 
     /**
+     * 所属重复系列ID；一次性事项为 null。
+     *
+     * <p>有值时这条是「某条重复规则展开出来的某一次」：可以单独改、单独完成，
+     * 也可以拿去问系列本身（{@code GET /series/{id}}）。
+     */
+    private Long seriesId;
+
+    /**
+     * 在系列里是第几次（从 1 开始）；一次性事项为 null
+     */
+    private Integer seriesIndex;
+
+    /**
      * 创建时间
      */
     private LocalDateTime createTime;

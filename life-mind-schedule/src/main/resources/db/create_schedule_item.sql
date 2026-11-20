@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS `schedule_item`
     `tags`           varchar(255)          DEFAULT NULL COMMENT '标签，逗号分隔，如「工作,重要」',
     `request_id`     varchar(64)           DEFAULT NULL COMMENT '幂等键：同一用户下相同值视为同一次创建，重试不会多建一条',
     `source`         varchar(16)  NOT NULL DEFAULT 'web' COMMENT '数据来源：web-前端手写 agent-智能体代操作',
+    -- 重复系列：一次性事项这两列为 NULL。规则本体在 schedule_series，
+    -- 这里只存归属与「第几次」，所以本表「一行一个具体时刻」的语义没变
+    `series_id`      bigint                DEFAULT NULL COMMENT '所属重复系列ID，指向 schedule_series.id；一次性事项为 NULL',
+    `series_index`   int                   DEFAULT NULL COMMENT '在系列里是第几次（从 1 开始）；一次性事项为 NULL',
     `create_time`    datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `update_time`    datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     `deleted`        tinyint      NOT NULL DEFAULT 0 COMMENT '逻辑删除：0-未删除 1-已删除',
@@ -45,6 +49,8 @@ CREATE TABLE IF NOT EXISTS `schedule_item`
     KEY `idx_user_type_status` (`user_id`, `item_type`, `status`),
     -- 所有查询都带 deleted=0，放在末尾让上面的索引先过滤掉大部分行
     KEY `idx_user_deleted` (`user_id`, `deleted`),
+    -- 「把这个系列的实例全查出来 / 批量改」：等值匹配后量级很小（单系列上限 100 条）
+    KEY `idx_user_series` (`user_id`, `series_id`),
     -- 创建幂等：MySQL 的唯一索引允许多个 NULL，所以不传 request_id 时不受影响
     UNIQUE KEY `uk_user_request_id` (`user_id`, `request_id`)
 ) ENGINE = InnoDB

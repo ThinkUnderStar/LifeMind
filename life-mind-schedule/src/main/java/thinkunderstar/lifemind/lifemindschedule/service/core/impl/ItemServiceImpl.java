@@ -365,6 +365,11 @@ public class ItemServiceImpl implements ItemService {
                     .or(w -> w.like(ScheduleItem::getContent, trimmed)));
         }
 
+        // 只看某条重复系列的实例：与日期条件可以叠加（「这个系列下周有几条」）
+        if (queryRequest.getSeriesId() != null) {
+            wrapper.eq(ScheduleItem::getSeriesId, queryRequest.getSeriesId());
+        }
+
         applyTimeFilter(wrapper, queryRequest);
 
         // 混合排序：日程看开始时间、待办看截止时间，统一用 COALESCE 排。

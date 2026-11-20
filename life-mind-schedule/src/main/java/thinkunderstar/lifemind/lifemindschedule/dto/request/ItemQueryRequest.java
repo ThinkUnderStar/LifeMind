@@ -71,4 +71,13 @@ public class ItemQueryRequest {
      */
     @DateTimeFormat(pattern = "yyyy-MM-dd")
     private LocalDate endDate;
+
+    /**
+     * 只看某条重复系列展开出的实例。
+     *
+     * <p>给 agent 用：它常常先列出系列，再说「把这个系列接下来几次念给我」。
+     * 没有这个参数就只能按日期区间捞，再在结果里自己过滤 seriesId——
+     * 分页会把不该显示的条目算进总数里。
+     */
+    private Long seriesId;
 }
