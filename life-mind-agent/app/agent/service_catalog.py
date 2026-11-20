@@ -37,6 +37,7 @@ BUILTIN_TOOLS: Tuple[BaseTool, ...] = (
 # 现在为空：agent 侧还没有任何组件服务工具（日程 / 待办 / 账单 / 健康都还没接入）。
 # 接入第一个服务时按下面的形式登记即可，工具名统一为「插件key_动作」：
 #
+#     # 实现在 app/agent/tools/service_tools.py，由 tools 包的 __init__ 统一导出
 #     from app.agent.tools import todo_create, todo_list
 #     SERVICE_TOOLS: Dict[str, Tuple[BaseTool, ...]] = {
 #         "todo": (todo_create, todo_list),

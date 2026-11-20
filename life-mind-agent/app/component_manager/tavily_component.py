@@ -5,7 +5,7 @@ Tavily 联网搜索客户端管理。
 有两点必须在构造时机上守住，否则会踩坑：
 
 1. 不能像别的项目那样在模块顶层 `from tavily import AsyncTavilyClient` 并直接 new：
-   - 依赖可能还没装（用户手动装），顶层 import 会让整个 tools.py / graph.py 起不来；
+   - 依赖可能还没装（用户手动装），顶层 import 会让整个 agent_tools.py / graph.py 起不来；
    - TAVILY_API_KEY 由 Nacos 在 lifespan 启动时才覆盖进 settings，模块导入时还是空串，
      顶层构造会拿到一个空 key 的客户端。
    所以 import 和构造都推迟到第一次真正调用 get_client() 时。

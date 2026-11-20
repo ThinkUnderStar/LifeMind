@@ -38,7 +38,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, Remove
 from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langchain_core.runnables import RunnableConfig
 
-from langgraph.types import Command, interrupt
+from langgraph.types import interrupt
 from pymilvus import CollectionSchema, DataType, FieldSchema
 from pymilvus.milvus_client import IndexParams
 from sqlalchemy import Select
@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # 正常切分后的 chunk 远小于这个值，这里只是最后一道保险。
 MEMORY_TEXT_MAX_BYTES = 16384
 
-# 用户级长期记忆在 store 里的命名空间，常量由 tools.py 唯一定义、这里 import。
+# 用户级长期记忆在 store 里的命名空间，常量由 agent_tools.py 唯一定义、这里 import。
 # 不在本模块另立一份：「写记忆」在 tools、「读记忆」在这里，两份各写一次漏改其中一处，
 # 表现是「记忆写进去了但永远搜不到」，且不会报错。
 
