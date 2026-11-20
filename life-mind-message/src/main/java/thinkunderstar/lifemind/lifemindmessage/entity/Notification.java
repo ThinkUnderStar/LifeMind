@@ -82,6 +82,18 @@ public class Notification {
     private Integer needPopup;
 
     /**
+     * 事件幂等键：生产方保证同一次业务事件取值相同。
+     *
+     * <p>用途只有一个——抵消 MQ「至少投递一次」造成的重复落库。消费端先按它
+     * 查一次（快速路径），落库时再由唯一索引 {@code uk_notification_event} 兜住
+     * 并发窗口。手工插入或系统通知可以留空（唯一索引允许多个 NULL）。
+     *
+     * <p>刻意不出现在 {@code NotificationResponse} 里：它是内部去重标识，
+     * 对前端没有任何意义，暴露出去反而会诱导前端拿它当业务 ID 用。
+     */
+    private String eventId;
+
+    /**
      * 是否已读：0-未读 1-已读
      */
     private Integer isRead;

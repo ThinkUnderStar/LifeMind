@@ -68,6 +68,18 @@ public class NotificationEvent {
     private Integer needPopup;
 
     /**
+     * 事件幂等键：生产方生成，必须能唯一标识「这一次业务事件」。
+     *
+     * <p>RocketMQ 只保证至少投递一次，重复消息会被本字段挡掉。格式约定
+     * {@code {来源}_{主键}}，例如 {@code schedule_reminder_123}——带来源前缀是
+     * 因为未来会有多个生产方，各自的主键空间独立，裸数字会互相撞车。
+     *
+     * <p>可空：手工插入或系统直发的通知可以不给，唯一索引允许多个 NULL。
+     * 需要幂等保护的场景必须给，否则重复消费仍会落两行。
+     */
+    private String eventId;
+
+    /**
      * 扩展数据，JSON 格式字符串，存放业务附加参数
      */
     private String extra;

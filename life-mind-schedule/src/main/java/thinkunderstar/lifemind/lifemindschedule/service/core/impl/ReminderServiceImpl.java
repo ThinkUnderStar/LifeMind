@@ -51,6 +51,19 @@ public class ReminderServiceImpl implements ReminderService {
      */
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("MM-dd HH:mm");
 
+    /**
+     * 通知事件的幂等键前缀，实际取值是「前缀 + reminder.id」。
+     *
+     * <p>生产方必须给出稳定的键，消费端才能挡住 MQ 的重复投递。这里用 reminder.id
+     * 而不是 item.id：一个事项可以有多个提醒时刻，同一个 item.id 会重复出现，
+     * 拿它当键会把「提前一天」「提前 30 分钟」当成同一条，正常的第二、三条提醒
+     * 会被消费端误判为重复而丢掉。
+     *
+     * <p>带前缀是因为 message 服务是通用落库方，未来别的服务也会发事件，
+     * 各自主键空间独立，裸数字会互相撞车。
+     */
+    private static final String EVENT_ID_PREFIX = "schedule_reminder_";
+
     private final ScheduleReminderMapper reminderMapper;
     private final ScheduleReminderWrapperService reminderWrapperService;
     private final ScheduleItemWrapperService itemWrapperService;
@@ -285,6 +298,10 @@ public class ReminderServiceImpl implements ReminderService {
         // 提醒恒弹窗，且不从 level 推导：level 区分「多要紧」，而所有提醒都必须
         // 打断用户——用户设了「到点提醒」，到点只往通知箱塞一条就等于没提醒
         event.setNeedPopup(1);
+        // 幂等键：投递失败会把 status 回退到待发送，下一轮重新抢占后再发一次。
+        // 若第一次其实已经进了队列（只是本地抛了异常），两条消息的 eventId 相同，
+        // 消费端只落一条、只弹一次。没有它，同一条提醒会落两条通知、弹两次窗。
+        event.setEventId(EVENT_ID_PREFIX + reminder.getId());
         // 扩展信息只放前端跳转需要的类型，不放标题等内容（正文已经带了）
         event.setExtra("{\"itemType\":\"" + item.getItemType() + "\"}");
         return event;

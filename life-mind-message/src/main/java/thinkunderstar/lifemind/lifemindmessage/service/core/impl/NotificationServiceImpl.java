@@ -6,6 +6,8 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import thinkunderstar.lifemind.lifemindmessage.common.Result;
 import thinkunderstar.lifemind.lifemindmessage.common.ResultCode;
@@ -21,6 +23,7 @@ import thinkunderstar.lifemind.lifemindmessage.util.RedisTokenBucketLimiter;
 
 import java.time.LocalDateTime;
 
+@Slf4j
 @Service
 public class NotificationServiceImpl implements NotificationService {
 
@@ -54,7 +57,27 @@ public class NotificationServiceImpl implements NotificationService {
         // ========== 2. 字段合法性校验 ==========
         validateNotificationEvent(notificationEvent);
 
-        // ========== 3. 按接收人限流 ==========
+        // ========== 3. 幂等去重 ==========
+        // 必须放在限流之前。若顺序反过来，被去重挡掉的重复消息也会先扣掉一个
+        // 限流令牌——同一条提醒重投几次，用户正常的通知额度就被吃光了，
+        // 表现为「明明没收到几条通知，却提示发送过于频繁」。
+        //
+        // 这里的查询只是快速路径：两个消费者实例并发处理同一事件时都查不到，
+        // 真正兜底的是 event_id 上的唯一索引（见下面的 catch）。
+        if (notificationEvent.getEventId() != null && !notificationEvent.getEventId().isBlank()) {
+            boolean processed = notificationWrapperService.count(
+                    new LambdaQueryWrapper<Notification>()
+                            .eq(Notification::getEventId, notificationEvent.getEventId())) > 0;
+            if (processed) {
+                // 正常返回而不是抛异常：重复消息应当被 ACK 掉。
+                // 抛异常会让 RocketMQ 一直重投，最终堆进死信队列，
+                // 把「重复投递」变成「永远投不进去」。
+                log.info("通知事件已处理过，跳过：eventId={}", notificationEvent.getEventId());
+                return;
+            }
+        }
+
+        // ========== 4. 按接收人限流 ==========
         // 系统通知 senderId 为 null，仍按 userId 限流，防止对单一用户刷通知
         if (!rateLimiter.tryAcquireByUser(notificationEvent.getUserId(),
                 NOTIFICATION_USER_CAPACITY, NOTIFICATION_USER_RATE)) {
@@ -76,8 +99,18 @@ public class NotificationServiceImpl implements NotificationService {
             notification.setNeedPopup(0);
         }
 
-        //落库
-        notificationWrapperService.save(notification);
+        // 老消息体同样没有 eventId，保持 null（唯一索引允许多个 NULL），
+        // 这类消息没有幂等保护，与上线前的行为一致
+        try {
+            //落库
+            notificationWrapperService.save(notification);
+        } catch (DuplicateKeyException e) {
+            // 并发窗口：两个消费者实例同时通过了上面的查询，唯一索引只放进来一条。
+            // 静默吞掉，等同于「已经处理过」——这一条消息的目的已经达成，
+            // 让它 ACK 掉比让它重试到死信更有意义。
+            log.info("通知事件并发重复，已被唯一索引拦截：eventId={}",
+                    notificationEvent.getEventId());
+        }
     }
 
     @Override
@@ -246,6 +279,13 @@ public class NotificationServiceImpl implements NotificationService {
         // 用 0/1 而不是布尔，与 is_read、deleted 保持一致，也方便以后扩展成多值
         if (event.getNeedPopup() != null && (event.getNeedPopup() < 0 || event.getNeedPopup() > 1)) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "弹窗标记不合法");
+        }
+
+        // 事件幂等键：可空；非空时长度不能超过列宽（64），
+        // 否则 Insert 会被 MySQL 以「Data too long」拒绝，而那条消息会在
+        // 重试 16 次后进死信——不如在这里就明确报参数错误
+        if (event.getEventId() != null && event.getEventId().length() > 64) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "事件幂等键长度超出限制");
         }
 
         // 扩展数据：可空，长度上限 1000

@@ -73,6 +73,25 @@ public class NotificationEvent {
     private Integer needPopup;
 
     /**
+     * 事件幂等键：本服务填 {@code schedule_reminder_{reminderId}}。
+     *
+     * <p>粒度必须是「哪一次提醒」而不是「哪个事项」：一个事项可以有多个提醒时刻
+     * （提前一天、提前 30 分钟），它们的 bizId 都是同一个 item.id，用它去重会把
+     * 正常的第二、三条提醒误挡掉。reminder.id 一行一个提醒时刻，天然唯一。
+     *
+     * <p>带 {@code schedule_reminder_} 前缀是因为 message 服务是通用的通知落库方，
+     * 以后别的服务也会发事件，各自主键空间独立，裸数字会互相撞车。
+     *
+     * <p>这是投递重试的安全网：扫描任务投递失败会把 status 回退到待发送，
+     * 下一轮重新抢占后再发一次；若第一次其实已经进了队列，两条消息的 eventId
+     * 相同，消费端只会落一条通知、只弹一次窗。
+     *
+     * <p>注意：新增字段必须同步到 message 服务的同名类，否则两边 JSON
+     * 反序列化时会静默拿到 null，不报错。
+     */
+    private String eventId;
+
+    /**
      * 扩展数据，JSON 字符串
      */
     private String extra;
