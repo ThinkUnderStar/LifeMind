@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: life-mind-schedule
+
+  cloud:
+    nacos:
+      # 与其他服务同一个 Nacos 实例；agent 用的是 8848，Java 侧统一 18848
+      server-addr: 127.0.0.1:18848
+      discovery:
+        group: LIFE_MIND_GROUP
+        ephemeral: true
+
+      config:
+        file-extension: yaml
+
+  # Spring Boot 3 的配置导入方式：不再用 bootstrap.yml，
+  # 服务自己的端口/数据源/rocketmq 全部放在 Nacos 的 schedule.yaml 里
+  config:
+    import:
+      - nacos:schedule.yaml?group=LIFE_MIND_CONFIG
