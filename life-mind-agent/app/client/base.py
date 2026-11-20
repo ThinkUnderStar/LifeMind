@@ -18,11 +18,58 @@
    进程内一个实例足够：FastAPI 是单事件循环，且这里不做并发隔离。
 """
 import logging
-from typing import Any, Dict, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# 网关缺失角色/范围时的兜底值。选最小集而不是空串：
+# 下游 HeaderAuthenticationFilter 要求三个头齐全，空串会被当作缺失。
+# 用 user/read 而不是 admin/full——兜底只能降权，不能提权。
+DEFAULT_ROLES = "user"
+DEFAULT_SCOPES = "read"
+
+
+@dataclass(frozen=True)
+class Identity:
+    """
+    调用下游服务时携带的身份三元组。
+
+    取代原来裸传的 `user_id`。理由是这三样总是一起走：下游过滤器要
+    Id 定位数据归属、要 Roles/Scopes 构建 Authentication，少一个就 401。
+    拆成三个参数会让每个 client 方法都变成 (user_id, roles, scopes, ...)，
+    而 17 个工具、12 个方法都得跟着改；包成一个对象后，将来加
+    tenant_id、device 之类只需改这里。
+
+    frozen=True：身份在请求生命周期内不该被改写。真要换身份（比如
+    代操作），构造一个新实例显式传下去，比原地改字段更容易追。
+    """
+
+    user_id: int
+    roles: str = DEFAULT_ROLES
+    scopes: str = DEFAULT_SCOPES
+
+    @classmethod
+    def of(
+            cls,
+            user_id: Any,
+            roles: Optional[str] = None,
+            scopes: Optional[str] = None,
+    ) -> "Identity":
+        """
+        从网关注入的原始头构造。
+
+        roles/scopes 为空时回退到最小集，而不是抛异常：直连 agent
+        （跳过网关调试）时这两个头本来就不存在，此时拒绝对话是过度反应，
+        降权到 user/read 反而符合「拿不准就给最小权限」。
+        """
+        return cls(
+            user_id=int(user_id),
+            roles=(roles or "").strip() or DEFAULT_ROLES,
+            scopes=(scopes or "").strip() or DEFAULT_SCOPES,
+        )
 
 # 建连超时与读超时分开：连不上要快速失败（而不是卡满整个读超时），
 # 读要留够时间给下游的数据库查询。
@@ -92,23 +139,25 @@ async def close_client() -> None:
     _client = None
 
 
-def build_headers(user_id: Union[int, str]) -> Dict[str, str]:
+def build_headers(identity: Identity) -> Dict[str, str]:
     """
     构造调用下游服务需要的身份头。
 
     下游的 `HeaderAuthenticationFilter` 要求三个头齐全，缺一个就 401：
     - `LifeMind-User-Id`：谁的数据，进入业务层的唯一归属依据；
-    - `LifeMind-User-Roles` / `LifeMind-User-Scopes`：只用来构建 Authentication。
+    - `LifeMind-User-Roles` / `LifeMind-User-Scopes`：构建 Authentication。
 
-    roles/scopes 这里给固定最小集，而不是从网关请求头透传，原因是：
-    下游目前没有启用方法级安全，这两个值不参与任何判定，纯粹是过滤器要求存在。
-    若将来下游启用 `@EnableMethodSecurity`（例如「只允许 admin 看全部」），
-    必须改成从网关注入的原始头透传，否则等于 agent 自动获得 user/read 权限。
+    这三个值都来自网关校验 JWT 后注入的原始请求头，agent 只做透传。
+    早期版本把 roles/scopes 写死成 user/read，当时下游没有启用方法级安全，
+    这两个值不参与判定，所以没出问题——但那等于 agent 自己给自己发了
+    一张 user/read 的通行证：一旦下游开启 `@EnableMethodSecurity`
+    （例如「只允许 admin 查全部用户」），agent 就不是在代表用户调用，
+    而是在冒充一个固定权限的账号。
     """
     return {
-        "LifeMind-User-Id": str(user_id),
-        "LifeMind-User-Roles": "user",
-        "LifeMind-User-Scopes": "read",
+        "LifeMind-User-Id": str(identity.user_id),
+        "LifeMind-User-Roles": identity.roles,
+        "LifeMind-User-Scopes": identity.scopes,
         # 落库标记数据来源：schedule_item.source 据此区分「agent 代操作」和「用户手写」
         "LifeMind-Client": "agent",
     }
@@ -120,7 +169,7 @@ async def request_json(
         base_url: str,
         method: str,
         path: str,
-        user_id: Union[int, str],
+        identity: Identity,
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
 ) -> Any:
@@ -131,7 +180,7 @@ async def request_json(
     :param base_url: 服务根地址，含 context-path，不带结尾斜杠
     :param method: HTTP 方法，大写
     :param path: 以 / 开头的接口路径
-    :param user_id: 当前用户ID，作为归属依据注入请求头
+    :param identity: 当前用户身份（ID + 角色 + 范围），整组注入请求头
     :param params: 查询参数，None 值会被剔除（避免拼出 `?status=None`）
     :param body: 请求体，按 JSON 发送
     :return: 下游 `Result.data`，可能为 None
@@ -147,7 +196,7 @@ async def request_json(
             url=url,
             params=clean_params,
             json=body,
-            headers=build_headers(user_id),
+            headers=build_headers(identity),
         )
     except httpx.TimeoutException:
         logger.error("%s 调用超时：%s %s", service_name, method, url)

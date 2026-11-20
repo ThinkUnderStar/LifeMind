@@ -8,8 +8,9 @@
 """
 from typing import Optional
 
-from fastapi import Header
+from fastapi import Depends, Header
 
+from app.client.base import Identity
 from app.exception.exceptions import BusinessException
 
 
@@ -31,6 +32,24 @@ async def current_user_id(
         raise BusinessException(message="用户身份格式非法", code=400)
 
     return int(text)
+
+
+async def current_identity(
+        user_id: int = Depends(current_user_id),
+        roles: Optional[str] = Header(default=None, alias="LifeMind-User-Roles"),
+        scopes: Optional[str] = Header(default=None, alias="LifeMind-User-Scopes"),
+) -> Identity:
+    """
+    取当前用户完整身份：ID + 角色 + 权限范围。
+
+    前两个头由网关校验 JWT 后注入，agent 只透传、不解析、不扩大：
+    下游服务用它们构建 Authentication，将来启用方法级安全时决定能做什么。
+
+    roles/scopes 缺失不报错，由 `Identity.of` 降权到 user/read——
+    直连 agent 调试时本来就没有这两个头，此时拒绝整个请求属过度反应；
+    但降权方向只能是「更小」，不能是「更大」。
+    """
+    return Identity.of(user_id, roles=roles, scopes=scopes)
 
 
 async def current_plugins(

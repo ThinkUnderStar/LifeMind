@@ -31,7 +31,7 @@ from typing import Any, Dict, FrozenSet, List, Literal, Optional
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
-from app.client.base import ServiceError
+from app.client.base import Identity, ServiceError
 from app.client.schedule_client import schedule_service
 
 logger = logging.getLogger(__name__)
@@ -63,20 +63,29 @@ READONLY_TOOL_NAMES: FrozenSet[str] = frozenset({
 
 # ======================== 内部工具 ========================
 
-def _user_id(config: RunnableConfig) -> Optional[int]:
+def _identity(config: RunnableConfig) -> Optional[Identity]:
     """
-    从运行时 config 取用户ID。
+    从运行时 config 取用户身份三元组（ID + 角色 + 范围）。
 
     与内置工具同一口径：只认 `configurable.user_id`（网关校验 JWT 后注入），
     缺失就放弃这次调用，绝不回退到某个默认用户——那会往别人的数据里写东西。
     这里不做 int 转换失败的重试，格式不对说明上游写错了，记日志即可。
+
+    roles/scopes 与 user_id 同源，都是网关校验 JWT 后注入的原始头，
+    由 chat 层放进 configurable。它们决定 agent 调下游时能做什么，
+    因此不能写死——写死等于 agent 用一个固定权限的账号代所有人操作。
     """
-    raw = config.get("configurable", {}).get("user_id")
+    configurable = config.get("configurable", {})
+    raw = configurable.get("user_id")
     if raw is None or raw == "":
-        logger.error("服务工具缺少 user_id，已跳过：configurable=%s", config.get("configurable"))
+        logger.error("服务工具缺少 user_id，已跳过：configurable=%s", configurable)
         return None
     try:
-        return int(raw)
+        return Identity.of(
+            raw,
+            roles=configurable.get("user_roles"),
+            scopes=configurable.get("user_scopes"),
+        )
     except (TypeError, ValueError):
         logger.error("服务工具的 user_id 不是整数：%r", raw)
         return None
@@ -127,7 +136,7 @@ def _fmt_item(item: Dict[str, Any]) -> str:
     return line
 
 
-async def _detail_after_write(user_id: int, item_id: int) -> str:
+async def _detail_after_write(identity: Identity, item_id: int) -> str:
     """
     写操作成功后回查一次详情。
 
@@ -136,9 +145,9 @@ async def _detail_after_write(user_id: int, item_id: int) -> str:
     回查失败不影响结论：写已经成功了，只是这句描述不够具体。
     """
     try:
-        item = await schedule_service.get_item(user_id, item_id)
+        item = await schedule_service.get_item(identity, item_id)
     except ServiceError:
-        logger.warning("写操作后回查事项失败：user_id=%s item_id=%s", user_id, item_id)
+        logger.warning("写操作后回查事项失败：user_id=%s item_id=%s", identity.user_id, item_id)
         return f"id={item_id}（操作已执行，但当前状态查询失败）"
     return _fmt_item(item)
 
@@ -272,8 +281,8 @@ async def schedule_create_item(
                        注意删除后用同一个键重建会被拒（服务端唯一索引仍占着），
                        所以只在明确重放上一次请求时传
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     body = _build_item_body(
@@ -285,11 +294,11 @@ async def schedule_create_item(
         body["requestId"] = request_id
 
     try:
-        item = await schedule_service.create_item(user_id, body)
+        item = await schedule_service.create_item(identity, body)
     except ServiceError as e:
         return f"创建失败：{e.message}"
 
-    logger.info("agent 创建事项成功：user_id=%s item_id=%s", user_id, (item or {}).get("id"))
+    logger.info("agent 创建事项成功：user_id=%s item_id=%s", identity.user_id, (item or {}).get("id"))
     return f"已创建，{_fmt_item(item)}"
 
 
@@ -333,8 +342,8 @@ async def schedule_update_item(
     :param clear_fields: 要清空的字段名，可选值 content / location / endTime / dueTime / tags，
                          例如 ["location"] 表示把地点去掉
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     body = _build_item_body(
@@ -350,11 +359,11 @@ async def schedule_update_item(
         return "没有要修改的内容，这次调用被忽略了。"
 
     try:
-        item = await schedule_service.update_item(user_id, body)
+        item = await schedule_service.update_item(identity, body)
     except ServiceError as e:
         return f"修改失败：{e.message}"
 
-    logger.info("agent 修改事项成功：user_id=%s item_id=%s", user_id, item_id)
+    logger.info("agent 修改事项成功：user_id=%s item_id=%s", identity.user_id, item_id)
     return f"已修改，{_fmt_item(item)}"
 
 
@@ -376,20 +385,20 @@ async def schedule_complete_item(
     :param item_id: 事项ID
     :param completed: true-标记完成（默认） false-撤销完成
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        await schedule_service.complete_item(user_id, item_id, completed)
+        await schedule_service.complete_item(identity, item_id, completed)
     except ServiceError as e:
         return f"操作失败：{e.message}"
 
     # 完成接口返回的是 Result<Void>（data 为 null），回查一次拿真实状态再告诉模型。
     # 不回查就只能说「已标记完成」，模型无法确认改没改成功，也没法向用户复述当前状态
     action = "已标记完成" if completed else "已撤销完成"
-    logger.info("agent 变更完成状态：user_id=%s item_id=%s completed=%s", user_id, item_id, completed)
-    return f"{action}，{await _detail_after_write(user_id, item_id)}"
+    logger.info("agent 变更完成状态：user_id=%s item_id=%s completed=%s", identity.user_id, item_id, completed)
+    return f"{action}，{await _detail_after_write(identity, item_id)}"
 
 
 @tool(name_or_callable="schedule_cancel_item")
@@ -407,17 +416,17 @@ async def schedule_cancel_item(config: RunnableConfig, item_id: int) -> str:
     :param config: 运行时上下文，由框架注入
     :param item_id: 事项ID
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        await schedule_service.cancel_item(user_id, item_id)
+        await schedule_service.cancel_item(identity, item_id)
     except ServiceError as e:
         return f"取消失败：{e.message}"
 
-    logger.info("agent 取消事项：user_id=%s item_id=%s", user_id, item_id)
-    return f"已取消，{await _detail_after_write(user_id, item_id)}"
+    logger.info("agent 取消事项：user_id=%s item_id=%s", identity.user_id, item_id)
+    return f"已取消，{await _detail_after_write(identity, item_id)}"
 
 
 @tool(name_or_callable="schedule_delete_item")
@@ -433,16 +442,16 @@ async def schedule_delete_item(config: RunnableConfig, item_id: int) -> str:
     :param config: 运行时上下文，由框架注入
     :param item_id: 事项ID
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        await schedule_service.delete_item(user_id, item_id)
+        await schedule_service.delete_item(identity, item_id)
     except ServiceError as e:
         return f"删除失败：{e.message}"
 
-    logger.info("agent 删除事项：user_id=%s item_id=%s", user_id, item_id)
+    logger.info("agent 删除事项：user_id=%s item_id=%s", identity.user_id, item_id)
     return f"已删除事项 id={item_id}。"
 
 
@@ -466,19 +475,19 @@ async def schedule_batch_complete(
     :param item_ids: 事项ID列表，最多 100 条
     :param completed: true-全部标记完成（默认） false-全部撤销完成
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
     if not item_ids:
         return "没有给出事项ID，这次调用被忽略了。"
 
     try:
-        result = await schedule_service.batch_complete(user_id, item_ids, completed)
+        result = await schedule_service.batch_complete(identity, item_ids, completed)
     except ServiceError as e:
         return f"批量操作失败：{e.message}"
 
     logger.info("agent 批量变更完成状态：user_id=%s count=%s completed=%s",
-                user_id, len(item_ids), completed)
+                identity.user_id, len(item_ids), completed)
     return _fmt_batch(result, "标记完成" if completed else "撤销完成")
 
 
@@ -493,18 +502,18 @@ async def schedule_batch_delete(config: RunnableConfig, item_ids: List[int]) -> 
     :param config: 运行时上下文，由框架注入
     :param item_ids: 事项ID列表，最多 100 条
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
     if not item_ids:
         return "没有给出事项ID，这次调用被忽略了。"
 
     try:
-        result = await schedule_service.batch_delete(user_id, item_ids)
+        result = await schedule_service.batch_delete(identity, item_ids)
     except ServiceError as e:
         return f"批量删除失败：{e.message}"
 
-    logger.info("agent 批量删除事项：user_id=%s count=%s", user_id, len(item_ids))
+    logger.info("agent 批量删除事项：user_id=%s count=%s", identity.user_id, len(item_ids))
     return _fmt_batch(result, "批量删除")
 
 
@@ -523,12 +532,12 @@ async def schedule_get_item(config: RunnableConfig, item_id: int) -> str:
     :param config: 运行时上下文，由框架注入
     :param item_id: 事项ID
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        item = await schedule_service.get_item(user_id, item_id)
+        item = await schedule_service.get_item(identity, item_id)
     except ServiceError as e:
         return f"查询失败：{e.message}"
 
@@ -573,8 +582,8 @@ async def schedule_list_items(
     :param page_num: 页码，从 1 开始
     :param page_size: 每页条数，默认 20，上限 50
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     params = {
@@ -590,7 +599,7 @@ async def schedule_list_items(
     }
 
     try:
-        page = await schedule_service.list_items(user_id, params)
+        page = await schedule_service.list_items(identity, params)
     except ServiceError as e:
         return f"查询失败：{e.message}"
 
@@ -607,12 +616,12 @@ async def schedule_overview(config: RunnableConfig) -> str:
 
     :param config: 运行时上下文，由框架注入
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        data = await schedule_service.overview(user_id) or {}
+        data = await schedule_service.overview(identity) or {}
     except ServiceError as e:
         return f"查询失败：{e.message}"
 
@@ -643,12 +652,12 @@ async def schedule_daily_stats(
     :param start_date: 起始日期，格式 2026-11-17；不传由服务端决定
     :param end_date: 结束日期，格式 2026-11-23
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        rows = await schedule_service.daily_stats(user_id, start_date, end_date) or []
+        rows = await schedule_service.daily_stats(identity, start_date, end_date) or []
     except ServiceError as e:
         return f"查询失败：{e.message}"
 
@@ -675,12 +684,12 @@ async def schedule_upcoming_reminders(config: RunnableConfig, days: int = 3) -> 
     :param config: 运行时上下文，由框架注入
     :param days: 往后看几天，默认 3
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        rows = await schedule_service.upcoming_reminders(user_id, days) or []
+        rows = await schedule_service.upcoming_reminders(identity, days) or []
     except ServiceError as e:
         return f"查询失败：{e.message}"
 
@@ -719,8 +728,8 @@ async def schedule_memo_create(
     :param tags: 标签，逗号分隔，如「工作,灵感」
     :param pinned: true 表示置顶
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     body: Dict[str, Any] = {"content": content}
@@ -732,11 +741,11 @@ async def schedule_memo_create(
         body["pinned"] = 1 if pinned else 0
 
     try:
-        memo = await schedule_service.create_memo(user_id, body)
+        memo = await schedule_service.create_memo(identity, body)
     except ServiceError as e:
         return f"记录失败：{e.message}"
 
-    logger.info("agent 创建备忘录：user_id=%s memo_id=%s", user_id, (memo or {}).get("id"))
+    logger.info("agent 创建备忘录：user_id=%s memo_id=%s", identity.user_id, (memo or {}).get("id"))
     return f"已记录，{_fmt_memo(memo)}"
 
 
@@ -763,8 +772,8 @@ async def schedule_memo_update(
     :param tags: 新标签，逗号分隔
     :param pinned: true-置顶 false-取消置顶
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     body: Dict[str, Any] = {"id": memo_id}
@@ -781,11 +790,11 @@ async def schedule_memo_update(
         return "没有要修改的内容，这次调用被忽略了。"
 
     try:
-        memo = await schedule_service.update_memo(user_id, body)
+        memo = await schedule_service.update_memo(identity, body)
     except ServiceError as e:
         return f"修改失败：{e.message}"
 
-    logger.info("agent 修改备忘录：user_id=%s memo_id=%s", user_id, memo_id)
+    logger.info("agent 修改备忘录：user_id=%s memo_id=%s", identity.user_id, memo_id)
     return f"已修改，{_fmt_memo(memo)}"
 
 
@@ -799,16 +808,16 @@ async def schedule_memo_delete(config: RunnableConfig, memo_id: int) -> str:
     :param config: 运行时上下文，由框架注入
     :param memo_id: 备忘录ID
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        await schedule_service.delete_memo(user_id, memo_id)
+        await schedule_service.delete_memo(identity, memo_id)
     except ServiceError as e:
         return f"删除失败：{e.message}"
 
-    logger.info("agent 删除备忘录：user_id=%s memo_id=%s", user_id, memo_id)
+    logger.info("agent 删除备忘录：user_id=%s memo_id=%s", identity.user_id, memo_id)
     return f"已删除备忘录 id={memo_id}。"
 
 
@@ -822,12 +831,12 @@ async def schedule_memo_get(config: RunnableConfig, memo_id: int) -> str:
     :param config: 运行时上下文，由框架注入
     :param memo_id: 备忘录ID
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     try:
-        memo = await schedule_service.get_memo(user_id, memo_id)
+        memo = await schedule_service.get_memo(identity, memo_id)
     except ServiceError as e:
         return f"查询失败：{e.message}"
 
@@ -853,8 +862,8 @@ async def schedule_memo_list(
     :param page_num: 页码，从 1 开始
     :param page_size: 每页条数，默认 20，上限 50
     """
-    user_id = _user_id(config)
-    if user_id is None:
+    identity = _identity(config)
+    if identity is None:
         return NO_IDENTITY
 
     params = {
@@ -865,7 +874,7 @@ async def schedule_memo_list(
     }
 
     try:
-        page = await schedule_service.list_memos(user_id, params)
+        page = await schedule_service.list_memos(identity, params)
     except ServiceError as e:
         return f"查询失败：{e.message}"
 

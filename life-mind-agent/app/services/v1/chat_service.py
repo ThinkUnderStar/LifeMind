@@ -28,6 +28,7 @@ from sqlalchemy import func, select, update
 
 from app.agent.nodes import delete_session_memory_since, drop_session_memory_collection
 from app.agent.service_catalog import plugin_of_tool, tool_label, ui_panel_of
+from app.client.base import Identity
 from app.db.mysql.entities import AgentTaskEntity, ChatMessageEntity
 from app.db.mysql.session import session_scope
 from app.db.postgresql.session import get_saver
@@ -66,7 +67,7 @@ def _sse(event_type: str, data: Any = None) -> str:
 
 
 def _build_config(
-        user_id: int,
+        identity: Identity,
         conversation_id: int,
         enable_web_search: int = 0,
         from_checkpoint_id: Optional[str] = None,
@@ -80,7 +81,7 @@ def _build_config(
     - from_checkpoint_id：本轮开始前的快照，只用于写进 user 消息行（回溯的分叉依据）；
     - fork_checkpoint_id：让图从该快照分叉继续（LangGraph 的 time travel），只有回溯会传。
 
-    :param user_id: 网关注入的用户ID
+    :param identity: 当前用户身份（ID + 角色 + 范围），三个值都进 configurable
     :param conversation_id: 会话ID，同时作为 thread_id
     :param enable_web_search: 本轮联网开关，放运行时 config，模型改不了
     :param from_checkpoint_id: 要记录到消息行上的父快照
@@ -89,7 +90,12 @@ def _build_config(
     :return: RunnableConfig 字典
     """
     configurable: Dict[str, Any] = {
-        "user_id": user_id,
+        "user_id": identity.user_id,
+        # 角色与范围随身份一起进运行时上下文，服务工具调下游时原样透传。
+        # 不写死在 client 层：那等于 agent 用一个固定权限的账号代所有人操作，
+        # 用户是 admin 时调不动管理接口，用户只有 read 时反而可能超权。
+        "user_roles": identity.roles,
+        "user_scopes": identity.scopes,
         # conversation_id 与会话主键同值；thread_id 单独给一份，
         # 兼容节点里 conversation_id or thread_id 的取法
         "conversation_id": conversation_id,
@@ -299,7 +305,7 @@ async def get_pending_interrupt_service(
 
 async def chat_with_agent_service(
         graph: CompiledStateGraph[State],
-        user_id: int,
+        identity: Identity,
         chat_dto: ChatDto,
         enabled_plugins: str = "",
 ) -> AsyncGenerator[str, None]:
@@ -313,19 +319,19 @@ async def chat_with_agent_service(
     供之后的时间回溯定位分叉点。
 
     :param graph: 已编译的图（由路由层通过 get_graph 取到，惰性编译）
-    :param user_id: 网关从 JWT 解出并注入请求头的用户ID
+    :param identity: 当前用户身份（ID + 角色 + 范围），三个值都进运行时 config
     :param chat_dto: 本轮请求体
     :yield: SSE 帧字符串
     """
     # 先按最小配置查一次状态，拿到 checkpoint 后重建 config（_build_config 只认最终值）
     has_history, checkpoint_id = await _load_thread_state(
         graph,
-        _build_config(user_id, chat_dto.conversation_id, chat_dto.enable_web_search,
+        _build_config(identity, chat_dto.conversation_id, chat_dto.enable_web_search,
                       enabled_plugins=enabled_plugins),
     )
 
     config = _build_config(
-        user_id=user_id,
+        identity=identity,
         conversation_id=chat_dto.conversation_id,
         enable_web_search=chat_dto.enable_web_search,
         from_checkpoint_id=checkpoint_id,
@@ -345,7 +351,7 @@ async def chat_with_agent_service(
 
 async def resume_chat_service(
         graph: CompiledStateGraph[State],
-        user_id: int,
+        identity: Identity,
         resume_dto: ResumeDto,
         enabled_plugins: str = "",
 ) -> AsyncGenerator[str, None]:
@@ -360,7 +366,7 @@ async def resume_chat_service(
     也不传 from_checkpoint_id：resume 不产生新的用户消息，写不进去也不该写。
 
     :param graph: 已编译的图
-    :param user_id: 网关注入的用户ID
+    :param identity: 当前用户身份（ID + 角色 + 范围）
     :param resume_dto: 会话ID、选择、编辑内容、联网开关
     :yield: SSE 帧字符串
     :raises BusinessException: choice=edit 但没给编辑内容
@@ -369,7 +375,7 @@ async def resume_chat_service(
         # 前端弹窗选"编辑"却没提交内容，属于非法请求；放过去节点里会拼出 "edit:" 空内容
         raise BusinessException(message="选择编辑时必须提供修改后的内容", code=400)
 
-    config = _build_config(user_id, resume_dto.conversation_id, resume_dto.enable_web_search,
+    config = _build_config(identity, resume_dto.conversation_id, resume_dto.enable_web_search,
                            enabled_plugins=enabled_plugins)
 
     graph_input = Command(resume={
@@ -439,7 +445,7 @@ async def clear_conversation_memory_service(user_id: int, conversation_id: int) 
 
 async def backtrack_chat_service(
         graph: CompiledStateGraph[State],
-        user_id: int,
+        identity: Identity,
         backtrack_dto: BacktrackDto,
         enabled_plugins: str = "",
 ) -> AsyncGenerator[str, None]:
@@ -459,11 +465,14 @@ async def backtrack_chat_service(
     清空线程后重新补一条 SystemMessage 占位。
 
     :param graph: 已编译的图
-    :param user_id: 网关注入的用户ID
+    :param identity: 当前用户身份（ID + 角色 + 范围）
     :param backtrack_dto: 会话ID、被改写的消息ID、新内容
     :yield: SSE 帧字符串
     :raises BusinessException: 404 消息不存在 / 400 消息不是用户消息
     """
+    # 下面的清库、删向量、打日志只需要 ID；完整身份只传给 _build_config
+    user_id = identity.user_id
+
     async with session_scope() as db:
         query = select(ChatMessageEntity).where(
             ChatMessageEntity.id == backtrack_dto.message_id,
@@ -548,7 +557,7 @@ async def backtrack_chat_service(
     else:
         # 首条消息的回溯：没有可用快照，只能清空线程从头开始
         await get_saver().adelete_thread(str(backtrack_dto.conversation_id))
-        config = _build_config(user_id=user_id, conversation_id=backtrack_dto.conversation_id,
+        config = _build_config(identity=identity, conversation_id=backtrack_dto.conversation_id,
                                enabled_plugins=enabled_plugins)
         messages.append(SystemMessage(content="", id=SYSTEM_MESSAGE_ID))
 

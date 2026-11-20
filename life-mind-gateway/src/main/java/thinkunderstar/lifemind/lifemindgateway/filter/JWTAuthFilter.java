@@ -4,6 +4,7 @@ import com.auth0.jwt.JWT;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.auth0.jwt.exceptions.TokenExpiredException;
+import com.auth0.jwt.interfaces.Claim;
 import com.auth0.jwt.interfaces.DecodedJWT;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -254,7 +255,10 @@ public class JWTAuthFilter implements WebFilter {
         }
 
         //获取用户信息
-        String userId = jwt.getClaim("LifeMind-User-Id") + "";
+        //不能写成 jwt.getClaim("LifeMind-User-Id") + ""：声明缺失时 getClaim 返回的
+        //不是 null 而是 isMissing() 的占位 Claim，拼串得到字面量 "Missing claim"，
+        //下面的 isBlank 拦不住，会以它当 userId 去查缓存、回源
+        String userId = claimString(jwt, "LifeMind-User-Id");
 
         //Token 合法但没有 User-Id claim 时必须拦住，否则会出两个问题：
         //1. 拼接 Redis key 得到字面量 "life-mind:null:scopes"，
@@ -262,7 +266,7 @@ public class JWTAuthFilter implements WebFilter {
         //2. 回源时 queryParam("userId", null) 不会抛异常，而是生成没有值的
         //   ?userId，account 服务按 Long 接收会直接报 400。
         //这种 Token 不可能是登录接口签发的，按无效 Token 处理。
-        if (userId == null || userId.isBlank()) {
+        if (userId.isBlank()) {
             return ResponseUtils.writeError(
                     exchange,
                     HttpStatus.UNAUTHORIZED,
@@ -273,8 +277,8 @@ public class JWTAuthFilter implements WebFilter {
 
         //向SecurityContext注入值，跳过认证过滤器（只用 JWT 里的信息，不需要查 Redis）
         List<SimpleGrantedAuthority> authorities = new ArrayList<>();
-        String roles = jwt.getClaim("LifeMind-User-Roles").asString();
-        if (roles != null && !roles.isBlank()) {
+        String roles = claimString(jwt, "LifeMind-User-Roles");
+        if (!roles.isBlank()) {
             for (String role : roles.split(",")) {
                 if (!role.isBlank()) {
                     authorities.add(new SimpleGrantedAuthority("ROLE_" + role.trim()));
@@ -309,7 +313,7 @@ public class JWTAuthFilter implements WebFilter {
      * @return true-版本一致，可以继续；false-已拒绝，错误响应已在方法内写回，调用方直接结束链路
      */
     private Mono<Boolean> checkTokenVersion(ServerWebExchange exchange, DecodedJWT jwt, String userId) {
-        Integer jwtVersion = jwt.getClaim(TOKEN_VERSION_CLAIM).asInt();
+        Integer jwtVersion = claimInteger(jwt, TOKEN_VERSION_CLAIM);
 
         //登录接口一定会写入版本号声明；缺这个声明（或声明不是数字）说明令牌
         //不是本系统登录接口签发的，按无效令牌处理，不能当成版本 0 放行
@@ -607,6 +611,54 @@ public class JWTAuthFilter implements WebFilter {
     }
 
     /**
+     * 安全读取字符串类型的声明。
+     *
+     * <p>java-jwt 的取值语义容易踩坑（4.5.2 实测）：
+     * <ul>
+     *     <li>{@code getClaim(name)} 在声明不存在时<b>不返回 null</b>，而是返回一个
+     *         {@code isMissing() == true} 的 Claim 实现。所以判空必须用
+     *         {@code isMissing()}，只判 {@code == null} 等于没防。</li>
+     *     <li>{@code asString()} 对缺失声明返回 <b>null</b>，不抛异常。</li>
+     *     <li>{@code claim + ""} 得到的是字面量 <b>"Missing claim"</b>——既不是 null
+     *         也不是空串，任何 {@code isBlank()} 检查都拦不住。用它当 userId
+     *         会拼出 {@code life-mind:Missing claim:scopes} 这种缓存 key。</li>
+     * </ul>
+     *
+     * <p>因此统一收敛到本方法，不返回 null：调用方拿到的永远是可直接比较的字符串。
+     *
+     * @param jwt  已验签的令牌
+     * @param name 声明名
+     * @return 声明值；声明不存在或值为 null 时返回空串，调用方按「没有」处理
+     */
+    private String claimString(DecodedJWT jwt, String name) {
+        Claim claim = jwt.getClaim(name);
+        if (claim == null || claim.isMissing()) {
+            return "";
+        }
+        String value = claim.asString();
+        return value == null ? "" : value;
+    }
+
+    /**
+     * 安全读取整型类型的声明。
+     *
+     * <p>与 {@link #claimString} 同理：缺失声明要靠 {@code isMissing()} 判断，
+     * 而 {@code asInt()} 对缺失声明和「值不是数字」两种情况都返回 null、
+     * 不抛异常（4.5.2 实测），所以这里不需要 try/catch。
+     *
+     * @param jwt  已验签的令牌
+     * @param name 声明名
+     * @return 声明值；声明不存在、为空或不是数字时返回 null，调用方按「无法校验」处理
+     */
+    private Integer claimInteger(DecodedJWT jwt, String name) {
+        Claim claim = jwt.getClaim(name);
+        if (claim == null || claim.isMissing()) {
+            return null;
+        }
+        return claim.asInt();
+    }
+
+    /**
      * 把用户信息、权限与插件集合写入请求头，交给后续过滤器处理。
      *
      * @param scopes  权限标识串，逗号分隔；空串表示该用户没有任何权限
@@ -626,8 +678,10 @@ public class JWTAuthFilter implements WebFilter {
                     headers.set("LifeMind-User-Id", userId);
 
                     //添加用户身份
+                    //空值写空串而不是跳过 set：下游 HeaderAuthenticationFilter 要求三个头
+                    //齐全，缺一个就 401；空串能让它建出无角色身份，比整个请求打回来合理
                     headers.remove("LifeMind-User-Roles");
-                    headers.set("LifeMind-User-Roles", jwt.getClaim("LifeMind-User-Roles").asString());
+                    headers.set("LifeMind-User-Roles", claimString(jwt, "LifeMind-User-Roles"));
 
                     //添加用户权限
                     headers.remove("LifeMind-User-Scopes");

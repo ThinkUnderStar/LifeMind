@@ -14,7 +14,8 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from starlette.responses import StreamingResponse
 
 from app.agent.graph import get_graph
-from app.api.v1.deps import current_plugins, current_user_id
+from app.api.v1.deps import current_identity, current_plugins, current_user_id
+from app.client.base import Identity
 from app.schemas.web.request import BacktrackDto, ChatDto, ResumeDto
 from app.schemas.web.response import MessageListDto, PendingInterruptDto, TaskDto
 from app.schemas.web.result import Result
@@ -57,7 +58,7 @@ def _sse_response(stream) -> StreamingResponse:
 async def chat_with_agent(
         request: Request,
         chat_dto: ChatDto = Body(..., description="用户这一轮的话、所属会话与联网开关"),
-        user_id: int = Depends(current_user_id),
+        identity: Identity = Depends(current_identity),
         enabled_plugins: str = Depends(current_plugins),
 ) -> StreamingResponse:
     """
@@ -84,18 +85,18 @@ async def chat_with_agent(
         BusinessException: 身份缺失/非法；会话不存在或不属于当前用户（404）。
     """
     # 会话必须已存在且属于自己：不校验就等于允许往别人的 thread 里写消息
-    await require_owned_conversation(user_id, chat_dto.conversation_id)
+    await require_owned_conversation(identity.user_id, chat_dto.conversation_id)
 
     graph = get_graph(request.app)
     return _sse_response(
-        chat_with_agent_service(graph, user_id, chat_dto, enabled_plugins=enabled_plugins))
+        chat_with_agent_service(graph, identity, chat_dto, enabled_plugins=enabled_plugins))
 
 
 @chat_router.post("/resume")
 async def resume_chat(
         request: Request,
         resume_dto: ResumeDto = Body(..., description="中断确认结果：会话ID + 选择 + 可选编辑内容"),
-        user_id: int = Depends(current_user_id),
+        identity: Identity = Depends(current_identity),
         enabled_plugins: str = Depends(current_plugins),
 ) -> StreamingResponse:
     """
@@ -119,7 +120,7 @@ async def resume_chat(
         BusinessException: 身份缺失/非法；会话不属于当前用户（404）；
                            选择编辑但没给内容（400）。
     """
-    await require_owned_conversation(user_id, resume_dto.conversation_id)
+    await require_owned_conversation(identity.user_id, resume_dto.conversation_id)
 
     graph = get_graph(request.app)
 
@@ -127,14 +128,14 @@ async def resume_chat(
     await assert_has_pending_interrupt(graph, resume_dto.conversation_id)
 
     return _sse_response(
-        resume_chat_service(graph, user_id, resume_dto, enabled_plugins=enabled_plugins))
+        resume_chat_service(graph, identity, resume_dto, enabled_plugins=enabled_plugins))
 
 
 @chat_router.post("/backtrack")
 async def backtrack_chat(
         request: Request,
         backtrack_dto: BacktrackDto = Body(..., description="会话ID + 被改写的用户消息ID + 新内容"),
-        user_id: int = Depends(current_user_id),
+        identity: Identity = Depends(current_identity),
         enabled_plugins: str = Depends(current_plugins),
 ) -> StreamingResponse:
     """
@@ -158,11 +159,11 @@ async def backtrack_chat(
         BusinessException: 身份缺失/非法；会话不属于当前用户（404）；
                            消息不存在（404）或不是用户消息（400）。
     """
-    await require_owned_conversation(user_id, backtrack_dto.conversation_id)
+    await require_owned_conversation(identity.user_id, backtrack_dto.conversation_id)
 
     graph = get_graph(request.app)
     return _sse_response(
-        backtrack_chat_service(graph, user_id, backtrack_dto, enabled_plugins=enabled_plugins))
+        backtrack_chat_service(graph, identity, backtrack_dto, enabled_plugins=enabled_plugins))
 
 
 @chat_router.get("/messages/{conversation_id}")
