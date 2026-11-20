@@ -26,14 +26,19 @@ public class Plugin {
     private Long id;
 
     /**
-     * 插件标识：todo / schedule / bill / health，与 agent 工具名前缀一致。
+     * 插件标识：schedule / bill / health，与 agent 工具名前缀一致。
      *
      * <p>只增不改：改名等于换插件，前端已存的启用记录和历史服务卡都会对不上。
+     *
+     * <p>一行插件必须对应 agent 侧 SERVICE_TOOLS 里的一组工具。待办没有
+     * todo_* 工具（它是 schedule_create_item 的 item_type=todo 分支），
+     * 因此不单列成一行——没有工具支撑的 plugin_key 会让用户在插件市场里
+     * 看到一个点了却毫无效果的开关。
      */
     private String pluginKey;
 
     /**
-     * 展示名，如「待办」
+     * 展示名，如「日程与待办」
      */
     private String name;
 

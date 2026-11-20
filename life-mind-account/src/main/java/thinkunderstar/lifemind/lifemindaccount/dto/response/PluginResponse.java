@@ -15,12 +15,14 @@ import lombok.NoArgsConstructor;
 public class PluginResponse {
 
     /**
-     * 插件标识：todo / schedule / bill / health
+     * 插件标识：schedule / bill / health
+     *
+     * <p>与 agent 侧 SERVICE_TOOLS 的 key 一一对应；待办并入 schedule，不单列。
      */
     private String pluginKey;
 
     /**
-     * 展示名，如「待办」
+     * 展示名，如「日程与待办」
      */
     private String name;
 

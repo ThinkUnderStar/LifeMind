@@ -16,7 +16,9 @@ import lombok.NoArgsConstructor;
 public class PluginToggleRequest {
 
     /**
-     * 插件标识，如 todo；必须是 plugin 表里已上架的 plugin_key
+     * 插件标识，如 schedule；必须是 plugin 表里已上架的 plugin_key。
+     *
+     * <p>待办不是独立插件，它随 schedule 一起启停，不要传 todo。
      */
     private String pluginKey;
 
