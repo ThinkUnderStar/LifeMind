@@ -2,6 +2,7 @@ package thinkunderstar.lifemind.lifemindgateway.filter;
 
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.algorithms.Algorithm;
+import com.auth0.jwt.exceptions.JWTDecodeException;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.auth0.jwt.exceptions.TokenExpiredException;
 import com.auth0.jwt.interfaces.Claim;
@@ -258,7 +259,7 @@ public class JWTAuthFilter implements WebFilter {
         //不能写成 jwt.getClaim("LifeMind-User-Id") + ""：声明缺失时 getClaim 返回的
         //不是 null 而是 isMissing() 的占位 Claim，拼串得到字面量 "Missing claim"，
         //下面的 isBlank 拦不住，会以它当 userId 去查缓存、回源
-        String userId = claimString(jwt, "LifeMind-User-Id");
+        String userId = claimUserId(jwt);
 
         //Token 合法但没有 User-Id claim 时必须拦住，否则会出两个问题：
         //1. 拼接 Redis key 得到字面量 "life-mind:null:scopes"，
@@ -280,9 +281,15 @@ public class JWTAuthFilter implements WebFilter {
         String roles = claimString(jwt, "LifeMind-User-Roles");
         if (!roles.isBlank()) {
             for (String role : roles.split(",")) {
-                if (!role.isBlank()) {
-                    authorities.add(new SimpleGrantedAuthority("ROLE_" + role.trim()));
+                String roleName = role.trim();
+                if (roleName.isEmpty()) {
+                    continue;
                 }
+                //identity.code 落库的就已经是 ROLE_USER / ROLE_ADMIN（account 的 identity 表），
+                //这里再无条件拼一次前缀会得到 ROLE_ROLE_USER，hasRole('USER') 永远匹配不上，
+                //表现为「Token 有效但每个接口都 403」。已经带前缀的直接用，没带的才补。
+                authorities.add(new SimpleGrantedAuthority(
+                        roleName.startsWith("ROLE_") ? roleName : "ROLE_" + roleName));
             }
         }
         SecurityContext securityContext = new SecurityContextImpl(
@@ -637,6 +644,37 @@ public class JWTAuthFilter implements WebFilter {
         }
         String value = claim.asString();
         return value == null ? "" : value;
+    }
+
+    /**
+     * 读取用户 ID 声明。不能直接用 {@link #claimString}。
+     *
+     * <p>account 侧签发用的是 {@code withClaim("LifeMind-User-Id", user.getId())}，
+     * 值类型是 Long，序列化成 JSON 后是<b>数字</b>。而 java-jwt 的
+     * {@code Claim.asString()} 只认 String 类型的值，遇到数字直接返回 {@code null}
+     * （不抛异常，也不做 toString 转换），于是 claimString 返回空串，
+     * 被误判成「Token 缺少用户信息」——每个带合法令牌的请求都 401。
+     *
+     * <p>这里先按数字读，读不出来再退回字符串，兼容历史上签发成字符串的令牌。
+     *
+     * @param jwt 已验签的令牌
+     * @return 用户 ID 字符串；声明缺失或无法解析时返回空串
+     */
+    private String claimUserId(DecodedJWT jwt) {
+        Claim claim = jwt.getClaim("LifeMind-User-Id");
+        if (claim == null || claim.isMissing()) {
+            return "";
+        }
+        try {
+            Long id = claim.asLong();
+            if (id != null) {
+                return String.valueOf(id);
+            }
+        } catch (JWTDecodeException ignored) {
+            // 不是数字，落到下面的字符串分支
+        }
+        String value = claim.asString();
+        return value == null ? "" : value.trim();
     }
 
     /**
