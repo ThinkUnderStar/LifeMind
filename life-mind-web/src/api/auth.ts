@@ -41,3 +41,26 @@ export function login(payload: LoginPayload): Promise<LoginResult> {
     rememberMe: payload.rememberMe ?? 0,
   })
 }
+
+/**
+ * 注册。后端不签发令牌，成功只返回 Result<Void>（data 为 null），
+ * 所以这里返回 void，调用方拿到成功后自己把用户送回登录态。
+ *
+ * 字段规则由后端说了算，前端只做同规则的提前拦截（提示文案对齐 ValidateUtils）：
+ * - username  `^[a-zA-Z][a-zA-Z0-9_]{3,15}$`  字母开头，4~16 位
+ * - password  8~20 位，必须同时含字母与数字
+ * - nickname  1~16 位，中文 / 字母 / 数字 / 下划线 / 连字符
+ */
+export interface RegisterPayload {
+  username: string
+  password: string
+  /** 仅用于服务端比对，不落库 */
+  confirmPassword: string
+  nickname: string
+  tempKey: string
+  captchaCode: string
+}
+
+export function register(payload: RegisterPayload): Promise<void> {
+  return post<void>(`${SERVICE.account}/auth/register`, payload)
+}

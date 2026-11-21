@@ -6,7 +6,7 @@
  */
 import { onMounted } from 'vue'
 import { boot, state } from './core/store'
-import LoginView from './views/LoginView.vue'
+import AuthView from './views/AuthView.vue'
 import AppShell from './views/AppShell.vue'
 
 onMounted(() => {
@@ -15,7 +15,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <LoginView v-if="state.booted && !state.authed" />
+  <AuthView v-if="state.booted && !state.authed" />
   <AppShell v-else-if="state.authed" />
   <div v-else class="booting" aria-live="polite">正在打开…</div>
 </template>
