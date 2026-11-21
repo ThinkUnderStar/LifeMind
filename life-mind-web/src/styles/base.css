@@ -1,0 +1,217 @@
+/**
+ * 全局基座：reset、排版基线、按钮与输入框的通用形态。
+ * 组件私有样式一律写在各自的 scoped block 里，这里不出现任何布局类。
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-text);
+  font-size: var(--t-md);
+  line-height: var(--lh-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+p,
+figure {
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  letter-spacing: -0.01em;
+}
+
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--signal);
+  text-decoration: none;
+}
+
+/* 焦点必须可见：键盘用户靠它定位，不能用 outline:none 换美观 */
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+::selection {
+  background: var(--signal-line);
+  color: var(--ink);
+}
+
+/* 细滚动条，宽度固定，避免出现/消失时内容横向跳动 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--rule-strong);
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- 按钮。三种用途，不再派生第四个变体 ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 7px 14px;
+  border-radius: var(--r-md);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  line-height: 1.4;
+  border: 1px solid transparent;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    color var(--dur) var(--ease);
+  white-space: nowrap;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--signal);
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #274d42;
+}
+
+.btn-quiet {
+  border-color: var(--rule);
+  color: var(--ink-soft);
+  background: transparent;
+}
+
+.btn-quiet:hover:not(:disabled) {
+  border-color: var(--rule-strong);
+  background: var(--paper-sunken);
+}
+
+/* 危险动作不填色：填红会诱导误点，只让文字和描边变红 */
+.btn-danger {
+  border-color: #e2c7c0;
+  color: var(--alert);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--alert-soft);
+}
+
+.btn-text {
+  padding: 2px 0;
+  color: var(--muted);
+  font-size: var(--t-sm);
+}
+
+.btn-text:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+/* ---------- 输入 ---------- */
+
+.field {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-md);
+  background: var(--paper-raised);
+  font-size: var(--t-sm);
+  transition: border-color var(--dur) var(--ease);
+}
+
+.field::placeholder {
+  color: var(--muted-soft);
+}
+
+.field:focus {
+  outline: none;
+  border-color: var(--signal);
+}
+
+.field:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+/* ---------- 小工具 ---------- */
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 空状态：一句话说明这里本该有什么，加一个动作，不道歉不卖萌 */
+.empty {
+  padding: var(--s5) var(--s4);
+  color: var(--muted);
+  font-size: var(--t-sm);
+  line-height: var(--lh-body);
+}

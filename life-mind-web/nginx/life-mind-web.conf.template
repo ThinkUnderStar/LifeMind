@@ -1,0 +1,89 @@
+# LifeMind 前端开发用 nginx 配置模板。
+#
+# 不要直接改这个文件：`npm run dev` 会把它复制到 .nginx/run.conf，
+# 替换掉 __PORT__ 这类占位符后再启动，改这里等于改模板源，不会立即生效。
+#
+# 为什么必须经 nginx，而不是让 Vite 直接 serve：
+# 浏览器只认识一个源（http://localhost:8088），页面和 /api 同源，
+# 跨域在配置层面根本不存在，不需要后端加 CORS 头，也不需要前端带 credentials。
+#
+# 为什么 /api 转给网关 8001 而不是各微服务端口：
+# JWT 校验、LifeMind-User-Id / -Roles / -Scopes / -Plugins 的注入只在网关做。
+# 直接转 8005 会绕开注入，下游拿不到身份直接 401；而前端绝不能自己塞 userId 头，
+# 那等于把身份判定权交给了浏览器。
+
+worker_processes 1;
+error_log logs/error.log warn;
+pid logs/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    access_log logs/access.log;
+
+    default_type application/octet-stream;
+    sendfile on;
+    keepalive_timeout 65;
+
+    # 临时目录全部落在项目内。Windows 上 nginx 装完默认没有写自己目录的权限，
+    # 不改这几行会在启动时报 "CreateFile() failed (5: Access is denied)"。
+    client_body_temp_path tmp/client_body;
+    proxy_temp_path tmp/proxy;
+    fastcgi_temp_path tmp/fastcgi;
+    uwsgi_temp_path tmp/uwsgi;
+    scgi_temp_path tmp/scgi;
+
+    server_tokens off;
+
+    upstream lm_gateway {
+        server 127.0.0.1:8001;
+        keepalive 16;
+    }
+
+    upstream lm_web {
+        server 127.0.0.1:5173;
+        keepalive 16;
+    }
+
+    server {
+        listen __PORT__;
+        server_name localhost;
+
+        # ---- 后端：/api/xxx → 网关 /xxx ----
+        # proxy_pass 末尾那个斜杠是有意义的：它让 nginx 去掉匹配到的 /api/ 前缀，
+        # 于是 /api/life-mind/schedule/item/page 变成 /life-mind/schedule/item/page。
+        location /api/ {
+            proxy_pass http://lm_gateway/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Connection "";
+
+            # SSE 四件套。少任何一条的表现都是「前端等整段回复生成完才一次性出现」：
+            # proxy_buffering 默认 on 会把帧攒在 nginx 里，cache 同理，
+            # 而 read_timeout 默认 60s，长任务会被当成超时切断。
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            chunked_transfer_encoding on;
+        }
+
+        # ---- 前端：交给 Vite dev server，保留 HMR ----
+        # 不用 nginx 直接读 dist：开发期要的是热更新，静态文件由 Vite 自己发。
+        location / {
+            proxy_pass http://lm_web;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            # HMR 是一条 websocket，必须把 Upgrade 头透过去，否则控制台一直重连
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_read_timeout 3600s;
+        }
+    }
+}
