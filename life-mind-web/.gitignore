@@ -5,5 +5,8 @@ dist/
 # nginx 运行时生成物：配置、日志、pid、临时缓冲都在这里，不进版本库
 .nginx/
 
+# 本机自备的 nginx 可执行文件（tools/nginx/），二进制不进版本库
+tools/nginx/
+
 *.local
 .DS_Store

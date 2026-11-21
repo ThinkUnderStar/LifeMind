@@ -13,8 +13,9 @@
  * 两条路径的后端目标都是网关 8001，行为一致，差别只在「跨域由谁处理」。
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import process from 'node:process'
@@ -24,7 +25,27 @@ const DEV_PORT = 5173 // 必须与 vite.config.ts 的 strictPort 一致
 const WEB_PORT = Number(process.env.LM_WEB_PORT || 8088)
 const GATEWAY = process.env.LM_GATEWAY || 'http://127.0.0.1:8001'
 
-const NGINX_DIR = join(ROOT, '.nginx')
+/**
+ * nginx for Windows 内部用 ANSI 版 Win32 API（CreateFileA）打开文件，
+ * 路径里出现任何非 ASCII 字符都会失败并报
+ *   1113: No mapping for the Unicode character exists in the target multi-byte code page
+ * 这和权限无关，把目录 ACL 开到最大也没用；也不能靠 chcp 65001 解决。
+ *
+ * 实测三种组合（nginx 1.26.2 / Windows）：
+ *   中文 prefix + 中文 exe  → 起不来，连 error.log 都写不出一行
+ *   中文 exe + ASCII prefix → 起不来，进程根本创建不出来
+ *   ASCII exe + ASCII prefix → 正常
+ * 所以只要项目路径含中文，就必须把「可执行文件」和「运行时目录」双双挪到 ASCII 路径。
+ *
+ * 本项目路径是「桌面\勿动\LifeMind」，正好踩中。运行时目录改放 %LOCALAPPDATA%，
+ * exe 从 tools/nginx 复制过去（tools 目录本身也带中文）。Vite 不受影响，
+ * 它是 Node 程序，走 Unicode API，跑在中文路径下完全正常。
+ */
+const ASCII_SAFE = /^[\x20-\x7E]*$/
+const ASCII_ROOT = ASCII_SAFE.test(ROOT)
+const NGINX_DIR = ASCII_ROOT
+  ? join(ROOT, '.nginx')
+  : join(process.env.LOCALAPPDATA || tmpdir(), 'life-mind-web', 'nginx')
 const NGINX_CONF = join(NGINX_DIR, 'run.conf')
 
 let nginxBin = null
@@ -93,6 +114,21 @@ function findNginx() {
   return null
 }
 
+/**
+ * 找到的 nginx 如果躺在非 ASCII 路径下，复制一份到运行时目录再执行。
+ * 只复制 exe：本项目的 conf 是自包含的（不 include mime.types、不设 root），
+ * 不依赖 nginx 发行版自带的 conf/ 与 html/ 目录。
+ */
+function toAsciiBinary(binPath) {
+  if (ASCII_SAFE.test(binPath)) return binPath
+
+  const target = join(NGINX_DIR, 'bin', 'nginx.exe')
+  mkdirSync(dirname(target), { recursive: true })
+  const stale = !existsSync(target) || statSync(target).size !== statSync(binPath).size
+  if (stale) cpSync(binPath, target)
+  return target
+}
+
 /** 生成运行时配置。模板里的占位符只换端口，其余原样保留便于对照排查 */
 function prepareNginx() {
   mkdirSync(join(NGINX_DIR, 'logs'), { recursive: true })
@@ -139,7 +175,13 @@ async function main() {
     )
   }
 
-  nginxBin = findNginx()
+  const found = findNginx()
+  if (found) {
+    nginxBin = toAsciiBinary(found)
+    if (nginxBin !== found) {
+      say(`[web] 项目路径含非 ASCII 字符，nginx 无法原地运行，已改用 ${nginxBin}`)
+    }
+  }
 
   if (nginxBin && (await canConnect(WEB_PORT))) {
     throw new Error(`${WEB_PORT} 已经被占用，nginx 起不来。先停掉占用它的进程，或设 LM_WEB_PORT 换一个端口。`)
@@ -171,16 +213,34 @@ async function main() {
     prepareNginx()
     say(`[web] 启动 nginx（${WEB_PORT} → 网关 ${GATEWAY}）…`)
 
-    const started = spawnSync(nginxBin, ['-p', NGINX_DIR, '-c', NGINX_CONF], {
-      encoding: 'utf8',
+    // 不能用 spawnSync 等 nginx 返回：Windows 没有 fork，nginx.exe 本身就是
+    // master 进程，启动后不会退出，spawnSync 会永远阻塞在那一行（端口已经监听，
+    // 但脚本再也不往下走）。改成非阻塞启动，用端口探测判断成败。
+    let errText = ''
+    const nginxProc = spawn(nginxBin, ['-p', NGINX_DIR, '-c', NGINX_CONF], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true,
     })
-    if (started.status !== 0) {
-      const detail = (started.stderr || started.stdout || '').trim()
-      throw new Error(`nginx 启动失败：\n${detail || '没有更多输出，查看 .nginx/logs/error.log'}`)
-    }
+    nginxProc.stderr?.on('data', (chunk) => {
+      errText += String(chunk)
+    })
+    nginxProc.on('exit', (code) => {
+      // master 意外退出：端口会消失，前端表现为「页面打不开」，这里给一句人话
+      if (nginxRunning && !shuttingDown) {
+        nginxRunning = false
+        warn(`\n[web] nginx 意外退出（code ${code}），${WEB_PORT} 已不可用。`)
+        warn(errText.trim() || `查看 ${join(NGINX_DIR, 'logs', 'error.log')}`)
+      }
+    })
 
     nginxRunning = true
-    await waitForPort(WEB_PORT, `nginx ${WEB_PORT}`)
+    try {
+      await waitForPort(WEB_PORT, `nginx ${WEB_PORT}`, 25)
+    } catch {
+      throw new Error(
+        `nginx 启动失败：\n${errText.trim() || `没有输出，查看 ${join(NGINX_DIR, 'logs', 'error.log')}`}`,
+      )
+    }
 
     say('')
     say(`  页面    http://localhost:${WEB_PORT}`)
@@ -195,7 +255,7 @@ async function main() {
     say('')
     warn('  没有找到 nginx，已降级为 Vite 自带代理。')
     warn('  功能一致，但「跨域统一由 nginx 处理」这条约定没有生效。')
-    warn('  装好 nginx 后无需改代码：把它放进 PATH 或 C:\\nginx，脚本会自动切回来。')
+    warn('  装好 nginx 后无需改代码：放进 PATH、C:\\nginx，或项目内 tools/nginx/，脚本会自动切回来。')
     warn('  也可以显式指定：NGINX_BIN=/path/to/nginx npm run dev')
   }
 

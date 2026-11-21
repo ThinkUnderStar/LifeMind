@@ -15,7 +15,30 @@ npm run dev
 
 **必须走网关，不能直连微服务。** JWT 校验和 `LifeMind-User-Id` / `-Roles` / `-Scopes` / `-Plugins` 四个头只在网关注入。直接转 8005 会让下游拿不到身份直接 401；而前端绝不能自己塞 userId 头，那等于把身份判定权交给浏览器。
 
-没装 nginx 也能跑，脚本会自动降级到 Vite 代理并打印一行说明。装好后不用改代码，放进 PATH 或 `C:\nginx` 就自动切回来；也可以用 `NGINX_BIN=/path/to/nginx npm run dev` 显式指定。
+没装 nginx 也能跑，脚本会自动降级到 Vite 代理并打印一行说明。装好后不用改代码，放进 PATH、`C:\nginx`，或项目内 `tools/nginx/`，就会自动切回来；也可以用 `NGINX_BIN=/path/to/nginx npm run dev` 显式指定。
+
+### nginx 与中文路径（Windows 必读）
+
+仓库里 `tools/nginx/` 放了 nginx 1.26.2 的 Windows 版（被 `.gitignore` 排除，二进制不入库）。下载地址 `https://nginx.org/download/nginx-1.26.2.zip`，解压后把 `nginx-1.26.2/` 整个改成 `tools/nginx/` 即可。
+
+nginx for Windows 内部走 ANSI 版 Win32 API（`CreateFileA`），**路径里只要有非 ASCII 字符就会失败**：
+
+```
+CreateFile() "...\.nginx\logs\error.log" failed
+(1113: No mapping for the Unicode character exists in the target multi-byte code page)
+```
+
+这跟权限无关，改目录 ACL 或 `chcp 65001` 都没用。实测三种组合：
+
+| exe 路径 | 运行时 prefix | 结果 |
+|---|---|---|
+| 中文 | 中文 | 起不来，连 error.log 都写不出 |
+| 中文 | ASCII | 起不来，进程创建不出来 |
+| ASCII | ASCII | 正常 |
+
+本项目路径是 `桌面\勿动\LifeMind`，正好命中。所以脚本会检测 `ROOT` 是否纯 ASCII：不是的话，运行时目录改放 `%LOCALAPPDATA%\life-mind-web\nginx`，并把 exe 从 `tools/nginx` 复制一份过去再执行。Vite 不受影响，Node 走 Unicode API，跑在中文路径下正常。
+
+另一个 Windows 坑：**nginx.exe 本身就是 master 进程，不会 fork 后退出**，所以启动不能等它返回（`spawnSync` 会永久阻塞——端口已经监听了，但脚本再也不往下走）。脚本用非阻塞 `spawn` + 端口探测判成败。
 
 依赖：node ≥ 18（用到 `crypto.randomUUID`、`Response`）。
 
