@@ -66,7 +66,14 @@ __pycache__/
 # ============ 日志与临时文件 ============
 *.log
 logs/
+# 本地启动脚本（scripts/start-backend.ps1）把各服务 stdout/stderr 落在这里
+.runlogs/
 *.tmp
 *.bak
 *.orig
 *.rej
+
+# ============ 运行时缓存 ============
+# rag_component 用 LocalFileStore(EMBEDDING_CACHE_PATH) 落盘的向量缓存，随查询增长，
+# 属于本机运行时状态，换台机器就该重建
+embedding_cache.db/
