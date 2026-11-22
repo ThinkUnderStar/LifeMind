@@ -74,33 +74,71 @@ onMounted(refresh)
 </template>
 
 <style scoped>
+/*
+ * 这里的 .field 必须自己写一遍。
+ * 父组件 AuthView 的 .field 是 scoped 的，加的是父组件的 data-v 属性，
+ * 而 scoped 只会把属性打在子组件的根节点上，碰不到这里面的 input——
+ * 之前这个输入框一直是吃 base.css 的默认样式（6px 圆角、9px 内边距），
+ * 放在登录卡片里跟另外三个字段对不齐，这就是「验证码那一行看着歪」的原因。
+ */
 .captcha {
   display: flex;
+  align-items: center;
   gap: var(--s2);
+}
+
+.field {
+  width: 100%;
+  height: 46px;
+  padding: 0 14px;
+  border: 1px solid rgba(23, 24, 26, 0.11);
+  border-radius: 3px;
+  background: #fff;
+  font-size: 14px;
+  transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease);
+}
+
+.field::placeholder {
+  color: rgba(23, 24, 26, 0.28);
+}
+
+.field:hover:not(:disabled):not(:focus) {
+  border-color: rgba(23, 24, 26, 0.22);
+}
+
+.field:focus {
+  outline: none;
+  border-color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--ink);
 }
 
 .shot {
   flex: 0 0 auto;
-  width: 104px;
-  height: 37px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-md);
+  /* 必须与原图 200×100 保持 2:1。验证码字符几乎顶满上下（约占 80% 高），
+     容器一扁就会切掉字符的顶和底——104×37 时裁掉的是上下各 29%，
+     只剩中间一截，人眼认不出来。92×46 正好 2:1，也和左边 46px 的输入框等高，
+     两个框的上下边才能落在同一条线上。 */
+  width: 92px;
+  height: 46px;
+  border: 1px solid rgba(23, 24, 26, 0.11);
+  border-radius: 3px;
   overflow: hidden;
-  background: var(--paper-raised);
-  transition: border-color var(--dur) var(--ease);
+  background: #fff;
+  /* 表单区不做位移和缩放：花样全在背景，这里只提示「可点」 */
+  transition: border-color 160ms var(--ease);
 }
 
 .shot:hover:not(:disabled) {
-  border-color: var(--rule-strong);
+  border-color: rgba(23, 24, 26, 0.3);
 }
 
 .shot img {
   display: block;
   width: 100%;
   height: 100%;
-  /* 原图 200×100；容器 104×37 下 cover 只裁掉左右各约 7%，字符比例正常。
-     fill 会把图横向拉伸四成，字符变胖更难看。 */
-  object-fit: cover;
+  /* 容器已按 2:1 对齐原图，contain 与 cover 等价；用 contain 是为了将来
+     后端换图尺寸时宁可留白，也不要裁掉字符。 */
+  object-fit: contain;
 }
 
 .fallback {

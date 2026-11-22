@@ -68,6 +68,8 @@ __pycache__/
 logs/
 # 本地启动脚本（scripts/start-backend.ps1）把各服务 stdout/stderr 落在这里
 .runlogs/
+# 临时构建 + 截图，用于没有 dev server 时验页面效果，验证完即弃
+.tmp_shot/
 *.tmp
 *.bak
 *.orig
