@@ -8,7 +8,7 @@
  * - 流已经开始后失败 → 后端在流里发一帧 `{"type":"error"}`，此时不能再 throw，
  *   因为 HTTP 状态码已经是 200 了，只能把 error 帧交给上层渲染。
  */
-import { BASE, ApiError, SERVICE, get, notifyUnauthorized, qs, readToken } from './http'
+import { BASE, ApiError, SERVICE, del, get, notifyUnauthorized, qs, readToken } from './http'
 import { readSseStream } from '../core/sse'
 import type {
   AgentTask,
@@ -143,4 +143,12 @@ export function listTasks(conversationId: number): Promise<AgentTask[]> {
  */
 export function getPendingInterrupt(conversationId: number): Promise<PendingInterrupt> {
   return get<PendingInterrupt>(`${SERVICE.agent}/v1/chat/pending/${conversationId}`)
+}
+
+/**
+ * 清空一个会话的全部历史记录（消息、任务、checkpoint、向量），**不可恢复**。
+ * 会话本身保留，还能继续往里发消息——这是「清空记录」，不是「删除会话」。
+ */
+export function clearConversationMemory(conversationId: number): Promise<void> {
+  return del<void>(`${SERVICE.agent}/v1/chat/memory/${conversationId}`)
 }

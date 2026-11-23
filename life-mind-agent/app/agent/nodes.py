@@ -42,7 +42,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 from pymilvus import CollectionSchema, DataType, FieldSchema
 from pymilvus.milvus_client import IndexParams
-from sqlalchemy import Select
+from sqlalchemy import Select, select
 
 from app.agent.prompts import VIOLATION_REPLY, SYSTEM_PROMPT_TEMPLATE, TASK_EXECUTION_SYSTEM_PROMPT
 from app.component_manager.agent_component import ChatLlmWithToolsManager, GateLlmManager, PlannerLlmManager, \
@@ -50,7 +50,7 @@ from app.component_manager.agent_component import ChatLlmWithToolsManager, GateL
 from app.core.settings import settings
 from app.db.milvus.client import get_milvus_client
 from app.db.mysql import ChatMessageEntity
-from app.db.mysql.entities import AgentTaskEntity
+from app.db.mysql.entities import AgentTaskEntity, ConversationEntity
 from app.db.mysql.session import session_scope
 from app.db.postgresql.session import get_store
 from app.rag import rag_flow
@@ -58,6 +58,7 @@ from app.rag.document_processor import llm_memory_processor
 from app.rag.embedding import embedding_docs
 from app.rag.vector_store import vector_store
 from app.schemas.graph.state import State, TaskItem
+from app.services.v1.session_service import DEFAULT_SESSION_TITLE, derive_title
 from app.util.any_to_str import session_memories_to_str, user_memories_to_str, task_list_to_str, task_list_to_executor_prompt
 
 from app.agent.tools import save_user_memory, update_tasks, recall_memory, web_search, USER_MEMORY_NAMESPACE
@@ -281,6 +282,22 @@ async def _save_session_memory(
         # 事务仍开着，后面 Milvus 失败才有得回滚
         await db.flush()
         await db.refresh(entity)
+
+        # 用户首条消息落库时顺手给会话命名：列表里全是「新对话」时分不清哪个是哪个。
+        # 只在标题仍是默认值时写，用户手动改过的名字绝不覆盖（这是他的命名权）。
+        # 同一事务内更新，向量写失败会一起回滚；命名本身失败只记日志，不连累消息落库。
+        if role == "user":
+            try:
+                conv = (await db.execute(
+                    select(ConversationEntity).where(ConversationEntity.id == conversation_id)
+                )).scalar_one_or_none()
+                if conv is not None and conv.title == DEFAULT_SESSION_TITLE:
+                    candidate = derive_title(content)
+                    if candidate and candidate != DEFAULT_SESSION_TITLE:
+                        conv.title = candidate
+                        logger.info("会话自动命名：conversation_id=%s title=%s", conversation_id, candidate)
+            except Exception:
+                logger.warning("会话自动命名失败，保留默认标题：conversation_id=%s", conversation_id, exc_info=True)
 
         try:
             # 切分交给 RAG 侧统一处理：长消息在这里变成多块，切分规则只有那一份

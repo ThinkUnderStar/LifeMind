@@ -3,7 +3,7 @@
  * 一个 reactive 对象加一组函数就够，多引一个库只是多一层要学的东西。
  *
  * 分工会被反复用到，先说清：
- * - 这里只管「对话与外壳」的状态：会话、消息、流、确认卡、当前插件的哪个分段。
+ * - 这里只管「对话与外壳」的状态：会话、消息、流、确认卡、右侧工作区的页面组。
  * - **面板里的业务数据不归这里管**。日程的列表、统计、系列都由面板组件自己拉，
  *   store 只递增 `panelEpoch` 通知它「数据可能变了」。这样加一个插件不必改 store。
  */
@@ -17,12 +17,13 @@ import type {
   SseEvent,
   ToolFrame,
   UiFrame,
+  WorkspacePage,
 } from './types'
 import { login as loginApi } from '../api/auth'
 import { listPlugins, setPluginEnabled } from '../api/plugin'
 import * as sessionApi from '../api/session'
 import * as chatApi from '../api/chat'
-import { popupNotices, markRead } from '../api/notice'
+import { popupNotices, markRead, pageNotices, unreadCount } from '../api/notice'
 import { readToken, writeToken } from '../api/http'
 import { resolvePlugin, resolveTab } from './plugin-registry'
 
@@ -44,9 +45,22 @@ export interface Toast {
 }
 
 const ACCOUNT_KEY = 'lm.account'
+const PANEL_OPEN_KEY = 'lm.panel.open'
 
 let seq = 0
 const nextKey = () => `t-${++seq}`
+
+/** 工作区页面用本地序号，同一个插件也能开好几张页 */
+let pageSeq = 0
+const nextPageKey = () => `page-${++pageSeq}`
+const blankPage = (): WorkspacePage => ({ key: nextPageKey(), kind: 'plugin', pluginKey: null, label: '新页面' })
+const staticPage = (kind: 'notice' | 'profile', label: string): WorkspacePage => ({
+  key: nextPageKey(),
+  kind,
+  pluginKey: null,
+  label,
+})
+const firstPage = blankPage()
 
 export const state = reactive({
   booted: false,
@@ -55,6 +69,10 @@ export const state = reactive({
   account: localStorage.getItem(ACCOUNT_KEY) || '',
 
   sessions: [] as Conversation[],
+  /** 会话栏当前看哪一类：正常会话 / 已归档。后端按 archived 参数过滤，前端不自己筛 */
+  sessionView: 'active' as 'active' | 'archived',
+  /** 会话列表正在拉取。启动/登录后先显示骨架，避免空状态先闪一帧再被数据替换 */
+  sessionsLoading: true,
   sessionId: null as number | null,
   messages: [] as UiMessage[],
   historyCursor: null as number | null,
@@ -67,13 +85,27 @@ export const state = reactive({
   tasks: [] as AgentTask[],
 
   plugins: [] as PluginInfo[],
-  activePlugin: 'schedule',
+
+  /**
+   * 右侧工作区：一组浏览器式的页面，默认收起但随时能主动打开。
+   * 空白页列出可打开的插件，点一个就在当前页打开；也能新建页再开另一个。
+   * 通知也是这里的一页（kind=notice），不再顶掉中间的对话。
+   */
+  workspaceOpen: localStorage.getItem(PANEL_OPEN_KEY) === '1',
+  workspacePages: [firstPage] as WorkspacePage[],
+  workspacePage: firstPage.key,
+  /** 当前显示的插件页参数。切页时由那张页还原，面板组件只读这三个字段 */
+  activePlugin: '',
   activeTab: 'day',
   panelParams: {} as { date?: string; id?: number },
   /** 递增即表示「面板该重新取数了」，面板 watch 它 */
   panelEpoch: 0,
 
   notices: [] as Notice[],
+  /** 通知箱列表（下拉里看的全部记录）。与 notices 分开：那个是弹窗队列，这个是历史 */
+  noticeList: [] as Notice[],
+  noticeUnread: 0,
+  noticeListLoading: false,
   /** 已弹过的通知 id。后端没有 notified_time，同一条未读会被反复取到，只能在界面侧记一份 */
   popped: [] as number[],
 
@@ -115,6 +147,12 @@ export async function login(payload: {
   await Promise.all([loadPlugins(), loadSessions()])
 }
 
+/** 改完账户名后同步本地记录：栏底账号与下次启动读的都是这里 */
+export function setAccount(username: string) {
+  localStorage.setItem(ACCOUNT_KEY, username)
+  state.account = username
+}
+
 export function logout() {
   writeToken(null)
   stop()
@@ -125,7 +163,15 @@ export function logout() {
   state.pending = null
   state.liveTools = []
   state.notices = []
+  state.noticeList = []
+  state.noticeUnread = 0
   state.plugins = []
+  const fresh = blankPage()
+  state.workspacePages = [fresh]
+  state.workspacePage = fresh.key
+  state.workspaceOpen = false
+  state.activePlugin = ''
+  localStorage.setItem(PANEL_OPEN_KEY, '0')
 }
 
 /* =========================== 插件 =========================== */
@@ -148,39 +194,275 @@ export async function togglePlugin(pluginKey: string, enabled: boolean): Promise
   }
 }
 
-export function openPlugin(key: string, tab?: string) {
+/* =========================== 工作区页面 =========================== */
+
+function currentPage(): WorkspacePage | undefined {
+  return state.workspacePages.find((p) => p.key === state.workspacePage)
+}
+
+function persistPanelOpen() {
+  localStorage.setItem(PANEL_OPEN_KEY, state.workspaceOpen ? '1' : '0')
+}
+
+/** 面板组件只看这三个全局字段；切页时由那张页记录的内容还原 */
+function syncPage() {
+  const page = currentPage()
+  const pluginKey = page?.kind === 'plugin' ? page.pluginKey : null
+  const manifest = pluginKey ? resolvePlugin(pluginKey) : undefined
+  state.activePlugin = pluginKey ?? ''
+  state.activeTab = page?.tab ?? manifest?.defaultTab ?? 'day'
+  state.panelParams = { ...(page?.params ?? {}) }
+}
+
+/** 面板内部可能改了分段或日期，切走前存回这一页 */
+function savePage() {
+  const page = currentPage()
+  if (page?.kind !== 'plugin' || !page.pluginKey) return
+  page.tab = state.activeTab
+  page.params = { ...state.panelParams }
+}
+
+/** 顶栏的「工作区」按钮：随时开合，第一次打开时给一张空白页 */
+export function toggleWorkspace() {
+  if (state.workspaceOpen) {
+    state.workspaceOpen = false
+  } else {
+    if (!state.workspacePages.length) {
+      const blank = blankPage()
+      state.workspacePages.push(blank)
+      state.workspacePage = blank.key
+    }
+    state.workspaceOpen = true
+    syncPage()
+  }
+  persistPanelOpen()
+}
+
+export function openWorkspace() {
+  if (!state.workspaceOpen) toggleWorkspace()
+}
+
+/** 新建一张页；带插件 key 就是直接新开一个插件页，不带就是空白页 */
+export function addWorkspacePage(pluginKey?: string, tab?: string) {
+  const manifest = pluginKey ? resolvePlugin(pluginKey) : undefined
+  if (pluginKey && !manifest) {
+    toast('这个插件还没有做出来')
+    return
+  }
+  savePage()
+  const page: WorkspacePage = {
+    key: nextPageKey(),
+    kind: 'plugin',
+    pluginKey: pluginKey ?? null,
+    label: pluginKey ? manifest!.name : '新页面',
+    tab: tab ?? manifest?.defaultTab,
+    params: {},
+  }
+  state.workspacePages.push(page)
+  state.workspacePage = page.key
+  state.workspaceOpen = true
+  persistPanelOpen()
+  syncPage()
+  state.panelEpoch += 1
+}
+
+/** 空白页上点插件：就地打开；当前已经是插件页就另开一页，不覆盖已看的内容 */
+export function openPluginHere(pluginKey: string) {
+  const manifest = resolvePlugin(pluginKey)
+  if (!manifest) {
+    toast('这个插件还没有做出来')
+    return
+  }
+  const page = currentPage()
+  if (page && page.kind === 'plugin' && !page.pluginKey) {
+    page.pluginKey = pluginKey
+    page.label = manifest.name
+    page.tab = manifest.defaultTab
+    page.params = {}
+    state.workspaceOpen = true
+    persistPanelOpen()
+    syncPage()
+    state.panelEpoch += 1
+  } else {
+    addWorkspacePage(pluginKey)
+  }
+}
+
+export function selectWorkspacePage(key: string) {
+  if (key === state.workspacePage || !state.workspacePages.some((p) => p.key === key)) return
+  savePage()
+  state.workspacePage = key
+  syncPage()
+  state.panelEpoch += 1
+}
+
+export function closeWorkspacePage(key: string) {
+  if (state.workspacePages.length <= 1) {
+    // 最后一张关掉就补张空白页，工作区不会剩个空壳
+    const blank = blankPage()
+    state.workspacePages = [blank]
+    state.workspacePage = blank.key
+    syncPage()
+    return
+  }
+  const idx = state.workspacePages.findIndex((p) => p.key === key)
+  if (idx < 0) return
+  const wasCurrent = state.workspacePage === key
+  state.workspacePages.splice(idx, 1)
+  if (wasCurrent) {
+    state.workspacePage = state.workspacePages[Math.min(idx, state.workspacePages.length - 1)].key
+    syncPage()
+    state.panelEpoch += 1
+  }
+}
+
+/**
+ * agent 用到服务时：空白页就地打开，已有同插件页就复用定位，否则新开一页。
+ * 连续用到同一个服务不会堆一叠重复标签，手动新建的页也不会被顶掉。
+ */
+export function openServicePage(key: string, tab?: string) {
   const manifest = resolvePlugin(key)
   if (!manifest) {
     toast('这个插件还没有做出来')
     return
   }
-  state.activePlugin = key
-  state.activeTab = tab ?? manifest.defaultTab
+  const page = currentPage()
+  if (page && page.kind === 'plugin' && !page.pluginKey) {
+    page.pluginKey = key
+    page.label = manifest.name
+    page.tab = tab ?? manifest.defaultTab
+    page.params = {}
+  } else if (page?.pluginKey === key) {
+    if (tab) page.tab = tab
+  } else {
+    const existing = state.workspacePages.find((p) => p.pluginKey === key)
+    if (existing) {
+      savePage()
+      state.workspacePage = existing.key
+      if (tab) existing.tab = tab
+    } else {
+      addWorkspacePage(key, tab)
+      return
+    }
+  }
+  state.workspaceOpen = true
+  persistPanelOpen()
+  syncPage()
+}
+
+/**
+ * 打开通知 / 个人主页这类「固定页」：都是工作区的一页，不是插件。
+ * 已有同一类页就切过去；当前正好是空白插件页就就地变身；否则新开一页。
+ */
+function openStaticPage(kind: 'notice' | 'profile', label: string) {
+  const existing = state.workspacePages.find((p) => p.kind === kind)
+  if (existing) {
+    if (state.workspacePage !== existing.key) selectWorkspacePage(existing.key)
+  } else {
+    // 空白页就地变成这一页，免得白占一张标签
+    const page = currentPage()
+    if (page && page.kind === 'plugin' && !page.pluginKey) {
+      savePage()
+      page.kind = kind
+      page.label = label
+      page.tab = undefined
+      page.params = {}
+      syncPage()
+    } else {
+      savePage()
+      const fresh = staticPage(kind, label)
+      state.workspacePages.push(fresh)
+      state.workspacePage = fresh.key
+      syncPage()
+    }
+    state.panelEpoch += 1
+  }
+  state.workspaceOpen = true
+  persistPanelOpen()
+}
+
+/** 通知从铃铛进，作为工作区的一页：中间对话照旧，不再被通知页顶掉 */
+export function openNoticeWorkspace() {
+  openStaticPage('notice', '通知')
+  void loadNoticeList()
+}
+
+/** 左侧栏底部的账号：个人主页也是工作区的一页，对话不被顶掉 */
+export function openProfileWorkspace() {
+  openStaticPage('profile', '个人主页')
 }
 
 /* =========================== 会话 =========================== */
 
-export async function loadSessions(): Promise<void> {
+/**
+ * 取会话列表。silent 用于归档/恢复/删除这类局部刷新：列表还在，只是少一条，
+ * 不该把整栏换成骨架再换回来（那一下闪烁很扎眼）。启动、登录、切视图仍走骨架。
+ */
+export async function loadSessions(silent = false): Promise<void> {
+  if (!silent) state.sessionsLoading = true
   try {
-    const page = await sessionApi.listSessions({ size: 40 })
+    const page = await sessionApi.listSessions({
+      size: 40,
+      archived: state.sessionView === 'archived',
+    })
     state.sessions = page.records
   } catch (error) {
     toast(messageOf(error), 'error')
+  } finally {
+    if (!silent) state.sessionsLoading = false
   }
 }
 
+/** 切换「会话 / 已归档」。列表重取，但不碰当前打开的对话——归档会话仍能读能聊 */
+export async function switchSessionView(view: 'active' | 'archived'): Promise<void> {
+  if (state.sessionView === view) return
+  state.sessionView = view
+  await loadSessions()
+}
+
+/**
+ * 开一个新对话：只清空界面，不建库。
+ *
+ * 会话要等用户真的发出第一句话才创建（见 send），这样列表里不会出现空的
+ * 「新对话」，也就没有「空会话被归档」这种怪事。反复点这里都只是清空，
+ * 不会出现多条空会话。
+ */
 export async function newSession(): Promise<void> {
-  try {
-    const created = await sessionApi.createSession()
-    state.sessions = [created, ...state.sessions]
-    state.sessionId = created.id
+  // 归档视图里点新对话，先切回正常视图才能看到稍后创建的会话
+  if (state.sessionView === 'archived') {
+    state.sessionView = 'active'
+    await loadSessions()
+  }
+
+  state.sessionId = null
+  state.messages = []
+  state.pending = null
+  state.tasks = []
+  state.panelParams = {}
+  state.historyCursor = null
+  state.historyHasMore = false
+}
+
+/**
+ * 清空一个会话的历史记录（不删会话本身）。
+ * 清的是当前打开的会话时，同步把聊天区、确认卡、任务、游标都清掉——
+ * 否则界面还留着已被后端软删的消息，用户一看以为没清成功。
+ * 标题保留（后端不动 conversation 行）：这是「清空记录」，不是「删除会话」。
+ */
+export async function clearConversation(id: number): Promise<void> {
+  if (state.sessionId === id && state.streaming) stop()
+  await chatApi.clearConversationMemory(id)
+  if (state.sessionId === id) {
     state.messages = []
     state.pending = null
+    state.tasks = []
+    state.panelParams = {}
     state.historyCursor = null
     state.historyHasMore = false
-  } catch (error) {
-    toast(messageOf(error), 'error')
+    state.liveTools = []
   }
+  // 清空不改会话行，列表条目还在；静默重取避免整栏骨架闪一下
+  await loadSessions(true)
 }
 
 export async function openSession(id: number): Promise<void> {
@@ -237,14 +519,16 @@ export async function loadOlder(): Promise<void> {
 
 /* =========================== 对话 =========================== */
 
-/** ui 帧 → 切面板并通知刷新。连续多个工具只触发一次刷新，否则面板会连闪 */
+/** ui 帧 → 自动开对应服务页并切过去，通知面板刷新。多处工具连续触发只刷一次 */
 function applyUiFrame(frame: UiFrame) {
   const manifest = resolvePlugin(frame.plugin)
   if (!manifest) return
 
-  state.activePlugin = manifest.key
-  state.activeTab = resolveTab(manifest, frame.view)
-  state.panelParams = { ...frame.params }
+  openServicePage(manifest.key, resolveTab(manifest, frame.view))
+  // 定位参数记在当前工作区页上，切走再回来不会串到别的页
+  const page = currentPage()
+  if (page) page.params = { ...frame.params }
+  syncPage()
 
   if (panelTimer !== null) window.clearTimeout(panelTimer)
   panelTimer = window.setTimeout(() => {
@@ -297,8 +581,18 @@ export async function send(text: string): Promise<void> {
   const content = text.trim()
   if (!content || state.streaming) return
 
-  if (!state.sessionId) await newSession()
-  if (!state.sessionId) return
+  // 还没建库的「新对话」：第一句话要发出去了才真正创建会话。
+  // 创建失败就不发——否则消息挂在前端、后端没有对应会话，刷新即丢。
+  if (!state.sessionId) {
+    try {
+      const created = await sessionApi.createSession()
+      state.sessionId = created.id
+      state.sessions = [created, ...state.sessions.filter((s) => s.id !== created.id)]
+    } catch (error) {
+      toast(messageOf(error), 'error')
+      return
+    }
+  }
 
   state.messages.push({ key: nextKey(), id: null, role: 'user', content, streaming: false })
   const reply = pushReply()
@@ -325,8 +619,8 @@ export async function send(text: string): Promise<void> {
     state.streaming = false
     state.liveTools = []
     controller = null
-    // 首轮之后后端可能把标题从「新对话」改成了摘要，重取一次
-    loadSessions()
+    // 首轮之后后端可能把标题从「新对话」改成了摘要，静默重取，别把会话栏闪成骨架
+    loadSessions(true)
   }
 }
 
@@ -352,7 +646,7 @@ export async function respond(choice: 'approve' | 'reject', editContent?: string
     state.streaming = false
     state.liveTools = []
     controller = null
-    loadSessions()
+    loadSessions(true)
   }
 }
 
@@ -383,12 +677,65 @@ export async function pollNotices(): Promise<void> {
   } catch {
     // 轮询失败不打扰用户，下一轮会自己恢复
   }
+  // 角标用全量未读数，不能拿弹窗数凑：notPopup 的通知也算未读
+  void refreshUnreadCount()
+}
+
+/** 未读角标。失败静默，下一轮轮询会重试 */
+export async function refreshUnreadCount(): Promise<void> {
+  if (!state.authed) return
+  try {
+    state.noticeUnread = await unreadCount()
+  } catch {
+    // 角标不是关键信息，拉取失败不打扰
+  }
+}
+
+/** 打开铃铛下拉时拉一次通知箱列表（最近 30 条，含已读） */
+export async function loadNoticeList(): Promise<void> {
+  if (!state.authed) return
+  state.noticeListLoading = true
+  try {
+    const page = await pageNotices({ pageNum: 1, pageSize: 30 })
+    state.noticeList = page.records
+  } catch {
+    // 列表拉失败就留空态，不弹 toast 打断正在做的事
+  } finally {
+    state.noticeListLoading = false
+  }
+}
+
+/** 通知箱里点一条：标已读，同时更新角标和弹窗队列 */
+export async function readNotice(id: number): Promise<void> {
+  state.noticeList = state.noticeList.map((n) => (n.id === id ? { ...n, isRead: 1 } : n))
+  state.notices = state.notices.filter((n) => n.id !== id)
+  try {
+    await markRead(id)
+    await refreshUnreadCount()
+  } catch {
+    // 本地已按已读显示；失败下次刷新会被纠正
+  }
+}
+
+/** 全部已读：后端没有批量接口，逐条标（并发发，不等一条一往返） */
+export async function readAllNotices(): Promise<void> {
+  const unread = state.noticeList.filter((n) => n.isRead === 0).map((n) => n.id)
+  if (!unread.length) return
+  state.noticeList = state.noticeList.map((n) => ({ ...n, isRead: 1 }))
+  state.notices = []
+  try {
+    await Promise.all(unread.map((id) => markRead(id)))
+    await refreshUnreadCount()
+  } catch {
+    // 同上，本地先按已读显示
+  }
 }
 
 export async function dismissNotice(id: number): Promise<void> {
   state.notices = state.notices.filter((n) => n.id !== id)
   try {
     await markRead(id)
+    void refreshUnreadCount()
   } catch {
     // 标已读失败也无所谓：本地已经不再展示它了
   }

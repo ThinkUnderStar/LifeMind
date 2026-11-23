@@ -1,6 +1,9 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+/** vite.config 跑在 Node 里，项目没装 @types/node，这里给用到的 process.env 一个最小声明 */
+declare const process: { env: Record<string, string | undefined> }
+
 /**
  * 开发期的代理有两个来源，按优先级：
  *
@@ -16,6 +19,13 @@ import vue from '@vitejs/plugin-vue'
  */
 const GATEWAY = process.env.LM_GATEWAY || 'http://127.0.0.1:8001'
 
+/**
+ * 头像等公开文件由 MinIO 直接提供，库里存的是 `/minio/{bucket}/{object}`。
+ * 生产由 nginx 反代这个前缀，开发期没有 nginx，所以在 dev server 里同样转发一条，
+ * 否则 `<img src="/minio/...">` 会打到前端自己身上变成 404。
+ */
+const MINIO = process.env.LM_MINIO || 'http://127.0.0.1:9000'
+
 export default defineConfig({
   plugins: [vue()],
   server: {
@@ -23,6 +33,11 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
+      '/minio': {
+        target: MINIO,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/minio/, ''),
+      },
       '/api': {
         target: GATEWAY,
         changeOrigin: true,

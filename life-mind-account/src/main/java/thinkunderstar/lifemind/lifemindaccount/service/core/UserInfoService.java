@@ -10,6 +10,7 @@ import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByEmail
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByOriginalRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByPhoneRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeUsernameRequest;
+import thinkunderstar.lifemind.lifemindaccount.dto.response.UserProfileResponse;
 
 import java.util.Collection;
 
@@ -33,6 +34,19 @@ import java.util.Collection;
  * </ul>
  */
 public interface UserInfoService {
+
+    /**
+     * 读取当前登录用户自己的资料。
+     *
+     * <p>此前本服务只有「改」的接口，前端不知道当前昵称、绑定情况与头像，
+     * 个人主页只能拿登录时记下的账户名充数。改资料之前先能读到当前值，是这一环的前提。
+     *
+     * <p>同样只作用于「当前登录用户」：身份取自网关注入的请求头，
+     * 不接收前端传来的用户 ID，所以只能读到自己的资料。
+     *
+     * @return 账户名、昵称、邮箱、手机号、头像与上次改账户名的时间
+     */
+    Result<UserProfileResponse> getProfile();
 
     /*
      * 绑定 / 换绑手机号、邮箱四个入口的共同约定：

@@ -193,6 +193,25 @@ export interface DailyStat {
   todoDoneCount: number
 }
 
+/* =========================== 右侧工作区页面 =========================== */
+
+/**
+ * 工作区里的一张页面，和对话区互不掺和。
+ * kind=plugin 时 pluginKey 为 null 就是空白页：列出能打开的插件，点一个在本页就地打开；
+ * kind=notice / profile 是通知页与个人主页，和插件页共用同一排标签、同一套开合。
+ * 同一个插件可以开多页，所以 key 是本地序号而不是 plugin key。
+ */
+export interface WorkspacePage {
+  key: string
+  kind: 'plugin' | 'notice' | 'profile'
+  pluginKey: string | null
+  label: string
+  /** 插件面板内的分段，切走再切回来要还原 */
+  tab?: string
+  /** agent 的 ui 帧带来的定位参数 */
+  params?: { date?: string; id?: number }
+}
+
 /* =========================== 通知 =========================== */
 
 export interface Notice {

@@ -1,21 +1,46 @@
 <script setup lang="ts">
 /**
- * 对话栏。这一栏的设计选择和主流聊天界面不一样：不用左右气泡。
- *
- * 理由：这里的对话不是两个人在闲聊，是「你说一句，它去改你的日程」。
- * 气泡会把注意力引到「谁说的」，而用户真正要读的是内容和它做了什么。
- * 所以改用「小标签 + 正文」的段落式排布，整体左对齐，读起来像记录而非聊天。
+ * 对话栏。用户在右、AI 在左：两侧各有自己的一栏，但不套气泡——
+ * 这里不是闲聊，是「你说一句，它去改你的日程」，内容本身才是重点。
+ * 文本块靠右但仍左对齐（长句右对齐难读），比彩色气泡安静。
  *
  * 滚动策略：只在用户本来就贴着底部时才自动跟随。用户上滑看历史时如果被强行拽回底部，
  * 是这类界面最烦人的一处。
  */
-import { nextTick, ref, watch } from 'vue'
-import { loadOlder, send, state, stop } from '../core/store'
+import { computed, nextTick, ref, watch } from 'vue'
+import { clearConversation, loadOlder, send, state, stop, toast } from '../core/store'
 import ApprovalCard from '../components/ApprovalCard.vue'
+import brandLogo from '../assets/brand/lifemind-logo.png'
 
 const draft = ref('')
 const streamEl = ref<HTMLElement | null>(null)
 const stick = ref(true)
+
+/** AI 用品牌标，用户用账号首字母——和顶栏头像同一套口径 */
+const userInitial = computed(() => (state.account || '我').trim().charAt(0).toUpperCase())
+
+/** 清空记录两段式：点一次出确认，避免误触抹掉不可恢复的历史 */
+const confirmingClear = ref(false)
+const clearing = ref(false)
+
+// 换会话就把确认态收起来，别让上一条的「确认」留到下一条
+watch(() => state.sessionId, () => {
+  confirmingClear.value = false
+})
+
+async function doClear() {
+  if (state.sessionId === null || clearing.value) return
+  clearing.value = true
+  try {
+    await clearConversation(state.sessionId)
+    confirmingClear.value = false
+    toast('已清空这个会话的记录')
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '清空失败', 'error')
+  } finally {
+    clearing.value = false
+  }
+}
 
 const EXAMPLES = [
   '明天下午三点项目评审，提前半小时提醒我',
@@ -81,7 +106,7 @@ function autoGrow(event: Event) {
       <div v-if="!state.messages.length" class="intro">
         <h1>说一件事，它替你去记。</h1>
         <p class="intro-lede">
-          日程、待办、提醒、备忘都在右侧面板里。你只需要说清楚什么时候、做什么，
+          日程、待办、提醒、备忘都收在工作区里，需要时从右上角展开。你只要说清楚什么时候、做什么，
           它会先把要做的操作摆出来问你是否同意，再落库。
         </p>
         <ul class="examples">
@@ -97,7 +122,10 @@ function autoGrow(event: Event) {
         class="turn"
         :data-role="message.role"
       >
-        <p class="who">{{ message.role === 'user' ? '你' : 'LifeMind' }}</p>
+        <span class="avatar" :title="message.role === 'user' ? '你' : 'LifeMind'">
+          <img v-if="message.role === 'assistant'" :src="brandLogo" alt="LifeMind" />
+          <template v-else>{{ userInitial }}</template>
+        </span>
         <div class="body">
           <template v-if="message.content">{{ message.content }}</template>
           <span v-else-if="message.streaming" class="thinking">正在想办法…</span>
@@ -117,14 +145,39 @@ function autoGrow(event: Event) {
     </div>
 
     <form class="composer" @submit.prevent="submit">
-      <button
-        v-if="state.historyHasMore"
-        class="btn btn-text older"
-        type="button"
-        @click="loadOlder"
-      >
-        更早的消息
-      </button>
+      <div class="composer-top">
+        <button
+          v-if="state.historyHasMore"
+          class="btn btn-text older"
+          type="button"
+          @click="loadOlder"
+        >
+          更早的消息
+        </button>
+        <span v-else></span>
+
+        <!-- 清空记录放在对话区：它是针对「这一条对话」的动作，跟会话栏的删除/归档不是一回事 -->
+        <div v-if="state.sessionId" class="clear-wrap">
+          <template v-if="confirmingClear">
+            <span class="ask">清空这个会话的全部记录？不可恢复</span>
+            <button class="btn btn-text danger" type="button" :disabled="clearing" @click="doClear">
+              {{ clearing ? '清空中…' : '确认清空' }}
+            </button>
+            <button class="btn btn-text" type="button" :disabled="clearing" @click="confirmingClear = false">
+              取消
+            </button>
+          </template>
+          <button
+            v-else
+            class="btn btn-text"
+            type="button"
+            :disabled="!state.messages.length || state.streaming"
+            @click="confirmingClear = true"
+          >
+            清空记录
+          </button>
+        </div>
+      </div>
 
       <div class="input-row">
         <textarea
@@ -156,31 +209,44 @@ function autoGrow(event: Event) {
   min-width: 0;
 }
 
+/* 内容列居中：宽屏不散开，窄屏至少留 24px。左右用同一个表达式，滚动条出现时也不歪 */
 .stream {
   flex: 1;
   overflow-y: auto;
-  padding: var(--s5) var(--s5) var(--s3);
+  padding: var(--s7) max(var(--s5), calc((100% - 760px) / 2)) var(--s4);
 }
 
 .intro {
-  max-width: 34em;
   padding-top: var(--s5);
 }
 
 .intro h1 {
-  font-size: var(--t-lg);
-  letter-spacing: -0.01em;
+  font-size: 28px;
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: -0.02em;
+}
+
+.intro h1::before {
+  content: '';
+  display: block;
+  width: 28px;
+  height: 2px;
+  margin-bottom: var(--s5);
+  background: var(--signal);
 }
 
 .intro-lede {
-  margin-top: var(--s3);
+  max-width: 40em;
+  margin-top: var(--s4);
   color: var(--ink-soft);
-  font-size: var(--t-sm);
-  line-height: 1.75;
+  font-size: var(--t-md);
+  line-height: 1.8;
 }
 
 .examples {
-  margin-top: var(--s5);
+  max-width: 40em;
+  margin-top: var(--s7);
   border-top: 1px solid var(--rule);
 }
 
@@ -192,34 +258,65 @@ function autoGrow(event: Event) {
   display: block;
   width: 100%;
   text-align: left;
-  padding: 10px 0;
+  padding: 14px 0;
   font-size: var(--t-sm);
   color: var(--muted);
-  transition: color var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease), padding-left var(--dur) var(--ease);
 }
 
 .examples button:hover {
   color: var(--signal);
+  padding-left: var(--s2);
 }
 
+/* 头像在正文侧边，不在上方——消息谁说的靠位置和头像就够，不必再占一行标签 */
 .turn {
-  max-width: 40em;
-  padding: var(--s3) 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: var(--s4) 0;
 }
 
-.who {
+/* AI 头像在左、用户头像在右；正文跟随各自一侧 */
+.turn[data-role='user'] {
+  flex-direction: row-reverse;
+}
+
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  margin-top: 3px;
+  border-radius: 50%;
   font-size: var(--t-xs);
-  color: var(--muted-soft);
-  margin-bottom: 2px;
+  font-weight: 500;
+  line-height: 1;
 }
 
-.turn[data-role='assistant'] .who {
-  color: var(--signal);
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.turn[data-role='assistant'] .avatar {
+  background: var(--signal-soft);
+}
+
+.turn[data-role='user'] .avatar {
+  background: var(--signal);
+  color: var(--on-signal);
 }
 
 .body {
-  font-size: var(--t-md);
-  line-height: 1.7;
+  /* 限制宽度，长消息不铺满整栏；块靠右，但内部文字仍左对齐 */
+  max-width: min(88%, 620px);
+  font-size: 16px;
+  line-height: 1.75;
+  color: var(--ink);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -287,12 +384,53 @@ function autoGrow(event: Event) {
 }
 
 .composer {
-  padding: var(--s2) var(--s5) var(--s4);
+  padding: var(--s4) max(var(--s5), calc((100% - 760px) / 2)) var(--s5);
   border-top: 1px solid var(--rule);
+  background: var(--paper);
+}
+
+.composer-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  min-height: 22px;
+  margin-bottom: var(--s2);
 }
 
 .older {
-  margin-bottom: var(--s2);
+  padding: 0;
+}
+
+.clear-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin-left: auto;
+}
+
+.clear-wrap .btn-text {
+  padding: 0;
+  font-size: var(--t-xs);
+  color: var(--muted);
+}
+
+.clear-wrap .btn-text:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.clear-wrap .btn-text:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.clear-wrap .ask {
+  font-size: var(--t-xs);
+  color: var(--alert);
+}
+
+.clear-wrap .danger:hover:not(:disabled) {
+  color: var(--alert);
 }
 
 .input-row {
@@ -301,23 +439,34 @@ function autoGrow(event: Event) {
   gap: var(--s2);
 }
 
+/* 页脚要圆润：输入框大圆角，两个动作按钮胶囊 */
+.input-row .btn-primary,
+.input-row .btn-quiet {
+  border-radius: var(--r-pill);
+}
+
+.input-row .btn-primary {
+  padding: 12px 22px;
+}
+
 .box {
   flex: 1;
   min-width: 0;
   resize: none;
-  padding: 9px 12px;
+  padding: 14px 18px;
   border: 1px solid var(--rule);
-  border-radius: var(--r-md);
+  border-radius: var(--r-lg);
   background: var(--paper-raised);
-  font-size: var(--t-sm);
+  font-size: var(--t-md);
   line-height: 1.6;
   max-height: 160px;
-  transition: border-color var(--dur) var(--ease);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 
 .box:focus {
   outline: none;
   border-color: var(--signal);
+  box-shadow: inset 0 0 0 1px var(--signal-line);
 }
 
 .box:disabled {
@@ -327,6 +476,22 @@ function autoGrow(event: Event) {
 
 .stop {
   flex: 0 0 auto;
-  padding: 9px 16px;
+  padding: 12px 18px;
+}
+
+/* 窄屏 placeholder 会折成两行，给输入框留够高度，别把提示文字裁掉 */
+@media (max-width: 720px) {
+  .stream {
+    padding-top: var(--s6);
+  }
+
+  .box {
+    min-height: 64px;
+  }
+
+  .input-row .btn-primary {
+    align-self: stretch;
+    padding: 12px 14px;
+  }
 }
 </style>

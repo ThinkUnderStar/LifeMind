@@ -14,15 +14,20 @@
   --paper: #fbfbfa;
   --paper-raised: #ffffff;
   --paper-sunken: #f4f4f1;
+  /* 浏览器式标签栏底色：比 sunken 深一档，活动页的纸白才「抬」得起来（不用于登录页） */
+  --chrome: #e9eae6;
 
   /* 线。全站唯一的容器语言：1px 细线，没有阴影、没有卡片边框 */
   --rule: #e4e4df;
   --rule-strong: #cfcfc8;
 
-  /* 主色。墨绿，克制 */
+  /* 主色。默认墨绿；data-theme 会整体覆盖下面五个变量，:root 这一组是兜底 */
   --signal: #2f5d50;
   --signal-soft: #eef2f0;
   --signal-line: #c3d2cc;
+  --signal-deep: #274d42;
+  /* 主色按钮上的文字色：浅色主题白字，深色主题深字 */
+  --on-signal: #fff;
   /* 脊柱竖线专用：比 --signal-line 深一档，否则 1px 在纸底上几乎看不见 */
   --spine: #a9c0b7;
 
@@ -58,6 +63,9 @@
 
   --r-sm: 2px;
   --r-md: 6px;
+  /* 圆润档：长条容器与胶囊按钮用。登录页沿用 sm/md，不受这组影响 */
+  --r-lg: 14px;
+  --r-pill: 999px;
 
   /* 三栏骨架。面板宽度是「一句话说清一条日程」所需的宽度，不是随手定的 */
   --w-rail: 236px;
@@ -69,6 +77,37 @@
 
   --z-pop: 40;
   --z-toast: 60;
+}
+
+/*
+ * 深色主题：整组纸墨线都换，不只是强调色。
+ * 主色在深色下用浅灰白而不是饱和色——黑界面里加彩色会显得跳，
+ * 强调靠明度差就够了。警示色换成亮一档的陶土色，保住在暗底上的可读性。
+ * data-theme 只会是 light / dark 两个值；「跟随系统」由 core/theme.ts 解析成其一。
+ */
+:root[data-theme='dark'] {
+  --ink: #e9eae6;
+  --ink-soft: #c2c4bd;
+  --paper: #141517;
+  --paper-raised: #1c1e20;
+  --paper-sunken: #242629;
+  --chrome: #1e2022;
+
+  --rule: #34373a;
+  --rule-strong: #4b4f53;
+
+  --signal: #d8dad5;
+  --signal-soft: #26292b;
+  --signal-line: #4d5154;
+  --signal-deep: #b9bbb6;
+  --on-signal: #17181a;
+  --spine: #5a5e61;
+
+  --alert: #e08a72;
+  --alert-soft: #392522;
+
+  --muted: #8d908a;
+  --muted-soft: #666a65;
 }
 
 /* 尊重系统级「减少动态效果」：把过渡压到 1ms 而不是删掉，避免布局跳变 */

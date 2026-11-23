@@ -16,6 +16,7 @@ import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByEmail
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByOriginalRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByPhoneRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeUsernameRequest;
+import thinkunderstar.lifemind.lifemindaccount.dto.response.UserProfileResponse;
 import thinkunderstar.lifemind.lifemindaccount.service.core.PluginService;
 import thinkunderstar.lifemind.lifemindaccount.service.core.UserInfoService;
 
@@ -32,7 +33,11 @@ public class UserInfoController {
     }
 
     /*
-     * 本控制器下都是「当前登录用户改自己的资料」，共九个接口，都不接受前端传用户 ID：
+     * 本控制器下都是「当前登录用户改自己的资料」，共十个接口，都不接受前端传用户 ID：
+     *
+     * 〇、读取自己的资料：
+     *   GET  /user/profile             返回账户名、昵称、邮箱、手机号、头像、上次改账户名的时间
+     *   改之前先能读到当前值，否则前端无从显示，也无从判断账户名还能不能改。
      *
      * 一、绑定 / 换绑手机号、邮箱：
      *   POST /user/bind/phone          绑定手机号：账号还没有手机号时用
@@ -71,6 +76,18 @@ public class UserInfoController {
      * 修改密码成功后会把用户的令牌版本号 +1，而版本号是 JWT 负载的一部分，
      * 网关比对不上就会拒绝，于是此前签发的所有令牌（含本次请求用的那一个）立即失效，需要重新登录。
      */
+
+    /**
+     * 读取当前登录用户自己的资料。
+     *
+     * <p>本控制器其余接口都是「改」，读这一环此前缺失：前端不知道当前昵称、绑没绑手机、
+     * 头像是什么，个人主页没法显示真实资料。这里补上，同样不接受用户 ID 入参，
+     * 只返回网关注入的身份对应的那一行。
+     */
+    @GetMapping("/profile")
+    public Result<UserProfileResponse> getProfile() {
+        return userInfoService.getProfile();
+    }
 
     /**
      * 绑定手机号：账号还没绑过手机号时用，已绑定会提示改用 {@code /user/rebind/phone}。

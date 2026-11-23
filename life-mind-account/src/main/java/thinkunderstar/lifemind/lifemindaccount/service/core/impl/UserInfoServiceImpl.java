@@ -24,6 +24,7 @@ import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByEmail
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByOriginalRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangePasswordByPhoneRequest;
 import thinkunderstar.lifemind.lifemindaccount.dto.request.ChangeUsernameRequest;
+import thinkunderstar.lifemind.lifemindaccount.dto.response.UserProfileResponse;
 import thinkunderstar.lifemind.lifemindaccount.entity.Permission;
 import thinkunderstar.lifemind.lifemindaccount.entity.User;
 import thinkunderstar.lifemind.lifemindaccount.entity.UserIdentity;
@@ -268,6 +269,23 @@ public class UserInfoServiceImpl implements UserInfoService {
         }
         return bindContact(ContactTarget.EMAIL, BindMode.REBIND,
                 bindEmailRequest.getEmail(), bindEmailRequest.getCode(), request);
+    }
+
+    @Override
+    public Result<UserProfileResponse> getProfile() {
+        // 只读自己：身份来自网关注入的请求头，前端传不了别人的 ID
+        Long userId = currentUserId();
+        User user = loadEnabledUser(userId);
+
+        UserProfileResponse profile = new UserProfileResponse(
+                user.getUsername(),
+                user.getNickname(),
+                user.getEmail(),
+                user.getPhone(),
+                user.getAvatar(),
+                user.getUsernameChangeTime()
+        );
+        return Result.success(profile);
     }
 
     @Override

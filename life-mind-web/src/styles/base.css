@@ -125,11 +125,11 @@ a {
 
 .btn-primary {
   background: var(--signal);
-  color: #fff;
+  color: var(--on-signal);
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: #274d42;
+  background: var(--signal-deep);
 }
 
 .btn-quiet {

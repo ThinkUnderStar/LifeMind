@@ -118,3 +118,16 @@ export async function send<T>(
 export const post = <T>(path: string, body?: unknown) => send<T>('POST', path, body)
 export const put = <T>(path: string, body?: unknown) => send<T>('PUT', path, body)
 export const del = <T>(path: string) => send<T>('DELETE', path)
+
+/**
+ * multipart 上传。不能复用 send()：那里固定 Content-Type: application/json，
+ * 手动传 boundary 只会传错。这里交给浏览器自己生成 multipart 边界。
+ */
+export async function upload<T>(path: string, form: FormData): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: { ...authHeaders() },
+    body: form,
+  })
+  return parse<T>(res)
+}
