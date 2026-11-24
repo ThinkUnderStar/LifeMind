@@ -52,3 +52,50 @@ export function changeAvatar(file: File): Promise<void> {
   form.append('avatar', file)
   return upload<void>(`${SERVICE.account}/user/avatar`, form)
 }
+
+/**
+ * 绑定与换绑。
+ *
+ * 后端把「没绑过」和「已绑过」分成两个端点而不是一个幂等接口：
+ * 已绑过的账号调 bind 会被拒（要先证明老号码），反之亦然。
+ * 前端按 profile 里 phone/email 是否为空选端点，不做「猜」。
+ *
+ * 验证码来自 auth 的发送接口（同一个 Redis 键），所以这里只有提交，没有发送。
+ */
+export function bindPhone(phone: string, code: string): Promise<void> {
+  return post<void>(`${SERVICE.account}/user/bind/phone`, { phone, code })
+}
+
+export function rebindPhone(phone: string, code: string): Promise<void> {
+  return post<void>(`${SERVICE.account}/user/rebind/phone`, { phone, code })
+}
+
+export function bindEmail(email: string, code: string): Promise<void> {
+  return post<void>(`${SERVICE.account}/user/bind/email`, { email, code })
+}
+
+export function rebindEmail(email: string, code: string): Promise<void> {
+  return post<void>(`${SERVICE.account}/user/rebind/email`, { email, code })
+}
+
+/**
+ * 用验证码改密。验证码发到「已绑定」的手机号 / 邮箱，
+ * 所以这两个入口在未绑定时应当直接禁用，而不是让用户点了才报错。
+ *
+ * 与用原密码改密一样：成功后令牌版本 +1，必须重新登录。
+ */
+export function changePasswordByPhone(payload: {
+  code: string
+  newPassword: string
+  confirmPassword: string
+}): Promise<void> {
+  return post<void>(`${SERVICE.account}/user/password/phone`, payload)
+}
+
+export function changePasswordByEmail(payload: {
+  code: string
+  newPassword: string
+  confirmPassword: string
+}): Promise<void> {
+  return post<void>(`${SERVICE.account}/user/password/email`, payload)
+}

@@ -216,6 +216,49 @@ public class FeedbackServiceImpl implements FeedbackService {
     }
 
     @Override
+    public Result<IPage<FeedbackResponse>> getMyFeedback(FeedbackQueryRequest queryRequest,
+                                                         HttpServletRequest request) {
+
+        // ========== 1. 参数校验 ==========
+        if (queryRequest == null) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "请求参数不能为空");
+        }
+
+        // ========== 2. 取当前登录用户 ==========
+        // 只查自己的：userId 是唯一的所有权依据，不接受任何前端传参
+        Long userId = resolveUserId(request);
+
+        // ========== 3. 限流 ==========
+        // 与管理员查询共用一个桶：都是「翻反馈列表」，没必要分两套配额
+        if (!rateLimiter.tryAcquireByUser(userId, FEEDBACK_QUERY_CAPACITY, FEEDBACK_QUERY_RATE)) {
+            throw new BusinessException(ResultCode.TOO_MANY_REQUESTS, "操作过于频繁，请稍后再试");
+        }
+
+        // ========== 4. 组装查询条件并分页 ==========
+        // 用户侧接口，pageSize 加个上限：前端正常只用 10~20，放开等于给了批量拉取的入口
+        long pageNum = queryRequest.getPageNum() == null || queryRequest.getPageNum() < 1
+                ? 1 : queryRequest.getPageNum();
+        long pageSize = queryRequest.getPageSize() == null || queryRequest.getPageSize() < 1
+                ? 10 : Math.min(queryRequest.getPageSize(), 50);
+
+        LambdaQueryWrapper<Feedback> wrapper = new LambdaQueryWrapper<Feedback>()
+                .eq(Feedback::getUserId, userId)
+                .eq(queryRequest.getType() != null, Feedback::getType, queryRequest.getType())
+                .eq(queryRequest.getStatus() != null, Feedback::getStatus, queryRequest.getStatus())
+                .orderByDesc(Feedback::getCreateTime);
+        Page<Feedback> page = feedbackWrapperService.page(new Page<>(pageNum, pageSize), wrapper);
+
+        // ========== 5. 实体转 VO ==========
+        IPage<FeedbackResponse> resultPage = page.convert(feedback -> {
+            FeedbackResponse vo = BeanUtil.copyProperties(feedback, FeedbackResponse.class);
+            // 是哪位管理员回复的与用户无关，不把内部用户 ID 吐到用户侧
+            vo.setReplyUserId(null);
+            return vo;
+        });
+        return Result.success(resultPage);
+    }
+
+    @Override
     public Result<IPage<FeedbackResponse>> getFeedbackPage(FeedbackQueryRequest queryRequest,
                                                            HttpServletRequest request) {
 

@@ -10,16 +10,28 @@
  * 字宽不一致会让 09:00 和 15:00 左右错开，扫视时很难对齐。
  */
 import { computed, ref, watch } from 'vue'
-import { pageItems, overview, completeItem, deleteItem } from '../../api/schedule'
-import type { Item, Overview } from '../../core/types'
-import { dayText, offsetText, parseDateTime, timeText, toDateString } from '../../core/date'
+import {
+  batchGetItems,
+  completeItem,
+  dailyStats,
+  deleteItem,
+  overview,
+  pageItems,
+  upcomingReminders,
+} from '../../api/schedule'
+import type { DailyStat, Item, Overview, Reminder } from '../../core/types'
+import { addDays, dayText, offsetText, parseDateTime, timeText, toDateString } from '../../core/date'
 import { toast } from '../../core/store'
 
 const props = defineProps<{ date: string; epoch: number }>()
+const emit = defineEmits<{ (e: 'edit', id: number): void }>()
 
 const schedules = ref<Item[]>([])
 const todos = ref<Item[]>([])
 const summary = ref<Overview | null>(null)
+const days = ref<DailyStat[]>([])
+/** 提醒只带 itemId，标题要靠批量取一次；没取到标题的按「某条提醒」显示，不硬编一个空字符串 */
+const soon = ref<Array<Reminder & { title: string }>>([])
 const loading = ref(false)
 
 const today = toDateString(new Date())
@@ -65,16 +77,34 @@ function subOf(item: Item): string {
 async function load() {
   loading.value = true
   try {
-    const [day, pending, stats] = await Promise.all([
+    const [day, pending, stats, upcoming, daily] = await Promise.all([
       pageItems({ date: props.date, itemType: 'schedule', pageSize: 100 }),
       // 待办不按日期取：它们没有「必须安排在几点」，只按截止时间挂在今天并不合理，
       // 「今天」这一屏要看到的是「今天还能做掉哪些」
       pageItems({ itemType: 'todo', status: 0, pageSize: 100 }),
       isToday.value ? overview() : Promise.resolve(null),
+      // 提醒与统计只对「今天」有意义：翻到别的日期时看的是那一天的历史，不是未来七天
+      isToday.value ? upcomingReminders(7) : Promise.resolve([]),
+      isToday.value
+        ? dailyStats(toDateString(addDays(new Date(), -6)), toDateString(new Date()))
+        : Promise.resolve([]),
     ])
     schedules.value = day.records
     todos.value = pending.records
     summary.value = stats
+    days.value = daily
+
+    // 提醒只有 itemId，标题得另取一次；一条都没取到标题也要能把时间显示出来
+    const ids = [...new Set(upcoming.map((r) => r.itemId))]
+    const titles = new Map<number, string>()
+    if (ids.length) {
+      try {
+        for (const item of await batchGetItems(ids)) titles.set(item.id, item.title)
+      } catch {
+        // 标题取失败不影响提醒本身，退化成「某条日程」
+      }
+    }
+    soon.value = upcoming.map((r) => ({ ...r, title: titles.get(r.itemId) ?? '某条日程' }))
   } catch (error) {
     toast(error instanceof Error ? error.message : '日程没取到', 'error')
   } finally {
@@ -100,6 +130,25 @@ async function remove(item: Item) {
   }
 }
 
+/** 近 7 天：柱高 = 当天待办完成率。没有待办的那天留一条基线，表示「那天无事」，不是「没取到」 */
+const bars = computed(() =>
+  days.value.map((d) => ({
+    key: d.date,
+    rate: d.todoCount ? d.todoDoneCount / d.todoCount : 0,
+    title: `${d.date.slice(5)}：日程 ${d.scheduleCount} 条，待办 ${d.todoDoneCount}/${d.todoCount}`,
+    bare: d.todoCount === 0,
+  })),
+)
+
+const weekDone = computed(() => days.value.reduce((sum, d) => sum + d.todoDoneCount, 0))
+
+function whenText(raw: string): string {
+  const date = parseDateTime(raw)
+  if (!date) return raw
+  // 工作区很窄，「11月25日 周二」会把标题挤成一行两三个字；这里只留「11/25 09:00」
+  return `${date.getMonth() + 1}/${date.getDate()} ${timeText(date)}`
+}
+
 watch(() => [props.date, props.epoch], load, { immediate: true })
 </script>
 
@@ -113,6 +162,13 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
         <!-- 后端给的就是 0~100 的百分数，不是 0~1，别再乘 100 -->
         <template v-if="summary"> · 本周完成 {{ Math.round(summary.weekCompletionRate ?? 0) }}%</template>
       </p>
+
+      <!-- 近 7 天完成率：七个细柱，不画坐标轴也不标数字，扫一眼就能看出这周是松是紧 -->
+      <div v-if="isToday && bars.length" class="week" :title="`近 7 天完成 ${weekDone} 条待办`">
+        <span v-for="b in bars" :key="b.key" class="bar" :data-bare="b.bare" :title="b.title">
+          <i :style="{ height: `${Math.max(b.rate * 100, 6)}%` }"></i>
+        </span>
+      </div>
     </header>
 
     <p v-if="loading" class="empty">正在取这一天的安排…</p>
@@ -134,10 +190,10 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
         <li v-for="item in timed" :key="item.id" class="slot">
           <span class="clock mono">{{ clockOf(item) }}</span>
           <span class="dot" aria-hidden="true"></span>
-          <div class="content">
-            <p class="title">{{ item.title }}</p>
-            <p v-if="subOf(item)" class="sub">{{ subOf(item) }}</p>
-          </div>
+          <button class="content open" type="button" @click="emit('edit', item.id)">
+            <span class="title">{{ item.title }}</span>
+            <span v-if="subOf(item)" class="sub">{{ subOf(item) }}</span>
+          </button>
           <button class="kill" type="button" title="删除" @click="remove(item)">×</button>
         </li>
       </ol>
@@ -150,11 +206,25 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
         <ul>
           <li v-for="todo in todos" :key="todo.id" class="todo" :data-overdue="isOverdue(todo)">
             <button class="check" type="button" :aria-label="`完成 ${todo.title}`" @click="toggle(todo)" />
-            <div class="content">
-              <p class="title">{{ todo.title }}</p>
-              <p v-if="todo.dueTime" class="sub">截止 {{ todo.dueTime.slice(5, 16) }}</p>
-            </div>
+            <button class="content open" type="button" @click="emit('edit', todo.id)">
+              <span class="title">{{ todo.title }}</span>
+              <span v-if="todo.dueTime" class="sub">截止 {{ todo.dueTime.slice(5, 16) }}</span>
+            </button>
             <button class="kill" type="button" title="删除" @click="remove(todo)">×</button>
+          </li>
+        </ul>
+      </section>
+
+      <!-- 提醒不是「今天的日程」，是「快到了的事」：放在最后，不打断今天的安排 -->
+      <section v-if="soon.length" class="upcoming">
+        <h3 class="sec">接下来 7 天</h3>
+        <ul>
+          <li v-for="r in soon.slice(0, 6)" :key="r.id" class="next">
+            <span class="when mono">{{ whenText(r.remindTime) }}</span>
+            <button class="content open" type="button" @click="emit('edit', r.itemId)">
+              <span class="title">{{ r.title }}</span>
+            </button>
+            <span class="offset">{{ offsetText(r.offsetMinutes) }}</span>
           </li>
         </ul>
       </section>
@@ -202,6 +272,50 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
   border: 1px solid var(--rule);
   border-radius: var(--r-sm);
   padding: 0 4px;
+}
+
+/* 近 7 天完成率。柱高是「当天待办完成了多少」，没有待办的日子只剩一条基线 */
+.week {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 18px;
+  margin-top: 9px;
+}
+
+.bar {
+  display: flex;
+  align-items: flex-end;
+  width: 5px;
+  height: 100%;
+}
+
+.bar i {
+  display: block;
+  width: 100%;
+  min-height: 2px;
+  background: var(--signal);
+  opacity: 0.45;
+  border-radius: 1px;
+}
+
+.bar[data-bare='true'] i {
+  background: var(--rule);
+  opacity: 1;
+}
+
+/* 行内容本身是按钮：点开就能编辑，不必先选中再找「编辑」 */
+button.open {
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.open:hover .title {
+  color: var(--ink-soft);
 }
 
 /* 竖线画在容器上而不是每个 li 上：li 之间不会被行高撑出断口 */
@@ -257,6 +371,7 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
 }
 
 .title {
+  display: block;
   font-size: var(--t-sm);
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -271,6 +386,34 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.upcoming {
+  margin-top: var(--s5);
+}
+
+.next {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.next:last-child {
+  border-bottom: none;
+}
+
+.next .when {
+  font-size: var(--t-xs);
+  color: var(--muted);
+  padding-top: 1px;
+}
+
+.next .offset {
+  font-size: var(--t-xs);
+  color: var(--muted-soft);
 }
 
 /* 删除只在悬停/聚焦时出现：常驻的 × 会让每一行都像一个待处理的错误 */
@@ -306,8 +449,9 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
   border-bottom: 1px solid var(--rule);
 }
 
+/* 逾期归土黄（与日历同一口径），陶土红只留给删除这类不可逆操作 */
 .overdue {
-  color: var(--alert);
+  color: var(--warn-strong);
 }
 
 .todo {
@@ -336,6 +480,6 @@ watch(() => [props.date, props.epoch], load, { immediate: true })
 }
 
 .todo[data-overdue='true'] .sub {
-  color: var(--alert);
+  color: var(--warn-strong);
 }
 </style>

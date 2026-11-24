@@ -6,19 +6,21 @@
  * 「＋」新建空白页，再去开别的插件，同一个插件也能开多张页。
  * 通知与个人主页也是这里的一页：和插件页共用标签，中间对话不被顶掉。
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import {
   addWorkspacePage,
   closeWorkspacePage,
   openPluginHere,
   selectWorkspacePage,
   state,
+  togglePlugin,
   toggleWorkspace,
 } from '../core/store'
 import type { WorkspacePage } from '../core/types'
 import { PLUGIN_MANIFESTS, resolvePlugin } from '../core/plugin-registry'
 import NoticePage from './NoticePage.vue'
 import ProfilePage from './ProfilePage.vue'
+import FeedbackPage from './FeedbackPage.vue'
 
 const current = computed(() => state.workspacePages.find((p) => p.key === state.workspacePage))
 const manifest = computed(() =>
@@ -31,10 +33,12 @@ const BLANK_ICON = 'M4 4h5v5H4zM11 4h5v5h-5zM4 11h5v5H4zM11 11h5v5h-5z'
 const NOTICE_ICON =
   'M10 2.5a4.5 4.5 0 0 0-4.5 4.5v3L4 12.5h12l-1.5-2.5V7A4.5 4.5 0 0 0 10 2.5ZM8.2 15a2 2 0 0 0 3.6 0'
 const PROFILE_ICON = 'M10 4.6a2.9 2.9 0 1 1 0 5.8 2.9 2.9 0 0 1 0-5.8ZM4.6 16.4c0-2.6 2.4-4.2 5.4-4.2s5.4 1.6 5.4 4.2'
+const FEEDBACK_ICON = 'M10 3.4c3.5 0 6.3 2.3 6.3 5.2S13.5 13.8 10 13.8c-.7 0-1.4-.1-2-.3l-3.4 2 .9-2.9c-1.1-1-1.8-2.4-1.8-4 0-2.9 2.8-5.2 6.3-5.2Z'
 
 function iconOf(page: WorkspacePage): string {
   if (page.kind === 'notice') return NOTICE_ICON
   if (page.kind === 'profile') return PROFILE_ICON
+  if (page.kind === 'feedback') return FEEDBACK_ICON
   return page.pluginKey ? (resolvePlugin(page.pluginKey)?.icon ?? BLANK_ICON) : BLANK_ICON
 }
 
@@ -57,6 +61,25 @@ const soon = computed(() =>
     .filter((p) => !PLUGIN_MANIFESTS.some((m) => m.key === p.pluginKey))
     .map((p) => p.name),
 )
+
+/**
+ * 启用 / 停用。
+ *
+ * 停用不删数据、也不关已打开的页——它只是让 agent 那一侧不再把这些工具挂给模型，
+ * 所以界面上允许「边看边关」，不做确认弹窗。
+ * busy 是防连点：开关是一个写操作，双击会发出两次相反的请求，谁后到就由谁定状态，很容易和界面显示对不上。
+ */
+const busy = ref<string | null>(null)
+
+async function flip(key: string, enabled: boolean) {
+  if (busy.value) return
+  busy.value = key
+  try {
+    await togglePlugin(key, enabled)
+  } finally {
+    busy.value = null
+  }
+}
 
 </script>
 
@@ -105,6 +128,10 @@ const soon = computed(() =>
         <ProfilePage />
       </div>
 
+      <div v-else-if="current?.kind === 'feedback'" class="page-host">
+        <FeedbackPage />
+      </div>
+
       <div v-else class="blank">
         <div class="intro">
           <h2>工作区</h2>
@@ -112,24 +139,34 @@ const soon = computed(() =>
         </div>
 
         <div class="cards">
-          <button
-            v-for="item in entries"
-            :key="item.key"
-            class="card"
-            type="button"
-            :disabled="!item.enabled"
-            :title="item.enabled ? `打开${item.name}` : '这个插件当前未启用'"
-            @click="openPluginHere(item.key)"
-          >
-            <span class="card-icon">
-              <svg viewBox="0 0 20 20" aria-hidden="true"><path :d="item.icon" /></svg>
-            </span>
-            <span class="card-text">
-              <strong>{{ item.name }}</strong>
-              <span class="desc">{{ item.desc }}</span>
-            </span>
-            <span class="state">{{ item.enabled ? '打开 →' : '未启用' }}</span>
-          </button>
+          <div v-for="item in entries" :key="item.key" class="card" :data-off="!item.enabled">
+            <button
+              class="open"
+              type="button"
+              :disabled="!item.enabled"
+              :title="item.enabled ? `打开${item.name}` : '先启用，才能在 agent 里用它'"
+              @click="openPluginHere(item.key)"
+            >
+              <span class="card-icon">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path :d="item.icon" /></svg>
+              </span>
+              <span class="card-text">
+                <strong>{{ item.name }}</strong>
+                <span class="desc">{{ item.desc }}</span>
+              </span>
+              <span class="state">{{ item.enabled ? '打开 →' : '未启用' }}</span>
+            </button>
+
+            <button
+              class="flip"
+              type="button"
+              :disabled="busy === item.key"
+              :aria-pressed="item.enabled"
+              @click="flip(item.key, !item.enabled)"
+            >
+              {{ busy === item.key ? '…' : item.enabled ? '停用' : '启用' }}
+            </button>
+          </div>
         </div>
 
         <p v-if="soon.length" class="soon">即将开放：{{ soon.join('、') }}</p>
@@ -320,7 +357,7 @@ const soon = computed(() =>
   color: var(--muted);
 }
 
-/* 插件入口是横着的长条，不是方块：图标 | 名称+说明 | 打开 */
+/* 插件入口是横着的长条，不是方块：图标 | 名称+说明 | 打开，右侧另挂启停开关 */
 .cards {
   display: grid;
   gap: var(--s2);
@@ -328,26 +365,68 @@ const soon = computed(() =>
 }
 
 .card {
-  display: grid;
-  grid-template-columns: 38px minmax(0, 1fr) auto;
+  display: flex;
   align-items: center;
-  gap: 12px;
-  min-height: 72px;
-  padding: 12px 14px;
+  gap: 2px;
+  padding-right: 10px;
   border: 1px solid var(--rule);
   border-radius: var(--r-lg);
-  text-align: left;
-  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease),
+    opacity var(--dur) var(--ease);
 }
 
-.card:hover:not(:disabled) {
+.card:hover {
   border-color: var(--signal-line);
   background: var(--signal-soft);
 }
 
-.card:disabled {
-  opacity: 0.5;
+/* 未启用整条淡下去，但仍可读：它只是"现在不挂给模型"，不是坏了 */
+.card[data-off='true'] {
+  opacity: 0.62;
+}
+
+.card[data-off='true']:hover {
+  opacity: 1;
+}
+
+.open {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  padding: 12px 6px 12px 14px;
+  text-align: left;
+}
+
+.open:disabled {
   cursor: default;
+}
+
+.flip {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  background: var(--paper);
+}
+
+.flip:hover {
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+/* 已启用：开关是低调的"停用"；未启用：它是这张卡唯一该做的事，给信号色 */
+.flip[aria-pressed='false'] {
+  color: var(--signal);
+  border-color: var(--signal-line);
+}
+
+.flip:disabled {
+  opacity: 0.5;
 }
 
 .card-icon {
@@ -396,6 +475,10 @@ const soon = computed(() =>
   flex: 0 0 auto;
   font-size: var(--t-xs);
   color: var(--signal);
+}
+
+.card[data-off='true'] .state {
+  color: var(--muted);
 }
 
 .soon {

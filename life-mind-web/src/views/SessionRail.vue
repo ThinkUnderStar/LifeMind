@@ -3,8 +3,9 @@
  * 会话栏。按后端返回的顺序（update_time 倒序）直接渲染，前端不再排序——
  * 两处排序规则各写一遍，早晚会不一致。
  *
- * 当前会话用左侧 2px 竖条标记，不用背景色块：整栏都是浅底，
- * 色块会把它切成「一张卡片」，和全站「不用卡片」的取向冲突。
+ * 当前会话用「深一档的行底 + 左侧 3px 竖条 + 标题提到墨色」三重标记。
+ * 行底必须比未选行肉眼可辨：原来借 --signal-soft 只有 2% 亮度差，
+ * 等于只靠竖条区分，扫一眼分不出当前是哪条。
  */
 import { computed, ref } from 'vue'
 import { loadSessions, newSession, openSession, state, switchSessionView, toast } from '../core/store'
@@ -14,6 +15,41 @@ import { parseDateTime, relativeDayText } from '../core/date'
 const emit = defineEmits<{ (e: 'open-profile'): void }>()
 
 const busy = ref(false)
+
+/**
+ * 改名。用双击标题而不是再加一个按钮：会话行只有 34px 高，
+ * 悬停时要同时放「归档」「删除」，再挤一个进去三个都会变得难点中。
+ * 双击是列表里改名的通用手势，行的 title 上也写了这一句。
+ */
+const renaming = ref<{ id: number; text: string } | null>(null)
+const renamingBusy = ref(false)
+
+function startRename(item: { id: number; title: string }) {
+  renaming.value = { id: item.id, text: item.title || '新对话' }
+}
+
+function cancelRename() {
+  renaming.value = null
+}
+
+async function commitRename() {
+  const target = renaming.value
+  if (!target || renamingBusy.value) return
+  const title = target.text.trim()
+  if (!title) return cancelRename()
+  if (title === state.sessions.find((s) => s.id === target.id)?.title) return cancelRename()
+
+  renamingBusy.value = true
+  try {
+    await sessionApi.renameSession(target.id, title)
+    renaming.value = null
+    await loadSessions(true)
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '改名失败', 'error')
+  } finally {
+    renamingBusy.value = false
+  }
+}
 
 const initial = computed(() => (state.account || '我').trim().charAt(0).toUpperCase())
 
@@ -116,11 +152,29 @@ function whenOf(raw: string | null): string {
     <ul v-else-if="state.sessions.length" class="list">
       <li v-for="item in state.sessions" :key="item.id">
         <div class="row" :data-active="state.sessionId === item.id">
-          <button class="open" type="button" @click="openSession(item.id)">
+          <form v-if="renaming?.id === item.id" class="rename" @submit.prevent="commitRename">
+            <input
+              v-model="renaming.text"
+              class="rename-field"
+              type="text"
+              maxlength="100"
+              autofocus
+              @keydown.esc="cancelRename"
+              @blur="commitRename"
+            />
+          </form>
+          <button
+            v-else
+            class="open"
+            type="button"
+            title="打开这个会话；双击标题可以改名"
+            @click="openSession(item.id)"
+            @dblclick="startRename(item)"
+          >
             <span class="text">{{ item.title || '新对话' }}</span>
             <span class="when">{{ whenOf(item.update_time) }}</span>
           </button>
-          <div class="ops">
+          <div v-if="renaming?.id !== item.id" class="ops">
             <button v-if="isArchivedView" type="button" title="恢复到会话列表" @click="restore(item.id)">恢复</button>
             <button v-else type="button" title="归档" @click="archive(item.id)">归档</button>
             <button type="button" title="删除" class="danger" @click="remove(item.id)">删除</button>
@@ -246,19 +300,24 @@ function whenOf(raw: string | null): string {
   50% { opacity: 0.45; }
 }
 
-/* 一条会话就是一枚圆角长条：标题与时间同处一行，整条压到 34px 左右 */
+/*
+ * 一条会话是一枚 34px 高的圆角长条，但**平时不落底色**：未选中就贴在纸底上，
+ * 只有鼠标悬停和选中才浮出色块。整栏五条都铺底色会变成五张卡片，视线没有落点，
+ * 反而看不出当前是哪条。
+ */
 .row {
   position: relative;
   display: flex;
   align-items: center;
   margin-bottom: var(--s1);
   border-radius: var(--r-lg);
-  background: var(--paper-sunken);
+  background: transparent;
   transition: background var(--dur) var(--ease);
 }
 
+/* 悬停给一档浅底，告诉人这一条可以点；比选中档浅，不与选中抢 */
 .row:hover {
-  background: var(--paper-raised);
+  background: var(--paper-sunken);
 }
 
 .row::before {
@@ -274,7 +333,7 @@ function whenOf(raw: string | null): string {
 
 .row[data-active='true'],
 .row[data-active='true']:hover {
-  background: var(--signal-soft);
+  background: var(--row-active);
 }
 
 .row[data-active='true']::before {
@@ -344,6 +403,23 @@ function whenOf(raw: string | null): string {
 
 .ops .danger:hover {
   color: var(--alert);
+}
+
+/* 改名输入框直接长在行里：高度与 .open 一致，改名时列表不跳 */
+.rename {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px 4px 13px;
+}
+
+.rename-field {
+  width: 100%;
+  padding: 3px 6px;
+  border: 1px solid var(--signal-line);
+  border-radius: var(--r-sm);
+  background: var(--paper);
+  font-size: var(--t-sm);
+  color: var(--ink);
 }
 
 /* 栏底账号：一行到底，只有头像和名字，不加箭头和提示字样 */

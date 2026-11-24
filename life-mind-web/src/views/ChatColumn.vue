@@ -8,13 +8,90 @@
  * 是这类界面最烦人的一处。
  */
 import { computed, nextTick, ref, watch } from 'vue'
-import { clearConversation, loadOlder, send, state, stop, toast } from '../core/store'
+import { clearConversation, loadOlder, rewrite, send, state, stop, toast } from '../core/store'
+import type { UiMessage } from '../core/store'
+import { listTasks } from '../api/chat'
+import type { AgentTask } from '../core/types'
 import ApprovalCard from '../components/ApprovalCard.vue'
 import brandLogo from '../assets/brand/lifemind-logo.png'
 
 const draft = ref('')
 const streamEl = ref<HTMLElement | null>(null)
 const stick = ref(true)
+
+/**
+ * 改写一条历史消息（时间回溯）。
+ *
+ * 只有 id 不为空的消息能改：id 来自后端，是回溯接口要的 message_id；
+ * 本次刚发出去、还没从后端读回来的消息在本地是临时键，改不了。
+ * 点了「改写」不直接提交，先把这条换成输入框——它会删掉这条之后的所有内容，值得再看一眼。
+ */
+const rewriting = ref<{ id: number; text: string } | null>(null)
+const rewritingBusy = ref(false)
+
+function startRewrite(message: UiMessage) {
+  if (state.streaming || message.id === null) return
+  rewriting.value = { id: message.id, text: message.content }
+}
+
+function cancelRewrite() {
+  rewriting.value = null
+}
+
+async function submitRewrite() {
+  const target = rewriting.value
+  if (!target || rewritingBusy.value) return
+  const text = target.text.trim()
+  if (!text) return toast('内容不能为空', 'error')
+  rewritingBusy.value = true
+  try {
+    await rewrite(target.id, text)
+    rewriting.value = null
+  } finally {
+    rewritingBusy.value = false
+  }
+}
+
+/**
+ * 当前会话的任务清单。任务的中间流水不进对话，但「它到底排了哪几步、走到哪了」
+ * 用户有权看到，所以放在输入框上方按需展开，不占正文。
+ */
+const tasks = ref<AgentTask[]>([])
+const showTasks = ref(false)
+
+const TASK_TEXT: Record<AgentTask['status'], string> = {
+  pending: '待执行',
+  running: '进行中',
+  done: '已结束',
+}
+
+async function loadTasks() {
+  if (!state.sessionId) {
+    tasks.value = []
+    return
+  }
+  try {
+    tasks.value = await listTasks(state.sessionId)
+  } catch {
+    // 任务清单是辅助信息，取不到就不显示，不打断对话
+    tasks.value = []
+  }
+}
+
+watch(
+  () => [state.sessionId, state.streaming] as const,
+  () => {
+    if (!state.streaming) void loadTasks()
+  },
+  { immediate: true },
+)
+
+// 换会话时把改名、改写这些临时态一起收起来
+watch(() => state.sessionId, () => {
+  rewriting.value = null
+  showTasks.value = false
+})
+
 
 /** AI 用品牌标，用户用账号首字母——和顶栏头像同一套口径 */
 const userInitial = computed(() => (state.account || '我').trim().charAt(0).toUpperCase())
@@ -127,9 +204,34 @@ function autoGrow(event: Event) {
           <template v-else>{{ userInitial }}</template>
         </span>
         <div class="body">
-          <template v-if="message.content">{{ message.content }}</template>
-          <span v-else-if="message.streaming" class="thinking">正在想办法…</span>
-          <span v-if="message.streaming && message.content" class="caret" aria-hidden="true"></span>
+          <!-- 改写态：这条消息换成输入框，旁边写清「之后的内容会被删掉」 -->
+          <template v-if="rewriting && rewriting.id === message.id">
+            <textarea v-model="rewriting.text" class="rewrite-box" rows="3"></textarea>
+            <div class="rewrite-acts">
+              <span class="warn">这条之后的内容会被删掉，重新回答</span>
+              <button class="btn btn-text" type="button" :disabled="rewritingBusy" @click="cancelRewrite">
+                取消
+              </button>
+              <button class="btn btn-text danger" type="button" :disabled="rewritingBusy" @click="submitRewrite">
+                {{ rewritingBusy ? '重新生成中…' : '就按这句重来' }}
+              </button>
+            </div>
+          </template>
+
+          <template v-else>
+            <template v-if="message.content">{{ message.content }}</template>
+            <span v-else-if="message.streaming" class="thinking">正在想办法…</span>
+            <span v-if="message.streaming && message.content" class="caret" aria-hidden="true"></span>
+            <button
+              v-if="message.role === 'user' && message.id !== null && !state.streaming"
+              class="rewrite"
+              type="button"
+              title="改写这句话，从这一句重新生成"
+              @click="startRewrite(message)"
+            >
+              改写
+            </button>
+          </template>
         </div>
       </article>
 
@@ -146,15 +248,24 @@ function autoGrow(event: Event) {
 
     <form class="composer" @submit.prevent="submit">
       <div class="composer-top">
-        <button
-          v-if="state.historyHasMore"
-          class="btn btn-text older"
-          type="button"
-          @click="loadOlder"
-        >
-          更早的消息
-        </button>
-        <span v-else></span>
+        <div class="left-ops">
+          <button
+            v-if="state.historyHasMore"
+            class="btn btn-text older"
+            type="button"
+            @click="loadOlder"
+          >
+            更早的消息
+          </button>
+          <button
+            v-if="tasks.length"
+            class="btn btn-text"
+            type="button"
+            @click="showTasks = !showTasks"
+          >
+            {{ showTasks ? '收起任务' : `任务 ${tasks.length}` }}
+          </button>
+        </div>
 
         <!-- 清空记录放在对话区：它是针对「这一条对话」的动作，跟会话栏的删除/归档不是一回事 -->
         <div v-if="state.sessionId" class="clear-wrap">
@@ -178,6 +289,14 @@ function autoGrow(event: Event) {
           </button>
         </div>
       </div>
+
+      <!-- 任务清单：它排了哪几步、走到哪了。done 只表示这条结束，不等于成功 -->
+      <ul v-if="showTasks && tasks.length" class="tasks">
+        <li v-for="task in tasks" :key="task.id" :data-status="task.status">
+          <span class="task-status">{{ TASK_TEXT[task.status] }}</span>
+          <span class="task-goal">{{ task.goal }}</span>
+        </li>
+      </ul>
 
       <div class="input-row">
         <textarea
@@ -400,6 +519,112 @@ function autoGrow(event: Event) {
 
 .older {
   padding: 0;
+}
+
+.left-ops {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+}
+
+.left-ops .btn-text {
+  padding: 0;
+  font-size: var(--t-xs);
+  color: var(--muted);
+}
+
+.left-ops .btn-text:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+/* 改写入口只在悬停目标那一句时出现：它是「回头改口」的动作，不该抢正常阅读 */
+.rewrite {
+  display: block;
+  margin-top: 5px;
+  font-size: var(--t-xs);
+  color: var(--muted-soft);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+.turn:hover .rewrite,
+.turn:focus-within .rewrite {
+  opacity: 1;
+}
+
+.rewrite:hover {
+  color: var(--signal);
+}
+
+.rewrite-box {
+  display: block;
+  width: 100%;
+  min-width: 260px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-md);
+  background: var(--paper);
+  font: inherit;
+  font-size: var(--t-sm);
+  line-height: 1.7;
+  color: var(--ink);
+  resize: vertical;
+  white-space: pre-wrap;
+}
+
+.rewrite-acts {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  margin-top: 6px;
+}
+
+.rewrite-acts .warn {
+  flex: 1;
+  font-size: var(--t-xs);
+  color: var(--muted-soft);
+}
+
+.rewrite-acts .btn-text {
+  padding: 0;
+  font-size: var(--t-xs);
+  color: var(--muted);
+}
+
+.rewrite-acts .danger {
+  color: var(--alert);
+}
+
+/* 任务清单：一行一步，状态在左、目标在右，长目标换行不撑破 */
+.tasks {
+  margin-bottom: var(--s2);
+  border-top: 1px solid var(--rule);
+}
+
+.tasks li {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--rule);
+  font-size: var(--t-xs);
+}
+
+.task-status {
+  color: var(--muted);
+}
+
+.tasks li[data-status='running'] .task-status {
+  color: var(--signal);
+}
+
+.tasks li[data-status='done'] .task-goal {
+  color: var(--muted);
+}
+
+.task-goal {
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
 }
 
 .clear-wrap {

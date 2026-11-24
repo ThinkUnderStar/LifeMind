@@ -18,8 +18,14 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import CaptchaField from '../components/CaptchaField.vue'
-import { register } from '../api/auth'
-import { login as enter } from '../core/store'
+import {
+  loginByEmail,
+  loginByPhone,
+  register,
+  sendEmailCode,
+  sendPhoneCode,
+} from '../api/auth'
+import { enterWithToken, login as enter } from '../core/store'
 import { ApiError } from '../api/http'
 
 /*
@@ -54,8 +60,11 @@ import cityMorning from '../assets/scene/city-morning.jpg'
 const shots = { cityMorning }
 
 type Mode = 'login' | 'register'
+/** 登录方式。注册只有一种，所以这个只在 login 下切换 */
+type Way = 'password' | 'phone' | 'email'
 
 const mode = ref<Mode>('login')
+const way = ref<Way>('password')
 const busy = ref(false)
 const error = ref('')
 const notice = ref('')
@@ -67,7 +76,60 @@ const confirmPassword = ref('')
 const captcha = ref('')
 const captchaRef = ref<InstanceType<typeof CaptchaField> | null>(null)
 
+/** 手机号或邮箱，按 way 复用：两者从不同时出现，分两个 ref 只是多一份要同步的状态 */
+const contact = ref('')
+const smsCode = ref('')
+
 const isRegister = computed(() => mode.value === 'register')
+const isCodeLogin = computed(() => !isRegister.value && way.value !== 'password')
+
+/* ---------------- 验证码发送与倒计时 ---------------- */
+
+const sending = ref(false)
+const countdown = ref(0)
+let timer: ReturnType<typeof setInterval> | null = null
+
+function stopTimer() {
+  if (timer) clearInterval(timer)
+  timer = null
+  countdown.value = 0
+}
+
+/**
+ * 发送短信 / 邮件验证码。
+ *
+ * 图形验证码在这里**不**校验（后端注释：人机校验放在登录时），
+ * 所以这一步只是「把码发出去」；真正的双重校验在提交那一下。
+ * 60 秒倒计时是前端礼貌限制，后端自己也按号码限流一分钟。
+ */
+async function sendCode() {
+  if (sending.value || countdown.value > 0) return
+  error.value = ''
+  notice.value = ''
+
+  const target = contact.value.trim()
+  if (!target) {
+    error.value = way.value === 'phone' ? '请先填手机号' : '请先填邮箱'
+    return
+  }
+
+  sending.value = true
+  try {
+    if (way.value === 'phone') await sendPhoneCode(target)
+    else await sendEmailCode(target)
+    notice.value = '验证码已发出，请查收'
+    countdown.value = 60
+    timer = setInterval(() => {
+      countdown.value -= 1
+      if (countdown.value <= 0) stopTimer()
+    }, 1000)
+  } catch (e) {
+    error.value = e instanceof ApiError ? e.message : '发送失败，请稍后再试'
+  } finally {
+    sending.value = false
+  }
+}
+
 
 /* ---------------- 背景：视差与光 ---------------- */
 
@@ -125,6 +187,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (frame) cancelAnimationFrame(frame)
+  stopTimer()
 })
 
 /* ---------------- 校验与提交 ---------------- */
@@ -135,6 +198,9 @@ const USERNAME_RE = /^[a-zA-Z][a-zA-Z0-9_]{3,15}$/
 const PASSWORD_RE = /^(?![0-9]+$)(?![a-zA-Z]+$)[0-9A-Za-z!@#$%^&*_-]{8,20}$/
 /** 1~16 位，中文 / 字母 / 数字 / 下划线 / 连字符 */
 const NICKNAME_RE = /^[\u4e00-\u9fa5a-zA-Z0-9_-]{1,16}$/
+/** 与 ValidateUtils 的 PHONE_REGEX / EMAIL_REGEX 逐字一致 */
+const PHONE_RE = /^1[3-9]\d{9}$/
+const EMAIL_RE = /^[a-zA-Z0-9_.-]+@[a-zA-Z0-9-]+(\.[a-zA-Z0-9]+)*\.[a-zA-Z0-9]{2,6}$/
 
 function reject(message: string) {
   // 只提示，不换验证码：这些是本地格式问题，服务端那份还没被消费，仍然可用
@@ -145,6 +211,36 @@ async function submit() {
   if (busy.value) return
   error.value = ''
   notice.value = ''
+
+  const tempKey = captchaRef.value?.tempKey
+  const captchaCode = captcha.value.trim()
+
+  /* ---- 手机 / 邮箱验证码登录：两种验证码都要，缺一个后端都会拒 ---- */
+  if (isCodeLogin.value) {
+    const target = contact.value.trim()
+    if (!target) return reject(way.value === 'phone' ? '请填手机号' : '请填邮箱')
+    if (way.value === 'phone' && !PHONE_RE.test(target)) return reject('手机号格式不对')
+    if (way.value === 'email' && !EMAIL_RE.test(target)) return reject('邮箱格式不对')
+    const sms = smsCode.value.trim()
+    if (!sms) return reject('请填收到的验证码')
+    if (captchaCode.length !== 5) return reject('图形验证码是图片上的五个字符')
+    if (!tempKey) return reject('图形验证码还没取到，点一下图片重新取')
+
+    busy.value = true
+    try {
+      const result =
+        way.value === 'phone'
+          ? await loginByPhone({ target, code: sms, tempKey, captchaCode })
+          : await loginByEmail({ target, code: sms, tempKey, captchaCode })
+      await enterWithToken(result.jwtToken, target)
+    } catch (e) {
+      error.value = e instanceof ApiError ? e.message : '请求没有完成，请再试一次'
+      captchaRef.value?.refresh()
+    } finally {
+      busy.value = false
+    }
+    return
+  }
 
   const name = username.value.trim()
   if (!name) return reject('请填用户名')
@@ -159,9 +255,7 @@ async function submit() {
     if (password.value !== confirmPassword.value) return reject('两次输入的密码不一致')
   }
 
-  if (captcha.value.trim().length !== 5) return reject('验证码是图片上的五个字符')
-
-  const tempKey = captchaRef.value?.tempKey
+  if (captchaCode.length !== 5) return reject('验证码是图片上的五个字符')
   if (!tempKey) return reject('验证码还没取到，点一下图片重新取')
 
   busy.value = true
@@ -173,7 +267,7 @@ async function submit() {
         confirmPassword: confirmPassword.value,
         nickname: nickname.value.trim(),
         tempKey,
-        captchaCode: captcha.value.trim(),
+        captchaCode,
       })
       // 后端注册只返回 Result<Void>，不签发令牌，所以把人送回登录态
       notice.value = `注册成功，用 ${name} 登录`
@@ -187,7 +281,7 @@ async function submit() {
         username: name,
         password: password.value,
         tempKey,
-        captchaCode: captcha.value.trim(),
+        captchaCode,
       })
     }
   } catch (e) {
@@ -207,6 +301,19 @@ function switchTo(next: Mode) {
   confirmPassword.value = ''
   captchaRef.value?.refresh()
 }
+
+/** 换登录方式：清掉上一方式的输入与提示，图形验证码也换一张（它是共享的，但错误语境变了） */
+function switchWay(next: Way) {
+  if (busy.value || way.value === next) return
+  way.value = next
+  contact.value = ''
+  smsCode.value = ''
+  error.value = ''
+  notice.value = ''
+  stopTimer()
+  captchaRef.value?.refresh()
+}
+
 </script>
 
 <template>
@@ -291,7 +398,15 @@ function switchTo(next: Mode) {
           语义交给 aria-label（视觉上省掉，无障碍不减）。
         -->
         <form class="form" @submit.prevent="submit">
+        <!-- 登录方式：密码 / 手机 / 邮箱。注册没有这一行，它只有一种填法 -->
+        <nav v-if="!isRegister" class="ways" aria-label="登录方式">
+          <button type="button" :aria-current="way === 'password'" @click="switchWay('password')">密码</button>
+          <button type="button" :aria-current="way === 'phone'" @click="switchWay('phone')">手机号</button>
+          <button type="button" :aria-current="way === 'email'" @click="switchWay('email')">邮箱</button>
+        </nav>
+
         <input
+          v-if="!isCodeLogin"
           v-model="username"
           class="field"
           type="text"
@@ -314,7 +429,43 @@ function switchTo(next: Mode) {
           :disabled="busy"
         />
 
+        <!-- 手机 / 邮箱：先发码，再连着图形验证码一起提交 -->
+        <template v-if="isCodeLogin">
+          <input
+            v-model="contact"
+            class="field"
+            type="text"
+            :autocomplete="way === 'phone' ? 'tel' : 'email'"
+            spellcheck="false"
+            :placeholder="way === 'phone' ? '手机号' : '邮箱'"
+            :aria-label="way === 'phone' ? '手机号' : '邮箱'"
+            :disabled="busy"
+          />
+
+          <div class="code-row">
+            <input
+              v-model="smsCode"
+              class="field"
+              type="text"
+              inputmode="numeric"
+              maxlength="6"
+              :placeholder="way === 'phone' ? '短信验证码' : '邮件验证码'"
+              aria-label="验证码"
+              :disabled="busy"
+            />
+            <button
+              class="send"
+              type="button"
+              :disabled="busy || sending || countdown > 0"
+              @click="sendCode"
+            >
+              {{ countdown > 0 ? `${countdown}s` : sending ? '发送中' : '发送' }}
+            </button>
+          </div>
+        </template>
+
         <input
+          v-if="!isCodeLogin"
           v-model="password"
           class="field"
           type="password"
@@ -362,7 +513,13 @@ function switchTo(next: Mode) {
       </p>
 
       <p class="foot">
-        {{ isRegister ? '注册后自动开通普通用户权限' : '验证码看不清，点一下图片换一张' }}
+        {{
+          isRegister
+            ? '注册后自动开通普通用户权限'
+            : isCodeLogin
+              ? '收不到？等一分钟再发一次'
+              : '验证码看不清，点一下图片换一张'
+        }}
       </p>
       </div>
     </section>
@@ -792,6 +949,61 @@ h1 {
   margin-top: 36px;
 }
 
+/* 登录方式：三个词并排，选中的那条压一道墨线。不做成胶囊 Tab，表单不该长得像后台 */
+.ways {
+  display: flex;
+  gap: 18px;
+  margin-bottom: 2px;
+}
+
+.ways button {
+  padding: 2px 0;
+  font-size: 13px;
+  color: var(--muted-soft);
+  border-bottom: 1px solid transparent;
+  transition: color 160ms var(--ease), border-color 160ms var(--ease);
+}
+
+.ways button:hover {
+  color: var(--ink-soft);
+}
+
+.ways button[aria-current='true'] {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+
+/* 验证码行：输入框吃掉剩余宽度，「发送」固定 46px 高与字段同高 */
+.code-row {
+  display: flex;
+  gap: 8px;
+}
+
+.code-row .field {
+  flex: 1;
+  min-width: 0;
+}
+
+.send {
+  flex: 0 0 auto;
+  height: 46px;
+  padding: 0 14px;
+  border: 1px solid rgba(23, 24, 26, 0.11);
+  border-radius: 3px;
+  background: #fff;
+  font-size: 13px;
+  color: var(--signal);
+  transition: border-color 160ms var(--ease), color 160ms var(--ease);
+}
+
+.send:hover:not(:disabled) {
+  border-color: rgba(23, 24, 26, 0.22);
+}
+
+.send:disabled {
+  color: var(--muted-soft);
+}
+
 /*
  * 输入框：白底 + 1px 灰线 + 3px 圆角。没有内阴影、没有渐变、没有背景透明。
  * 聚焦时把边框压成墨黑，并用 inset 阴影补足到 2px——只改视觉厚度，不改盒模型，
@@ -828,8 +1040,7 @@ h1 {
 }
 
 /* 提示不用左侧色条、不用图标：一行小字，颜色说话 */
-.error,
-.notice {
+.error,.notice {
   font-size: 12.5px;
   line-height: 1.55;
 }

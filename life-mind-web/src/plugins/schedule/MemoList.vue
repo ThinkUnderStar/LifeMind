@@ -6,7 +6,7 @@
  * 新建用一行输入 + 回车：备忘的价值在「想到就记」，弹一个表单填四栏会让人放弃记。
  */
 import { ref, watch } from 'vue'
-import { pageMemos, createMemo, deleteMemo, pinMemo } from '../../api/schedule'
+import { createMemo, deleteMemo, getMemo, pageMemos, pinMemo, updateMemo } from '../../api/schedule'
 import type { Memo } from '../../core/types'
 import { toast } from '../../core/store'
 
@@ -16,6 +16,12 @@ const rows = ref<Memo[]>([])
 const draft = ref('')
 const loading = ref(false)
 const busy = ref(false)
+
+/** 编辑中的那一条。备忘正文可能很长，列表里给全文、点开是改它，不是另开一个详情页 */
+const editingId = ref<number | null>(null)
+const editTitle = ref('')
+const editContent = ref('')
+const saving = ref(false)
 
 async function load() {
   loading.value = true
@@ -30,18 +36,64 @@ async function load() {
   }
 }
 
+/**
+ * 新建。后端要求 content 非空（@NotBlank），标题可为空——
+ * 所以这一行输入存成正文，标题取它前面一小段：用户打的本来就是「那一句话」。
+ */
 async function add() {
-  const title = draft.value.trim()
-  if (!title || busy.value) return
+  const text = draft.value.trim()
+  if (!text || busy.value) return
   busy.value = true
   try {
-    await createMemo({ title })
+    await createMemo({ title: text.slice(0, 20), content: text })
     draft.value = ''
     await load()
   } catch (error) {
     toast(error instanceof Error ? error.message : '没记上', 'error')
   } finally {
     busy.value = false
+  }
+}
+
+/** 打开编辑时取一次详情：列表是批量查的，编辑要的是这条最新的一版 */
+async function startEdit(memo: Memo) {
+  editingId.value = memo.id
+  editTitle.value = memo.title
+  editContent.value = memo.content ?? ''
+  try {
+    const fresh = await getMemo(memo.id)
+    if (editingId.value !== memo.id) return
+    editTitle.value = fresh.title
+    editContent.value = fresh.content ?? ''
+  } catch {
+    // 详情取不到就用列表里的内容继续编辑，不把用户挡在门外
+  }
+}
+
+function stopEdit() {
+  editingId.value = null
+  editTitle.value = ''
+  editContent.value = ''
+}
+
+async function save() {
+  if (editingId.value === null || saving.value) return
+  const content = editContent.value.trim()
+  if (!content) return toast('正文不能为空', 'error')
+  saving.value = true
+  try {
+    await updateMemo({
+      id: editingId.value,
+      title: editTitle.value.trim() || content.slice(0, 20),
+      content,
+    })
+    stopEdit()
+    await load()
+    toast('已更新')
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '没改成', 'error')
+  } finally {
+    saving.value = false
   }
 }
 
@@ -86,23 +138,38 @@ watch(() => props.epoch, load, { immediate: true })
 
     <ul v-else>
       <li v-for="memo in rows" :key="memo.id" class="row">
-        <button
-          class="pin"
-          type="button"
-          :data-on="memo.pinned === 1"
-          :aria-pressed="memo.pinned === 1"
-          :title="memo.pinned === 1 ? '取消置顶' : '置顶'"
-          @click="togglePin(memo)"
-        >
-          置顶
-        </button>
+        <template v-if="editingId === memo.id">
+          <div class="edit">
+            <input v-model="editTitle" class="field" type="text" placeholder="标题（可空）" />
+            <textarea v-model="editContent" class="field area" rows="4" placeholder="正文"></textarea>
+            <div class="acts">
+              <button class="act primary" type="button" :disabled="saving" @click="save">
+                {{ saving ? '保存中…' : '保存' }}
+              </button>
+              <button class="act" type="button" @click="stopEdit">取消</button>
+            </div>
+          </div>
+        </template>
 
-        <div class="content">
-          <p class="title">{{ memo.title }}</p>
-          <p v-if="memo.content" class="body">{{ memo.content }}</p>
-        </div>
+        <template v-else>
+          <button
+            class="pin"
+            type="button"
+            :data-on="memo.pinned === 1"
+            :aria-pressed="memo.pinned === 1"
+            :title="memo.pinned === 1 ? '取消置顶' : '置顶'"
+            @click="togglePin(memo)"
+          >
+            置顶
+          </button>
 
-        <button class="kill" type="button" title="删除" @click="remove(memo)">×</button>
+          <button class="content open" type="button" @click="startEdit(memo)">
+            <span class="title">{{ memo.title }}</span>
+            <span v-if="memo.content" class="body">{{ memo.content }}</span>
+          </button>
+
+          <button class="kill" type="button" title="删除" @click="remove(memo)">×</button>
+        </template>
       </li>
     </ul>
   </div>
@@ -145,13 +212,64 @@ watch(() => props.epoch, load, { immediate: true })
   min-width: 0;
 }
 
+button.open {
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.open:hover .title {
+  color: var(--ink-soft);
+}
+
+.edit {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.area {
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.6;
+}
+
+.acts {
+  display: flex;
+  gap: var(--s3);
+}
+
+.act {
+  padding: 3px 0;
+  font-size: var(--t-xs);
+  color: var(--muted);
+}
+
+.act:hover {
+  color: var(--ink);
+}
+
+.act.primary {
+  color: var(--signal);
+}
+
+.act:disabled {
+  opacity: 0.5;
+}
+
 .title {
+  display: block;
   font-size: var(--t-sm);
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
 
 .body {
+  display: block;
   margin-top: 1px;
   font-size: var(--t-xs);
   color: var(--muted);

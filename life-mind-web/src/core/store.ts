@@ -54,7 +54,7 @@ const nextKey = () => `t-${++seq}`
 let pageSeq = 0
 const nextPageKey = () => `page-${++pageSeq}`
 const blankPage = (): WorkspacePage => ({ key: nextPageKey(), kind: 'plugin', pluginKey: null, label: '新页面' })
-const staticPage = (kind: 'notice' | 'profile', label: string): WorkspacePage => ({
+const staticPage = (kind: 'notice' | 'profile' | 'feedback', label: string): WorkspacePage => ({
   key: nextPageKey(),
   kind,
   pluginKey: null,
@@ -151,6 +151,21 @@ export async function login(payload: {
 export function setAccount(username: string) {
   localStorage.setItem(ACCOUNT_KEY, username)
   state.account = username
+}
+
+/**
+ * 已经拿到令牌时的统一收尾。
+ *
+ * 密码登录、手机验证码登录、邮箱验证码登录拿到的都是同一个 LoginResponse，
+ * 但后两种没有「用户名」可填：后端只回令牌。显示名用手机号/邮箱充数，
+ * 打开个人主页拿到昵称后自然会换成更好看的那个。
+ */
+export async function enterWithToken(jwtToken: string, label: string): Promise<void> {
+  writeToken(jwtToken)
+  localStorage.setItem(ACCOUNT_KEY, label)
+  state.account = label
+  state.authed = true
+  await Promise.all([loadPlugins(), loadSessions()])
 }
 
 export function logout() {
@@ -354,7 +369,7 @@ export function openServicePage(key: string, tab?: string) {
  * 打开通知 / 个人主页这类「固定页」：都是工作区的一页，不是插件。
  * 已有同一类页就切过去；当前正好是空白插件页就就地变身；否则新开一页。
  */
-function openStaticPage(kind: 'notice' | 'profile', label: string) {
+function openStaticPage(kind: 'notice' | 'profile' | 'feedback', label: string) {
   const existing = state.workspacePages.find((p) => p.kind === kind)
   if (existing) {
     if (state.workspacePage !== existing.key) selectWorkspacePage(existing.key)
@@ -390,6 +405,11 @@ export function openNoticeWorkspace() {
 /** 左侧栏底部的账号：个人主页也是工作区的一页，对话不被顶掉 */
 export function openProfileWorkspace() {
   openStaticPage('profile', '个人主页')
+}
+
+/** 意见反馈：从个人主页底部进来，同样是一页，不弹窗、不遮对话 */
+export function openFeedbackWorkspace() {
+  openStaticPage('feedback', '意见反馈')
 }
 
 /* =========================== 会话 =========================== */
@@ -655,6 +675,68 @@ export function stop() {
   controller = null
   state.streaming = false
   state.liveTools = []
+}
+
+/**
+ * 改写一条历史用户消息，并从那里重新生成（时间回溯）。
+ *
+ * 这是不可逆的：后端会清掉该消息及其之后的消息、任务与向量切片。
+ * 所以本地也只在**流真的开始之后**才截断界面——如果请求在进图之前就被拒
+ * （会话不属于我、消息不是用户消息），界面还完整，用户可以接着用。
+ *
+ * 只有历史消息能改：state.messages 里 id 为 null 的是本次刚发的临时消息，
+ * 后端还没有它的记录，拿不到 message_id 就无法回溯。
+ */
+export async function rewrite(messageId: number, content: string): Promise<void> {
+  const text = content.trim()
+  if (!text || state.streaming || !state.sessionId) return
+
+  const index = state.messages.findIndex((m) => m.id === messageId)
+  if (index < 0) {
+    toast('这条消息已不在当前列表里，刷新后再试', 'error')
+    return
+  }
+
+  const user: UiMessage = { key: nextKey(), id: null, role: 'user', content: text, streaming: false }
+  const reply: UiMessage = { key: nextKey(), id: null, role: 'assistant', content: '', streaming: true }
+
+  let begun = false
+  const begin = () => {
+    if (begun) return
+    begun = true
+    state.messages = [...state.messages.slice(0, index), user, reply]
+  }
+
+  state.streaming = true
+  state.liveTools = []
+  state.pending = null
+  controller = new AbortController()
+
+  try {
+    await chatApi.backtrackChat(
+      { conversationId: state.sessionId, messageId, content: text },
+      {
+        signal: controller.signal,
+        onEvent: (evt) => {
+          begin()
+          handleEvent(evt, reply)
+        },
+      },
+    )
+  } catch (error) {
+    if ((error as Error)?.name === 'AbortError') {
+      if (begun) reply.content += '\n\n（已停止）'
+    } else {
+      toast(messageOf(error), 'error')
+    }
+  } finally {
+    // 没 begun 说明请求在进图前就被拒了：界面保持原样，不截断、不留空气泡
+    if (begun) reply.streaming = false
+    state.streaming = false
+    state.liveTools = []
+    controller = null
+    loadSessions(true)
+  }
 }
 
 /* =========================== 通知 =========================== */

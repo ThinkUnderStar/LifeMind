@@ -64,3 +64,60 @@ export interface RegisterPayload {
 export function register(payload: RegisterPayload): Promise<void> {
   return post<void>(`${SERVICE.account}/auth/register`, payload)
 }
+
+/**
+ * 手机 / 邮箱验证码登录。
+ *
+ * 两个验证码都要带：图形验证码证明「是人」，短信/邮件验证码证明「号码是他的」。
+ * 图形验证码先换 tempKey（见 newTempKey）再取图，和密码登录是同一套。
+ */
+export interface CodeLoginPayload {
+  /** 手机号或邮箱，与调用的端点一致 */
+  target: string
+  code: string
+  tempKey: string
+  captchaCode: string
+  rememberMe?: number
+}
+
+export function loginByPhone(payload: CodeLoginPayload): Promise<LoginResult> {
+  return post<LoginResult>(`${SERVICE.account}/auth/login/phone`, {
+    phone: payload.target,
+    code: payload.code,
+    tempKey: payload.tempKey,
+    captchaCode: payload.captchaCode,
+    rememberMe: payload.rememberMe ?? 0,
+  })
+}
+
+export function loginByEmail(payload: CodeLoginPayload): Promise<LoginResult> {
+  return post<LoginResult>(`${SERVICE.account}/auth/login/email`, {
+    email: payload.target,
+    code: payload.code,
+    tempKey: payload.tempKey,
+    captchaCode: payload.captchaCode,
+    rememberMe: payload.rememberMe ?? 0,
+  })
+}
+
+/**
+ * 发送短信 / 邮件验证码。
+ *
+ * 发送环节不做图形验证码校验（后端注释：人机校验放在登录时），也不判断号码是否注册——
+ * 否则这个接口就成了「查这个手机号有没有账号」的探测器。因此调用方不要拿它做存在性判断。
+ *
+ * 这个接口同时服务于三处：验证码登录、绑定/换绑手机邮箱、用验证码改密。
+ * 它们校验的是同一个 Redis 键，所以没必要为每处再拆一个发送入口。
+ */
+export function sendPhoneCode(phone: string): Promise<void> {
+  return post<void>(`${SERVICE.account}/auth/code/send/phone`, { phone })
+}
+
+export function sendEmailCode(email: string): Promise<void> {
+  return post<void>(`${SERVICE.account}/auth/code/send/email`, { email })
+}
+
+/** 注销账号（软删除）。成功后令牌立即作废，调用方必须清本地登录态 */
+export function deactivateAccount(): Promise<void> {
+  return post<void>(`${SERVICE.account}/auth/deactivate`)
+}

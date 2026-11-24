@@ -9,6 +9,7 @@
  */
 import { SERVICE, del, get, post, put, qs } from './http'
 import type {
+  BatchResult,
   DailyStat,
   Item,
   ItemQuery,
@@ -82,6 +83,24 @@ export function deleteItem(id: number): Promise<void> {
   return del<void>(`${ITEM}/${id}`)
 }
 
+/**
+ * 批量取详情 / 批量完成 / 批量删除。
+ *
+ * 后端这三个批量接口都是「逐条回报、一条失败不影响其余」，所以完成与删除返回 BatchResult
+ * 而不是 void：界面需要知道哪几条没成，不能笼统说「操作成功」。
+ */
+export function batchGetItems(ids: number[]): Promise<Item[]> {
+  return get<Item[]>(`${ITEM}/batch`, { ids: ids.join(',') })
+}
+
+export function batchCompleteItems(ids: number[], completed = true): Promise<BatchResult> {
+  return put<BatchResult>(`${ITEM}/batch/complete`, { ids, completed })
+}
+
+export function batchDeleteItems(ids: number[]): Promise<BatchResult> {
+  return post<BatchResult>(`${ITEM}/batch/delete`, { ids })
+}
+
 /* ---------------- 统计 ---------------- */
 
 export function overview(): Promise<Overview> {
@@ -106,6 +125,11 @@ export function remindersOfItem(itemId: number): Promise<Reminder[]> {
 
 export function pageMemos(pageNum = 1, pageSize = 50, keyword?: string): Promise<Page<Memo>> {
   return get<Page<Memo>>(`${MEMO}/page`, { pageNum, pageSize, keyword })
+}
+
+/** 单条详情。备忘内容可能很长，列表里只给摘要，展开时再取全文 */
+export function getMemo(id: number): Promise<Memo> {
+  return get<Memo>(`${MEMO}/${id}`)
 }
 
 export function createMemo(payload: {

@@ -193,6 +193,47 @@ export interface DailyStat {
   todoDoneCount: number
 }
 
+/**
+ * 批量操作的结果。后端不做整体事务：一条失败不影响其余，
+ * 所以这里同时给成功数与逐条失败原因，界面才能说清「哪几条没成」。
+ */
+export interface BatchResult {
+  successCount: number
+  succeeded: number[]
+  failed: Array<{ id: number; reason: string }>
+}
+
+/** 反馈类型。数值与后端 feedback 表的 type 字典一致 */
+export type FeedbackType = 1 | 2 | 3 | 4
+
+export interface FeedbackSubmitPayload {
+  type: FeedbackType
+  content: string
+  /** 联系方式，可空——登录用户其实已经能找得到，留在这里是给「换个号联系我」的情况 */
+  contact?: string
+  /** 截图，可空。服务端只收一张，且限 5MB 内的常见图片格式 */
+  file?: File
+}
+
+/**
+ * 一条已经提交过的反馈。
+ *
+ * 状态取值与后端 feedback 表一致：0-待处理 1-处理中 2-已回复 3-已关闭。
+ * 服务端不会下发回复人的用户 ID（那是内部信息），所以这里也不声明。
+ */
+export interface FeedbackRecord {
+  id: number
+  type: FeedbackType
+  content: string
+  /** 截图地址，形如 /minio/life-mind-public/users/{uid}/feedback-images/{uuid}.png；没传图时为 null */
+  images: string | null
+  contact: string | null
+  status: number
+  reply: string | null
+  replyTime: string | null
+  createTime: string
+}
+
 /* =========================== 右侧工作区页面 =========================== */
 
 /**
@@ -203,7 +244,7 @@ export interface DailyStat {
  */
 export interface WorkspacePage {
   key: string
-  kind: 'plugin' | 'notice' | 'profile'
+  kind: 'plugin' | 'notice' | 'profile' | 'feedback'
   pluginKey: string | null
   label: string
   /** 插件面板内的分段，切走再切回来要还原 */

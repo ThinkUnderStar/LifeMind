@@ -7,12 +7,19 @@
  * 两者都没值的归到「没排时间」，放在最后——它们不是历史，是待整理的。
  */
 import { computed, ref, watch } from 'vue'
-import { pageItems, completeItem, deleteItem } from '../../api/schedule'
+import {
+  batchCompleteItems,
+  batchDeleteItems,
+  completeItem,
+  deleteItem,
+  pageItems,
+} from '../../api/schedule'
 import type { Item } from '../../core/types'
 import { parseDateTime, relativeDayText, timeText, toDateString } from '../../core/date'
 import { toast } from '../../core/store'
 
 const props = defineProps<{ epoch: number }>()
+const emit = defineEmits<{ (e: 'edit', id: number): void }>()
 
 type Filter = 'all' | 'schedule' | 'todo' | 'overdue'
 
@@ -21,6 +28,11 @@ const items = ref<Item[]>([])
 const total = ref(0)
 const page = ref(1)
 const loading = ref(false)
+
+/** 批量模式：只在需要「一次处理好几条」时才出现，平时不占一列、也不改行的点击语义 */
+const picking = ref(false)
+const chosen = ref<number[]>([])
+const applying = ref(false)
 
 const size = 50
 const canMore = computed(() => items.value.length < total.value)
@@ -129,11 +141,65 @@ async function remove(item: Item) {
   }
 }
 
+function startPick() {
+  picking.value = true
+  chosen.value = []
+}
+
+function stopPick() {
+  picking.value = false
+  chosen.value = []
+}
+
+function togglePick(id: number) {
+  const set = new Set(chosen.value)
+  if (set.has(id)) set.delete(id)
+  else set.add(id)
+  chosen.value = [...set]
+}
+
+const allPicked = computed(
+  () => items.value.length > 0 && items.value.every((i) => chosen.value.includes(i.id)),
+)
+
+function toggleAll() {
+  chosen.value = allPicked.value ? [] : items.value.map((i) => i.id)
+}
+
+/**
+ * 批量完成 / 批量删除。
+ *
+ * 后端逐条回报，所以界面不能说「成功」了事：失败的那几条要报出条数，
+ * 成功与否都要重取列表——逐条成功也可能只成功了一部分。
+ */
+async function applyBatch(kind: 'complete' | 'delete') {
+  if (!chosen.value.length || applying.value) return
+  applying.value = true
+  try {
+    const result =
+      kind === 'complete'
+        ? await batchCompleteItems(chosen.value, true)
+        : await batchDeleteItems(chosen.value)
+
+    if (result.failed.length) {
+      toast(`${result.successCount} 条已处理，${result.failed.length} 条没成`, 'error')
+    } else {
+      toast(kind === 'complete' ? `已完成 ${result.successCount} 条` : `已删除 ${result.successCount} 条`)
+    }
+    stopPick()
+    await load(true)
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '批量操作失败', 'error')
+  } finally {
+    applying.value = false
+  }
+}
+
 watch(() => props.epoch, () => void load(true), { immediate: true })
 </script>
 
 <template>
-  <div class="list">
+  <div class="list" :data-pick="picking">
     <nav class="filters" aria-label="筛选">
       <button
         v-for="item in FILTERS"
@@ -143,6 +209,10 @@ watch(() => props.epoch, () => void load(true), { immediate: true })
         @click="pick(item.key)"
       >
         {{ item.label }}
+      </button>
+      <span class="pad"></span>
+      <button class="pickmode" type="button" @click="picking ? stopPick() : startPick()">
+        {{ picking ? '退出批量' : '批量' }}
       </button>
     </nav>
 
@@ -159,7 +229,15 @@ watch(() => props.epoch, () => void load(true), { immediate: true })
       <section v-for="group in groups" :key="group.key" class="group">
         <h3 class="label">{{ group.label }}</h3>
         <ul>
-          <li v-for="item in group.rows" :key="item.id" class="row" :data-done="item.status === 1">
+          <li
+            v-for="item in group.rows"
+            :key="item.id"
+            class="row"
+            :data-done="item.status === 1"
+            :data-picked="chosen.includes(item.id)"
+            @click="picking ? togglePick(item.id) : emit('edit', item.id)"
+          >
+            <span v-if="picking" class="pick" :data-on="chosen.includes(item.id)" aria-hidden="true"></span>
             <span class="when mono" :data-overdue="isOverdue(item)">{{ timeOf(item) }}</span>
 
             <button
@@ -168,7 +246,7 @@ watch(() => props.epoch, () => void load(true), { immediate: true })
               type="button"
               :aria-label="`切换「${item.title}」的完成状态`"
               :data-on="item.status === 1"
-              @click="toggle(item)"
+              @click.stop="toggle(item)"
             ></button>
             <span v-else class="kind" aria-hidden="true"></span>
 
@@ -178,7 +256,8 @@ watch(() => props.epoch, () => void load(true), { immediate: true })
               <p v-else-if="item.location" class="sub">{{ item.location }}</p>
             </div>
 
-            <button class="kill" type="button" title="删除" @click="remove(item)">×</button>
+            <button v-if="!picking" class="kill" type="button" title="删除" @click.stop="remove(item)">×</button>
+            <span v-else class="kill-space" aria-hidden="true"></span>
           </li>
         </ul>
       </section>
@@ -187,6 +266,19 @@ watch(() => props.epoch, () => void load(true), { immediate: true })
         {{ loading ? '正在取…' : `再看 ${Math.min(size, total - items.length)} 条` }}
       </button>
     </template>
+
+    <!-- 批量条贴在列表底部：滚动时始终够得着，不随列表长度跑掉 -->
+    <div v-if="picking" class="batchbar">
+      <button class="all" type="button" @click="toggleAll">{{ allPicked ? '取消全选' : '全选' }}</button>
+      <span class="count">已选 {{ chosen.length }}</span>
+      <span class="pad"></span>
+      <button type="button" :disabled="!chosen.length || applying" @click="applyBatch('complete')">
+        {{ applying ? '处理中…' : '完成' }}
+      </button>
+      <button class="danger" type="button" :disabled="!chosen.length || applying" @click="applyBatch('delete')">
+        删除
+      </button>
+    </div>
   </div>
 </template>
 
@@ -213,6 +305,92 @@ watch(() => props.epoch, () => void load(true), { immediate: true })
 .filters button[aria-current='true'] {
   color: var(--ink);
   border-bottom-color: var(--ink);
+}
+
+.pad {
+  flex: 1;
+}
+
+.pickmode {
+  color: var(--muted);
+}
+
+.pickmode:hover {
+  color: var(--signal);
+}
+
+/* 批量模式多一列勾选：只在 data-pick 时占位，平时行宽不变 */
+.list[data-pick='true'] .row {
+  grid-template-columns: 16px 46px 12px minmax(0, 1fr) 18px;
+}
+
+.pick {
+  width: 11px;
+  height: 11px;
+  margin-top: 4px;
+  border: 1.5px solid var(--rule-strong);
+  border-radius: 3px;
+}
+
+.pick[data-on='true'] {
+  background: var(--signal);
+  border-color: var(--signal);
+}
+
+.row {
+  cursor: pointer;
+}
+
+.row[data-picked='true'] {
+  background: var(--signal-soft);
+}
+
+.kill-space {
+  width: 18px;
+}
+
+.batchbar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  margin-top: var(--s4);
+  padding: 9px 2px;
+  background: var(--paper);
+  border-top: 1px solid var(--rule);
+  font-size: var(--t-xs);
+}
+
+.batchbar button {
+  padding: 4px 10px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  color: var(--muted);
+  background: var(--paper);
+}
+
+.batchbar button:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+.batchbar .all {
+  border-color: transparent;
+  padding-left: 0;
+}
+
+.batchbar .danger:hover:not(:disabled) {
+  color: var(--alert);
+  border-color: var(--alert);
+}
+
+.batchbar button:disabled {
+  opacity: 0.45;
+}
+
+.batchbar .count {
+  color: var(--muted);
 }
 
 .group + .group {

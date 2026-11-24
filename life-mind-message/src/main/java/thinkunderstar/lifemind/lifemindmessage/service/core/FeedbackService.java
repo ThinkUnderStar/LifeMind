@@ -24,6 +24,19 @@ public interface FeedbackService {
     Result<Void> submitFeedback(FeedbackSubmitRequest submitRequest, MultipartFile file , HttpServletRequest request);
 
     /**
+     * 分页查询当前用户提交过的反馈。
+     *
+     * <p>过滤条件里的用户 ID 只取网关注入的 {@code LifeMind-User-Id}，
+     * 不接受前端传参，所以这条接口不可能被用来翻别人的反馈。
+     * 按创建时间倒序，带上处理状态与回复。
+     *
+     * @param queryRequest 查询请求参数（pageNum、pageSize、type、status 均可选）
+     * @param request      当前请求，用于从请求头解析用户 ID
+     * @return 当前用户的分页反馈列表
+     */
+    Result<IPage<FeedbackResponse>> getMyFeedback(FeedbackQueryRequest queryRequest, HttpServletRequest request);
+
+    /**
      * 分页查询全部反馈（管理员视角）。
      *
      * <p>管理员可查看所有用户提交的反馈，不按用户过滤；按反馈类型/处理状态筛选，

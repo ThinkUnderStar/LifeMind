@@ -44,7 +44,8 @@ export const PLUGIN_MANIFESTS: PluginManifest[] = [
     views: {
       // agent 侧 _TOOL_UI 里登记过的全部 view 值
       week: 'day',
-      list: 'list',
+      // 「全部」页签已并入日程：agent 旧帧的 view=list 落到月历，不再落空
+      list: 'calendar',
       memo: 'memo',
       reminder: 'day',
       stats: 'day',
