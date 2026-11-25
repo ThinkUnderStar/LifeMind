@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 意见反馈。住在工作区，从个人主页底部进来。
+ * 意见反馈。左栏功能区块（或个人主页底部）进入的独立整页，不占工作区标签。
  *
  * 两件事：写一条新的，看自己以前提过的处理到哪一步了。
  * `/feedback/page`、`/feedback/process` 是管理员后台，不进用户界面。
@@ -11,7 +11,8 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { myFeedback, submitFeedback } from '../api/feedback'
 import type { FeedbackRecord, FeedbackType } from '../core/types'
-import { toast } from '../core/store'
+import { backToChat, toast } from '../core/store'
+import ChevronIcon from '../components/ChevronIcon.vue'
 
 const TYPES: Array<{ value: FeedbackType; label: string }> = [
   { value: 1, label: '功能建议' },
@@ -129,8 +130,13 @@ onBeforeUnmount(dropShot)
 <template>
   <section class="feedback">
     <header class="head">
-      <h1>意见反馈</h1>
-      <p class="lede">哪里不好用、哪里出错了，直接写。处理完会发一条通知给你。</p>
+      <button class="back" type="button" @click="backToChat">
+        <ChevronIcon dir="left" :size="13" />回到对话
+      </button>
+      <div>
+        <h1>意见反馈</h1>
+        <p class="lede">哪里不好用、哪里出错了，直接写。处理完会发一条通知给你。</p>
+      </div>
     </header>
 
     <template v-if="sent">
@@ -252,10 +258,36 @@ onBeforeUnmount(dropShot)
   padding: var(--s5) var(--s4) var(--s6);
 }
 
+.head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: var(--s5);
+}
+
 .head h1 {
   font-size: 20px;
   font-weight: 500;
   letter-spacing: -0.01em;
+}
+
+.back {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 7px 14px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+
+.back:hover {
+  color: var(--ink);
+  border-color: var(--rule-strong);
 }
 
 .lede {
@@ -534,5 +566,16 @@ onBeforeUnmount(dropShot)
   margin-top: 10px;
   font-size: var(--t-xs);
   color: var(--muted-soft);
+}
+
+@media (max-width: 720px) {
+  .feedback {
+    padding: var(--s5) var(--s4);
+  }
+
+  .head {
+    flex-direction: column;
+    gap: var(--s3);
+  }
 }
 </style>

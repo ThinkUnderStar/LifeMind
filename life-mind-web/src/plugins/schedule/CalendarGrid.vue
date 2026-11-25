@@ -18,6 +18,7 @@ import { completeItem, pageItems } from '../../api/schedule'
 import type { Item } from '../../core/types'
 import { addDays, dayText, parseDateTime, startOfWeek, timeText, toDateString } from '../../core/date'
 import { toast } from '../../core/store'
+import ChevronIcon from '../../components/ChevronIcon.vue'
 
 const props = defineProps<{ date: string; epoch: number }>()
 const emit = defineEmits<{
@@ -198,9 +199,13 @@ watch(() => props.epoch, load, { immediate: true })
 <template>
   <div class="calendar">
     <header class="month">
-      <button class="arrow" type="button" title="上个月" @click="shiftMonth(-1)">‹</button>
+      <button class="arrow" type="button" title="上个月" @click="shiftMonth(-1)">
+        <ChevronIcon dir="left" :size="15" />
+      </button>
       <h2 class="label">{{ title }}</h2>
-      <button class="arrow" type="button" title="下个月" @click="shiftMonth(1)">›</button>
+      <button class="arrow" type="button" title="下个月" @click="shiftMonth(1)">
+        <ChevronIcon :size="15" />
+      </button>
       <span class="pad"></span>
       <button class="today-btn" type="button" @click="goToday">今天</button>
     </header>
@@ -306,11 +311,12 @@ watch(() => props.epoch, load, { immediate: true })
 }
 
 .arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 22px;
   height: 22px;
   border-radius: var(--r-sm);
-  font-size: 18px;
-  line-height: 1;
   color: var(--muted);
 }
 

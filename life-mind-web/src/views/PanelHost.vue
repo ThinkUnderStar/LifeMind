@@ -2,47 +2,37 @@
 /**
  * 右侧工作区：一组浏览器式的页面。
  *
- * 空白页是入口，列出已经做好的插件，点一张就在**当前页**打开；
+ * 空白页是入口，只列出**已绑定**且前端已做好的插件，点一张就在**当前页**打开；
  * 「＋」新建空白页，再去开别的插件，同一个插件也能开多张页。
- * 通知与个人主页也是这里的一页：和插件页共用标签，中间对话不被顶掉。
+ * 这里只放插件面板；左栏里的四个入口都是独立界面，不占这里的标签。绑定/解绑统一在插件服务库做。
  */
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import {
   addWorkspacePage,
   closeWorkspacePage,
   openPluginHere,
   selectWorkspacePage,
   state,
-  togglePlugin,
-  toggleWorkspace,
 } from '../core/store'
 import type { WorkspacePage } from '../core/types'
 import { PLUGIN_MANIFESTS, resolvePlugin } from '../core/plugin-registry'
-import NoticePage from './NoticePage.vue'
-import ProfilePage from './ProfilePage.vue'
-import FeedbackPage from './FeedbackPage.vue'
+import ChevronIcon from '../components/ChevronIcon.vue'
 
 const current = computed(() => state.workspacePages.find((p) => p.key === state.workspacePage))
 const manifest = computed(() =>
-  current.value?.kind === 'plugin' && current.value.pluginKey
-    ? resolvePlugin(current.value.pluginKey)
-    : undefined,
+  current.value?.pluginKey ? resolvePlugin(current.value.pluginKey) : undefined,
 )
 
 const BLANK_ICON = 'M4 4h5v5H4zM11 4h5v5h-5zM4 11h5v5H4zM11 11h5v5h-5z'
-const NOTICE_ICON =
-  'M10 2.5a4.5 4.5 0 0 0-4.5 4.5v3L4 12.5h12l-1.5-2.5V7A4.5 4.5 0 0 0 10 2.5ZM8.2 15a2 2 0 0 0 3.6 0'
-const PROFILE_ICON = 'M10 4.6a2.9 2.9 0 1 1 0 5.8 2.9 2.9 0 0 1 0-5.8ZM4.6 16.4c0-2.6 2.4-4.2 5.4-4.2s5.4 1.6 5.4 4.2'
-const FEEDBACK_ICON = 'M10 3.4c3.5 0 6.3 2.3 6.3 5.2S13.5 13.8 10 13.8c-.7 0-1.4-.1-2-.3l-3.4 2 .9-2.9c-1.1-1-1.8-2.4-1.8-4 0-2.9 2.8-5.2 6.3-5.2Z'
 
 function iconOf(page: WorkspacePage): string {
-  if (page.kind === 'notice') return NOTICE_ICON
-  if (page.kind === 'profile') return PROFILE_ICON
-  if (page.kind === 'feedback') return FEEDBACK_ICON
   return page.pluginKey ? (resolvePlugin(page.pluginKey)?.icon ?? BLANK_ICON) : BLANK_ICON
 }
 
-/** 已做好的插件始终可点；后端的 enabled 只决定能不能真的调它的服务 */
+/**
+ * 工作区只列**已绑定**的插件：解绑后这里看不见，是插件服务库统一管理绑定的直接结果。
+ * 启停开关不放在这里——要去插件服务库解绑，避免两处入口各说各话。
+ */
 const entries = computed(() =>
   PLUGIN_MANIFESTS.map((m) => {
     const info = state.plugins.find((p) => p.pluginKey === m.key)
@@ -51,35 +41,19 @@ const entries = computed(() =>
       name: info?.name || m.name,
       desc: info?.description || m.hint,
       icon: m.icon,
-      enabled: info ? info.enabled : true,
     }
+  }).filter((e) => {
+    const info = state.plugins.find((p) => p.pluginKey === e.key)
+    // 没配过（info 为空）时按 manifest 默认可点；明确解绑的才排除
+    return !info || info.enabled
   }),
 )
 
 const soon = computed(() =>
   state.plugins
-    .filter((p) => !PLUGIN_MANIFESTS.some((m) => m.key === p.pluginKey))
+    .filter((p) => p.enabled && !PLUGIN_MANIFESTS.some((m) => m.key === p.pluginKey))
     .map((p) => p.name),
 )
-
-/**
- * 启用 / 停用。
- *
- * 停用不删数据、也不关已打开的页——它只是让 agent 那一侧不再把这些工具挂给模型，
- * 所以界面上允许「边看边关」，不做确认弹窗。
- * busy 是防连点：开关是一个写操作，双击会发出两次相反的请求，谁后到就由谁定状态，很容易和界面显示对不上。
- */
-const busy = ref<string | null>(null)
-
-async function flip(key: string, enabled: boolean) {
-  if (busy.value) return
-  busy.value = key
-  try {
-    await togglePlugin(key, enabled)
-  } finally {
-    busy.value = null
-  }
-}
 
 </script>
 
@@ -112,41 +86,24 @@ async function flip(key: string, enabled: boolean) {
         </button>
         <button class="tab-new" type="button" title="新建空白页" aria-label="新建空白页" @click="addWorkspacePage()">＋</button>
       </div>
-      <button class="fold" type="button" title="收起工作区" aria-label="收起工作区" @click="toggleWorkspace">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10" /></svg>
-      </button>
     </nav>
 
     <div class="content">
       <component :is="manifest.panel" v-if="manifest" :key="state.workspacePage" />
 
-      <div v-else-if="current?.kind === 'notice'" class="page-host">
-        <NoticePage />
-      </div>
-
-      <div v-else-if="current?.kind === 'profile'" class="page-host">
-        <ProfilePage />
-      </div>
-
-      <div v-else-if="current?.kind === 'feedback'" class="page-host">
-        <FeedbackPage />
-      </div>
-
       <div v-else class="blank">
         <div class="intro">
           <h2>工作区</h2>
-          <p>挑一个服务，在这里直接打开。也可以先新建空白页，再打开另一个服务。</p>
+          <p>这里只列出已绑定的服务。要绑定或解绑，去左侧的插件服务库。</p>
+        </div>
+
+        <div v-if="!entries.length" class="none">
+          还没有绑定任何服务。去插件服务库绑定一个，它就会出现在这里。
         </div>
 
         <div class="cards">
-          <div v-for="item in entries" :key="item.key" class="card" :data-off="!item.enabled">
-            <button
-              class="open"
-              type="button"
-              :disabled="!item.enabled"
-              :title="item.enabled ? `打开${item.name}` : '先启用，才能在 agent 里用它'"
-              @click="openPluginHere(item.key)"
-            >
+          <div v-for="item in entries" :key="item.key" class="card">
+            <button class="open" type="button" :title="`打开${item.name}`" @click="openPluginHere(item.key)">
               <span class="card-icon">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path :d="item.icon" /></svg>
               </span>
@@ -154,17 +111,7 @@ async function flip(key: string, enabled: boolean) {
                 <strong>{{ item.name }}</strong>
                 <span class="desc">{{ item.desc }}</span>
               </span>
-              <span class="state">{{ item.enabled ? '打开 →' : '未启用' }}</span>
-            </button>
-
-            <button
-              class="flip"
-              type="button"
-              :disabled="busy === item.key"
-              :aria-pressed="item.enabled"
-              @click="flip(item.key, !item.enabled)"
-            >
-              {{ busy === item.key ? '…' : item.enabled ? '停用' : '启用' }}
+              <span class="state">打开<ChevronIcon :size="13" /></span>
             </button>
           </div>
         </div>
@@ -285,53 +232,27 @@ async function flip(key: string, enabled: boolean) {
   background: var(--alert-soft);
 }
 
-.tab-new,
-.fold {
+.tab-new {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 28px;
   height: 28px;
   flex: 0 0 auto;
+  margin: 0 0 4px 6px;
   border-radius: 50%;
+  font-size: 17px;
   color: var(--muted);
 }
 
-.tab-new {
-  margin: 0 0 4px 6px;
-  font-size: 17px;
-}
-
-.tab-new:hover,
-.fold:hover {
+.tab-new:hover {
   color: var(--ink);
   background: var(--paper-sunken);
-}
-
-.fold {
-  margin: 0 0 5px 6px;
-}
-
-.fold svg {
-  width: 16px;
-  height: 16px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.5;
-  stroke-linecap: round;
 }
 
 .content {
   display: flex;
   flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  min-width: 0;
-}
-
-/* 通知页 / 个人主页是工作区里的一页：自己管滚动，撑满标签下方的剩余高度 */
-.page-host {
-  display: flex;
   flex: 1;
   min-height: 0;
   min-width: 0;
@@ -380,15 +301,6 @@ async function flip(key: string, enabled: boolean) {
   background: var(--signal-soft);
 }
 
-/* 未启用整条淡下去，但仍可读：它只是"现在不挂给模型"，不是坏了 */
-.card[data-off='true'] {
-  opacity: 0.62;
-}
-
-.card[data-off='true']:hover {
-  opacity: 1;
-}
-
 .open {
   display: grid;
   grid-template-columns: 38px minmax(0, 1fr) auto;
@@ -398,35 +310,6 @@ async function flip(key: string, enabled: boolean) {
   min-width: 0;
   padding: 12px 6px 12px 14px;
   text-align: left;
-}
-
-.open:disabled {
-  cursor: default;
-}
-
-.flip {
-  flex: 0 0 auto;
-  padding: 4px 10px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
-  font-size: var(--t-xs);
-  color: var(--muted);
-  background: var(--paper);
-}
-
-.flip:hover {
-  color: var(--ink);
-  border-color: var(--rule-strong);
-}
-
-/* 已启用：开关是低调的"停用"；未启用：它是这张卡唯一该做的事，给信号色 */
-.flip[aria-pressed='false'] {
-  color: var(--signal);
-  border-color: var(--signal-line);
-}
-
-.flip:disabled {
-  opacity: 0.5;
 }
 
 .card-icon {
@@ -472,12 +355,17 @@ async function flip(key: string, enabled: boolean) {
 }
 
 .state {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   flex: 0 0 auto;
   font-size: var(--t-xs);
   color: var(--signal);
 }
 
-.card[data-off='true'] .state {
+.none {
+  margin-top: var(--s4);
+  font-size: var(--t-xs);
   color: var(--muted);
 }
 

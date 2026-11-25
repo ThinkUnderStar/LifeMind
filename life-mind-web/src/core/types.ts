@@ -238,13 +238,13 @@ export interface FeedbackRecord {
 
 /**
  * 工作区里的一张页面，和对话区互不掺和。
- * kind=plugin 时 pluginKey 为 null 就是空白页：列出能打开的插件，点一个在本页就地打开；
- * kind=notice / profile 是通知页与个人主页，和插件页共用同一排标签、同一套开合。
+ * 只有一种 kind：plugin；pluginKey 为 null 就是空白页，列出能打开的插件，点一个在本页就地打开。
+ * 左栏里的插件服务库、通知、意见反馈、个人主页都是顶层独立界面，不在这里开标签。
  * 同一个插件可以开多页，所以 key 是本地序号而不是 plugin key。
  */
 export interface WorkspacePage {
   key: string
-  kind: 'plugin' | 'notice' | 'profile' | 'feedback'
+  kind: 'plugin'
   pluginKey: string | null
   label: string
   /** 插件面板内的分段，切走再切回来要还原 */

@@ -655,7 +655,9 @@ async def gate(state: State) -> Dict:
     """
     human_message = state.messages[-1]
     gate_llm = GateLlmManager.get_gate_llm()
-    output = await gate_llm.ainvoke(human_message)
+    # langchain_core 1.x 起 ainvoke 只接受 PromptValue / str / list[BaseMessage]，
+    # 单个 BaseMessage 会抛 ValueError（Invalid input type）。这里必须包成 list。
+    output = await gate_llm.ainvoke([human_message])
 
     return {"type": output.type}
 
@@ -791,7 +793,8 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
     task_list = state.task_list
 
     planner_llm = PlannerLlmManager.get_planner_llm()
-    output = await planner_llm.ainvoke(state.messages[-1])
+    # 同 gate：langchain_core 1.x 只接受 list[BaseMessage]，单个消息对象会报错
+    output = await planner_llm.ainvoke([state.messages[-1]])
 
     # 添加任务
     async with session_scope() as db:

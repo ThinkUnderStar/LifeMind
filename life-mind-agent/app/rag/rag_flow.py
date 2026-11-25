@@ -57,7 +57,13 @@ async def rag_search(question: str, collection_name: str) -> List[Document]:
         vector_field="vector",
         connection_args={
             "uri": settings.MILVUS_URI,
-            "token": settings.MILVUS_TOKEN,
+            # 不能用 token：langchain 的 Milvus 会按「地址 + user」复用已有连接，
+            # 而进程里已注册了一个同地址、user='' 的 AsyncMilvusClient 连接（async alias）。
+            # 用 token 时 user 为空，会复用那条异步连接，同步调用 describe_collection
+            # 拿到 coroutine 直接崩。拆成 user/password 让 user='root'，匹配不到异步
+            # 连接，才会新建一条独立的同步连接。
+            "user": settings.MILVUS_TOKEN.split(":", 1)[0],
+            "password": settings.MILVUS_TOKEN.split(":", 1)[1],
             "db_name": settings.MILVUS_DB_NAME
         },
     )
@@ -93,8 +99,14 @@ async def rag_search(question: str, collection_name: str) -> List[Document]:
         logger.info("rag 无候选且未开兜底 collection=%s", collection_name)
         return []
 
-    # 精排只在候选上跑：交叉编码器逐条推理，条数直接决定耗时
-    reranked = await RerankManager.get_reranker().acompress_documents(candidates, question)
+    # 精排只在候选上跑：交叉编码器逐条推理，条数直接决定耗时。
+    # 运行期推理失败（缺依赖 / 权重损坏 / CUDA 异常）也降级为原序，不能让
+    # 召回这一增强环节把整轮对话拖垮——get_reranker() 里已兜住构建期失败。
+    try:
+        reranked = await RerankManager.get_reranker().acompress_documents(candidates, question)
+    except Exception as e:
+        logger.warning("精排推理失败，降级为向量原序：%s: %s", type(e).__name__, e)
+        reranked = candidates[: settings.RERANKER_TOP_N]
     # 精排的 top_n 是"保留几条候选"，这里是"最终给模型几条"，两者不同：
     # 前者给人工复查留余量，后者直接决定上下文长度
     result = reranked[: settings.RETRIEVE_FINAL_TOP_K]

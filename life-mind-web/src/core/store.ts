@@ -3,7 +3,7 @@
  * 一个 reactive 对象加一组函数就够，多引一个库只是多一层要学的东西。
  *
  * 分工会被反复用到，先说清：
- * - 这里只管「对话与外壳」的状态：会话、消息、流、确认卡、右侧工作区的页面组。
+ * - 这里只管「对话与外壳」的状态：会话、消息、流、确认卡、右侧工作区的页面组、顶层独立页。
  * - **面板里的业务数据不归这里管**。日程的列表、统计、系列都由面板组件自己拉，
  *   store 只递增 `panelEpoch` 通知它「数据可能变了」。这样加一个插件不必改 store。
  */
@@ -54,12 +54,6 @@ const nextKey = () => `t-${++seq}`
 let pageSeq = 0
 const nextPageKey = () => `page-${++pageSeq}`
 const blankPage = (): WorkspacePage => ({ key: nextPageKey(), kind: 'plugin', pluginKey: null, label: '新页面' })
-const staticPage = (kind: 'notice' | 'profile' | 'feedback', label: string): WorkspacePage => ({
-  key: nextPageKey(),
-  kind,
-  pluginKey: null,
-  label,
-})
 const firstPage = blankPage()
 
 export const state = reactive({
@@ -67,6 +61,14 @@ export const state = reactive({
   authed: false,
   /** 登录用的用户名，只用来在侧栏显示一句「谁在用」，JWT 里没有昵称 */
   account: localStorage.getItem(ACCOUNT_KEY) || '',
+
+  /**
+   * 顶层界面。chat = 左栏 + 对话 + 右工作区；另外四个是左栏入口对应的独立整页。
+   * 五者互斥：进独立页时对话侧整块收起，退回后原样恢复（会话、工作区页都还在）。
+   * 规则：从左栏（功能区块与账号菜单）进去的，一律是独立页，不占工作区标签。
+   * 不持久化：刷新回到对话，避免停在已经不是工作区一页的页面上。
+   */
+  mainView: 'chat' as 'chat' | 'plugins' | 'notice' | 'feedback' | 'profile',
 
   sessions: [] as Conversation[],
   /** 会话栏当前看哪一类：正常会话 / 已归档。后端按 archived 参数过滤，前端不自己筛 */
@@ -89,7 +91,7 @@ export const state = reactive({
   /**
    * 右侧工作区：一组浏览器式的页面，默认收起但随时能主动打开。
    * 空白页列出可打开的插件，点一个就在当前页打开；也能新建页再开另一个。
-   * 通知也是这里的一页（kind=notice），不再顶掉中间的对话。
+   * 这里只放插件面板：左栏里的通知、意见反馈、个人主页、插件服务库都是独立界面，不占标签。
    */
   workspaceOpen: localStorage.getItem(PANEL_OPEN_KEY) === '1',
   workspacePages: [firstPage] as WorkspacePage[],
@@ -181,6 +183,7 @@ export function logout() {
   state.noticeList = []
   state.noticeUnread = 0
   state.plugins = []
+  state.mainView = 'chat'
   const fresh = blankPage()
   state.workspacePages = [fresh]
   state.workspacePage = fresh.key
@@ -203,10 +206,51 @@ export async function togglePlugin(pluginKey: string, enabled: boolean): Promise
   try {
     await setPluginEnabled(pluginKey, enabled)
     state.plugins = state.plugins.map((p) => (p.pluginKey === pluginKey ? { ...p, enabled } : p))
-    toast(enabled ? '已启用' : '已停用')
+    // 解绑后工作区不该再留这个插件的页：把已开的同名页关掉，免得停用的服务还摆在标签栏里
+    if (!enabled) closePluginPages(pluginKey)
+    toast(enabled ? '已绑定' : '已解绑')
   } catch (error) {
     toast(messageOf(error), 'error')
   }
+}
+
+/** 关掉工作区里某个插件的全部页；一张都不剩就补张空白页，不留空壳 */
+function closePluginPages(pluginKey: string) {
+  const kept = state.workspacePages.filter((p) => !(p.kind === 'plugin' && p.pluginKey === pluginKey))
+  if (!kept.length) {
+    const blank = blankPage()
+    state.workspacePages = [blank]
+    state.workspacePage = blank.key
+  } else {
+    state.workspacePages = kept
+    if (!kept.some((p) => p.key === state.workspacePage)) state.workspacePage = kept[0].key
+  }
+  syncPage()
+  state.panelEpoch += 1
+}
+
+/** 左栏四个功能入口：都切顶层独立页，不占工作区标签、不顶掉正在看的对话 */
+export function openPluginLibrary() {
+  state.mainView = 'plugins'
+}
+
+/** 通知进页时拉一次列表；弹窗队列与它无关，照常轮询 */
+export function openNotice() {
+  state.mainView = 'notice'
+  void loadNoticeList()
+}
+
+export function openFeedback() {
+  state.mainView = 'feedback'
+}
+
+/** 左栏底部账号菜单进个人主页 */
+export function openProfile() {
+  state.mainView = 'profile'
+}
+
+export function backToChat() {
+  state.mainView = 'chat'
 }
 
 /* =========================== 工作区页面 =========================== */
@@ -341,6 +385,12 @@ export function openServicePage(key: string, tab?: string) {
     toast('这个插件还没有做出来')
     return
   }
+  // 解绑的服务不进工作区：agent 仍可能推 ui 帧过来，这里挡在入口，不然停用的插件又被打开
+  const info = state.plugins.find((p) => p.pluginKey === key)
+  if (info && !info.enabled) {
+    toast(`「${manifest.name}」已解绑，可在插件服务库里重新绑定`)
+    return
+  }
   const page = currentPage()
   if (page && page.kind === 'plugin' && !page.pluginKey) {
     page.pluginKey = key
@@ -363,53 +413,6 @@ export function openServicePage(key: string, tab?: string) {
   state.workspaceOpen = true
   persistPanelOpen()
   syncPage()
-}
-
-/**
- * 打开通知 / 个人主页这类「固定页」：都是工作区的一页，不是插件。
- * 已有同一类页就切过去；当前正好是空白插件页就就地变身；否则新开一页。
- */
-function openStaticPage(kind: 'notice' | 'profile' | 'feedback', label: string) {
-  const existing = state.workspacePages.find((p) => p.kind === kind)
-  if (existing) {
-    if (state.workspacePage !== existing.key) selectWorkspacePage(existing.key)
-  } else {
-    // 空白页就地变成这一页，免得白占一张标签
-    const page = currentPage()
-    if (page && page.kind === 'plugin' && !page.pluginKey) {
-      savePage()
-      page.kind = kind
-      page.label = label
-      page.tab = undefined
-      page.params = {}
-      syncPage()
-    } else {
-      savePage()
-      const fresh = staticPage(kind, label)
-      state.workspacePages.push(fresh)
-      state.workspacePage = fresh.key
-      syncPage()
-    }
-    state.panelEpoch += 1
-  }
-  state.workspaceOpen = true
-  persistPanelOpen()
-}
-
-/** 通知从铃铛进，作为工作区的一页：中间对话照旧，不再被通知页顶掉 */
-export function openNoticeWorkspace() {
-  openStaticPage('notice', '通知')
-  void loadNoticeList()
-}
-
-/** 左侧栏底部的账号：个人主页也是工作区的一页，对话不被顶掉 */
-export function openProfileWorkspace() {
-  openStaticPage('profile', '个人主页')
-}
-
-/** 意见反馈：从个人主页底部进来，同样是一页，不弹窗、不遮对话 */
-export function openFeedbackWorkspace() {
-  openStaticPage('feedback', '意见反馈')
 }
 
 /* =========================== 会话 =========================== */
@@ -448,6 +451,9 @@ export async function switchSessionView(view: 'active' | 'archived'): Promise<vo
  * 不会出现多条空会话。
  */
 export async function newSession(): Promise<void> {
+  // 左栏是全局导航：在插件库/通知页点「新对话」要回对话视图，否则界面没反应
+  state.mainView = 'chat'
+
   // 归档视图里点新对话，先切回正常视图才能看到稍后创建的会话
   if (state.sessionView === 'archived') {
     state.sessionView = 'active'
@@ -486,6 +492,8 @@ export async function clearConversation(id: number): Promise<void> {
 }
 
 export async function openSession(id: number): Promise<void> {
+  // 左栏是全局导航：在插件库/通知页点某条会话要回对话视图，否则主区域停在独立页
+  state.mainView = 'chat'
   if (state.streaming) stop()
   state.sessionId = id
   state.messages = []

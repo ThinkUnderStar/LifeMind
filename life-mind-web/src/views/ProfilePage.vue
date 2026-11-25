@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 个人主页。住在右侧工作区，从左侧栏底部的账号进入。
+ * 个人主页。左栏底部账号进入的独立整页，不占工作区标签、不顶掉正在看的对话。
  *
  * 资料以 `GET /user/profile` 为准（昵称、绑定情况、头像都是账号服务里的真实数据），
  * 不再拿登录时记的账户名充数。
@@ -9,7 +9,8 @@
  * 是另一条链路，这里只展示当前绑定状态，不做半截的入口。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { logout, openFeedbackWorkspace, setAccount, toast } from '../core/store'
+import { backToChat, logout, openFeedback, setAccount, toast } from '../core/store'
+import ChevronIcon from '../components/ChevronIcon.vue'
 import * as userApi from '../api/user'
 import * as authApi from '../api/auth'
 import type { UserProfile } from '../api/user'
@@ -327,6 +328,13 @@ async function pickAvatar(event: Event) {
 
 <template>
   <section class="profile">
+    <header class="head">
+      <button class="back" type="button" @click="backToChat">
+        <ChevronIcon dir="left" :size="13" />回到对话
+      </button>
+      <h1>个人主页</h1>
+    </header>
+
     <p v-if="loading" class="hint">读取中…</p>
     <div v-else-if="failed" class="hint">
       {{ failed }}
@@ -538,7 +546,7 @@ async function pickAvatar(event: Event) {
 
       <p v-if="editing === 'username'" class="note">账户名是登录名，改完下次登录要用新名字；一年只能改一次。</p>
 
-      <button class="feedback-link" type="button" @click="openFeedbackWorkspace">意见反馈</button>
+      <button class="feedback-link" type="button" @click="openFeedback">意见反馈</button>
 
       <div class="signout">
         <button class="quit" type="button" @click="logout">退出登录</button>
@@ -560,6 +568,39 @@ async function pickAvatar(event: Event) {
   min-width: 0;
   overflow-y: auto;
   padding: var(--s5) var(--s4) var(--s6);
+}
+
+.head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: var(--s5);
+}
+
+.head h1 {
+  font-size: 21px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.back {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 7px 14px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+
+.back:hover {
+  color: var(--ink);
+  border-color: var(--rule-strong);
 }
 
 .hint {
@@ -804,5 +845,16 @@ async function pickAvatar(event: Event) {
 
 .note.warn {
   color: var(--alert);
+}
+
+@media (max-width: 720px) {
+  .profile {
+    padding: var(--s5) var(--s4);
+  }
+
+  .head {
+    flex-direction: column;
+    gap: var(--s3);
+  }
 }
 </style>

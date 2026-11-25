@@ -1,14 +1,15 @@
 <script setup lang="ts">
 /**
- * 通知页。现在住在右侧工作区里（工作区的一页），顶栏铃铛打开；
+ * 通知页。与「对话 + 工作区」「插件服务库」并列的第三个顶层界面，由左栏功能区块进入；
  * 和右下角弹窗是两回事：弹窗只管「到点打断一下」，这里是主动回看全部通知的地方。
- * 所以版式按窄栏设计：标题小一号、左右留白收紧，工作区拉宽时也不会散。
+ * 版式按整页设计：宽屏内容居中、左右留白充足，窄屏收成单栏。
  *
  * 未读筛选在前端做——后端 page 接口支持 isRead 参数，但列表只有 30 条，
  * 切筛选时重新请求反而会丢掉刚标已读的本地状态；一页数据量小，本地筛更稳。
  */
 import { computed, ref } from 'vue'
-import { loadNoticeList, readAllNotices, readNotice, state } from '../core/store'
+import { backToChat, loadNoticeList, readAllNotices, readNotice, state } from '../core/store'
+import ChevronIcon from '../components/ChevronIcon.vue'
 
 const filter = ref<'all' | 'unread'>('all')
 
@@ -44,11 +45,18 @@ function timeText(raw: string | null): string {
   <section class="notice-page">
     <div class="inner">
       <header class="head">
+        <button class="back" type="button" @click="backToChat">
+          <ChevronIcon dir="left" :size="13" />回到对话
+        </button>
         <div>
           <h1>通知</h1>
-          <p v-if="state.noticeUnread" class="lede">{{ state.noticeUnread }} 条未读</p>
-          <p v-else class="lede">都读完了</p>
+          <p class="lede">日程提醒、反馈回复和系统消息都在这里。</p>
         </div>
+      </header>
+
+      <div class="subhead">
+        <p v-if="state.noticeUnread" class="lede">{{ state.noticeUnread }} 条未读</p>
+        <p v-else class="lede">都读完了</p>
         <button
           v-if="state.noticeUnread"
           class="btn btn-quiet"
@@ -57,7 +65,7 @@ function timeText(raw: string | null): string {
         >
           全部标为已读
         </button>
-      </header>
+      </div>
 
       <nav class="filter" aria-label="通知筛选">
         <button type="button" :data-on="filter === 'all'" @click="filter = 'all'">全部</button>
@@ -100,38 +108,73 @@ function timeText(raw: string | null): string {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--s5) var(--s4) var(--s6);
+  padding: var(--s6) var(--s6) var(--s7);
+  background: var(--paper);
 }
 
 .inner {
   width: 100%;
-  max-width: 760px;
+  max-width: 980px;
   margin: 0 auto;
 }
 
 .head {
   display: flex;
   align-items: flex-start;
-  justify-content: space-between;
+  justify-content: flex-start;
   flex-wrap: wrap;
-  gap: var(--s3);
-  padding-bottom: var(--s4);
-  border-bottom: 1px solid var(--rule);
+  gap: var(--s5);
 }
 
 .head h1 {
-  font-size: 20px;
+  font-size: 21px;
   font-weight: 500;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
+  color: var(--ink);
 }
 
 .lede {
-  margin-top: 4px;
+  margin-top: 7px;
   font-size: var(--t-xs);
+  line-height: 1.7;
   color: var(--muted);
 }
 
-.head .btn-quiet {
+.back {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 7px 14px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+
+.back:hover {
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+.subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--s3);
+  margin-top: var(--s5);
+  padding-bottom: var(--s3);
+  border-bottom: 1px solid var(--rule);
+}
+
+.subhead .lede {
+  margin-top: 0;
+}
+
+.subhead .btn-quiet {
   padding: 6px 12px;
   font-size: var(--t-xs);
 }
@@ -188,7 +231,7 @@ function timeText(raw: string | null): string {
 .list button {
   display: block;
   width: 100%;
-  padding: 12px 8px;
+  padding: 14px 12px;
   text-align: left;
   transition: background var(--dur) var(--ease);
 }
@@ -237,5 +280,16 @@ function timeText(raw: string | null): string {
   color: var(--muted);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .notice-page {
+    padding: var(--s5) var(--s4);
+  }
+
+  .head {
+    flex-direction: column;
+    gap: var(--s3);
+  }
 }
 </style>

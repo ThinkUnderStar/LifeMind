@@ -12,8 +12,12 @@ RAG 组件族。
 配置被 Nacos 热更新后签名变化，下次获取自动重建实例；签名不变则复用。
 因此这些类都不需要额外的 init / refresh 方法。
 """
+import logging
 import re
-from typing import Dict
+from typing import Dict, Sequence
+
+from langchain_core.documents import Document
+from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_classic.embeddings import CacheBackedEmbeddings
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker, LLMChainExtractor
 from langchain_classic.storage import LocalFileStore
@@ -21,6 +25,40 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from app.core.settings import settings
+
+
+def _rerank_device() -> str:
+    """有 CUDA 用显卡，没有就退 CPU。
+
+    环境装的是 CPU 版 torch 时 torch.cuda.is_available() 为 False，
+    写死 cuda 会让交叉编码器一加载就崩，把会话召回整条链路拖垮。
+    """
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+logger = logging.getLogger(__name__)
+
+
+class PassthroughReranker(BaseDocumentCompressor):
+    """精排降级器：不做交叉编码打分，按向量相似度原序保留前 top_n 条。
+
+    交叉编码器要 sentence-transformers + torch，缺依赖或权重加载失败时整轮对话会被
+    拖垮。召回是增强环节，宁可退回"向量原序"也不能让对话失败——多查询与阈值过滤
+    已经在前面筛过一轮，原序仍是可用的候选。
+    """
+
+    top_n: int = 10
+
+    def compress_documents(
+        self,
+        documents: Sequence[Document],
+        query: str,
+        callbacks=None,
+    ) -> Sequence[Document]:
+        return list(documents[: self.top_n])
 
 
 class TextSplitterManager:
@@ -125,17 +163,19 @@ class RerankManager:
     """
 
     # 缓存：{ (重排模型名, 保留条数): 重排器实例 }
-    _cache: Dict[tuple[str, int], CrossEncoderReranker] = {}
+    _cache: Dict[tuple[str, int], BaseDocumentCompressor] = {}
 
     @classmethod
-    def get_reranker(cls) -> CrossEncoderReranker:
+    def get_reranker(cls) -> BaseDocumentCompressor:
         """
         获取当前配置对应的重排器。
 
         签名是 (模型名, top_n)：换模型要重新加载权重，改保留条数也要重建实例。
+        交叉编码器构建失败（缺 sentence-transformers / torch、权重加载异常、无 CUDA）
+        时降级为 PassthroughReranker，保证召回不拖垮整轮对话。
 
         Returns:
-            CrossEncoderReranker: 绑定了 HuggingFace 交叉编码器的本地重排器。
+            BaseDocumentCompressor: 交叉编码器重排器，或降级后的原序保留器。
         """
         sig = (
             settings.RERANKER_MODEL,
@@ -143,16 +183,25 @@ class RerankManager:
         )
 
         if sig not in cls._cache:
-            reranker = CrossEncoderReranker(
-                model = HuggingFaceCrossEncoder(
-                    # 本地加载的交叉编码器，真正读权重发生在第一次推理时
-                    model_name=settings.RERANKER_MODEL,
-                    # 推理设备写死 cuda：没有可用显卡会直接报错，届时改成 cpu
-                    model_kwargs={"device": "cuda"}
-                ),
-                # 重排后保留几条，直接决定后续送进 LLM 的上下文长度
-                top_n=settings.RERANKER_TOP_N,
-            )
+            try:
+                reranker = CrossEncoderReranker(
+                    model=HuggingFaceCrossEncoder(
+                        # 本地加载的交叉编码器，真正读权重发生在第一次推理时
+                        model_name=settings.RERANKER_MODEL,
+                        # 有显卡走 cuda，CPU 版 torch 自动退 cpu，不让设备选择拖垮召回
+                        model_kwargs={"device": _rerank_device()}
+                    ),
+                    # 重排后保留几条，直接决定后续送进 LLM 的上下文长度
+                    top_n=settings.RERANKER_TOP_N,
+                )
+            except Exception as e:
+                # 构建阶段就失败（如缺依赖），降级；权重加载异常在首次推理时才抛，
+                # 由 rag_flow 的调用侧兜底，这里只覆盖能即时发现的错误。
+                logger.warning(
+                    "交叉编码器加载失败，精排降级为向量原序：%s: %s",
+                    type(e).__name__, e,
+                )
+                reranker = PassthroughReranker(top_n=settings.RERANKER_TOP_N)
 
             # 整体替换而非新增，缓存只留当前配置一份
             cls._cache = {sig: reranker}

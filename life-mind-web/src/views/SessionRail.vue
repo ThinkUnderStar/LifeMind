@@ -7,14 +7,77 @@
  * 行底必须比未选行肉眼可辨：原来借 --signal-soft 只有 2% 亮度差，
  * 等于只靠竖条区分，扫一眼分不出当前是哪条。
  */
-import { computed, ref } from 'vue'
-import { loadSessions, newSession, openSession, state, switchSessionView, toast } from '../core/store'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import {
+  loadSessions,
+  logout,
+  newSession,
+  openFeedback,
+  openNotice,
+  openPluginLibrary,
+  openProfile,
+  openSession,
+  state,
+  switchSessionView,
+  toast,
+} from '../core/store'
+import { applyTheme, currentTheme, THEMES, type ThemeKey } from '../core/theme'
+import ChevronIcon from '../components/ChevronIcon.vue'
 import * as sessionApi from '../api/session'
 import { parseDateTime, relativeDayText } from '../core/date'
-
-const emit = defineEmits<{ (e: 'open-profile'): void }>()
+import brandLogo from '../assets/brand/lifemind-logo.png'
 
 const busy = ref(false)
+
+/* ---------------- 顶部功能区块 ---------------- */
+
+/** 左栏三个功能入口都切顶层独立页，和会话列表互不影响 */
+function goPlugins() {
+  openPluginLibrary()
+}
+
+function goNotice() {
+  openNotice()
+}
+
+function goFeedback() {
+  openFeedback()
+}
+
+/* ---------------- 栏底账号菜单 ---------------- */
+
+const accountOpen = ref(false)
+const themeOpen = ref(false)
+const theme = ref<ThemeKey>(currentTheme())
+
+function chooseTheme(key: ThemeKey) {
+  theme.value = key
+  applyTheme(key)
+  themeOpen.value = false
+  accountOpen.value = false
+}
+
+function goProfile() {
+  accountOpen.value = false
+  themeOpen.value = false
+  openProfile()
+}
+
+function doLogout() {
+  accountOpen.value = false
+  themeOpen.value = false
+  logout()
+}
+
+function onDocClick(event: MouseEvent) {
+  if (!(event.target as HTMLElement).closest('.me-wrap')) {
+    accountOpen.value = false
+    themeOpen.value = false
+  }
+}
+
+onMounted(() => document.addEventListener('click', onDocClick))
+onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
 
 /**
  * 改名。用双击标题而不是再加一个按钮：会话行只有 34px 高，
@@ -114,6 +177,39 @@ function whenOf(raw: string | null): string {
 
 <template>
   <aside class="rail">
+    <!-- 品牌收在左栏顶部：不横跨整个界面，主区域从上到下就是左右两块 -->
+    <div class="brand">
+      <img class="mark" :src="brandLogo" alt="" />
+      <span class="name">LifeMind</span>
+    </div>
+
+    <!-- 功能区块：和会话列表分开的一组入口，三个入口各自打开一个独立整页 -->
+    <nav class="functions" aria-label="功能">
+      <button
+        class="fn"
+        type="button"
+        :data-on="state.mainView === 'plugins'"
+        @click="goPlugins"
+      >
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 4h6v5H3zM11 4h6v5h-6zM3 11h6v5H3zM11 11h6v5h-6z" /></svg>
+        <span>插件服务库</span>
+      </button>
+      <button
+        class="fn"
+        type="button"
+        :data-on="state.mainView === 'notice'"
+        @click="goNotice"
+      >
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a4.5 4.5 0 0 0-4.5 4.5v3L4 12.5h12L14.5 10V7A4.5 4.5 0 0 0 10 2.5ZM8.2 15a2 2 0 0 0 3.6 0" /></svg>
+        <span>通知</span>
+        <span v-if="state.noticeUnread" class="fn-badge">{{ state.noticeUnread > 99 ? '99+' : state.noticeUnread }}</span>
+      </button>
+      <button class="fn" type="button" :data-on="state.mainView === 'feedback'" @click="goFeedback">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3c4 0 7 2.3 7 5.2S14 13.4 10 13.4c-.8 0-1.5-.1-2.2-.3L4 15l1-3c-1.2-1-2-2.4-2-3.8C3 5.3 6 3 10 3Z" /></svg>
+        <span>意见反馈</span>
+      </button>
+    </nav>
+
     <div class="rail-head">
       <h2 class="title">
         <button
@@ -187,11 +283,70 @@ function whenOf(raw: string | null): string {
       {{ isArchivedView ? '还没有归档的会话。' : '还没有会话。点「新对话」，或者直接在中间说一句你要安排的事。' }}
     </p>
 
-    <!-- 栏底的账号：点开是工作区里的个人主页，不顶掉当前对话。只留头像和名字，不加任何提示字样 -->
-    <button class="me" type="button" title="个人主页" @click="emit('open-profile')">
-      <span class="me-avatar">{{ initial }}</span>
-      <span class="me-name">{{ state.account || '已登录' }}</span>
-    </button>
+    <!-- 栏底账号：主题切换 / 个人主页 / 退出都收在这里；个人主页是独立整页，不占工作区标签 -->
+    <div class="me-wrap">
+      <button
+        class="me"
+        type="button"
+        :aria-expanded="accountOpen"
+        title="账号与设置"
+        @click="accountOpen = !accountOpen"
+      >
+        <span class="me-avatar">{{ initial }}</span>
+        <span class="me-name">{{ state.account || '已登录' }}</span>
+      </button>
+
+      <div v-if="accountOpen" class="me-pop">
+        <div class="me-pop-head">
+          <span class="me-avatar large">{{ initial }}</span>
+          <span class="me-pop-id">{{ state.account || '已登录' }}</span>
+        </div>
+
+        <!-- 主题色收成一条入口，点开再弹子菜单，不让三个色块平铺占满账号菜单 -->
+        <button
+          class="me-pop-item has-sub"
+          type="button"
+          :aria-expanded="themeOpen"
+          @click="themeOpen = !themeOpen"
+        >
+          <span class="swatch" :style="{ background: THEMES.find((t) => t.key === theme)?.color }"></span>
+          <span>主题色</span>
+          <span class="sub-current">{{ THEMES.find((t) => t.key === theme)?.name }}</span>
+          <ChevronIcon dir="right" :size="13" />
+        </button>
+
+        <button
+          class="me-pop-item"
+          type="button"
+          :data-on="state.mainView === 'profile'"
+          @click="goProfile"
+        >个人主页</button>
+        <button class="me-pop-item danger" type="button" @click="doLogout">退出登录</button>
+      </div>
+
+      <!-- 主题色子菜单：从账号菜单右侧弹出，选完两层的关掉 -->
+      <div v-if="accountOpen && themeOpen" class="theme-menu" role="menu" aria-label="主题色">
+        <button class="theme-menu-back" type="button" @click="themeOpen = false">
+          <ChevronIcon dir="left" :size="13" />主题色
+        </button>
+        <button
+          v-for="item in THEMES"
+          :key="item.key"
+          class="theme-menu-item"
+          type="button"
+          role="menuitemradio"
+          :aria-checked="theme === item.key"
+          :data-on="theme === item.key"
+          @click="chooseTheme(item.key)"
+        >
+          <span class="swatch" :style="{ background: item.color }"></span>
+          <span class="theme-menu-name">{{ item.name }}</span>
+          <svg v-if="theme === item.key" class="tick" viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M4 10.5l4 4 8-9" />
+          </svg>
+        </button>
+      </div>
+    </div>
   </aside>
 </template>
 
@@ -201,6 +356,90 @@ function whenOf(raw: string | null): string {
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--rule);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  height: 60px;
+  padding: 0 var(--s4);
+  border-bottom: 1px solid var(--rule);
+}
+
+.mark {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+}
+
+.name {
+  font-family: 'Segoe Script', 'Brush Script MT', cursive;
+  font-size: 21px;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
+/* 功能区块：一条一个入口，排在会话列表上方、和会话用分隔线隔开 */
+.functions {
+  display: grid;
+  gap: 2px;
+  flex: 0 0 auto;
+  padding: var(--s2);
+  border-bottom: 1px solid var(--rule);
+}
+
+.fn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--r-lg);
+  font-size: var(--t-sm);
+  color: var(--ink-soft);
+  text-align: left;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+.fn:hover {
+  background: var(--paper-sunken);
+  color: var(--ink);
+}
+
+/* 插件服务库是顶层视图，进去时这一条点亮，和会话选中态同款语言 */
+.fn[data-on='true'] {
+  color: var(--ink);
+  background: var(--row-active);
+  font-weight: 500;
+}
+
+.fn svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.fn-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  margin-left: auto;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--signal);
+  color: var(--on-signal);
+  font-size: 10px;
+  line-height: 1;
 }
 
 .rail-head {
@@ -257,6 +496,12 @@ function whenOf(raw: string | null): string {
   flex: 1;
   overflow-y: auto;
   padding: var(--s2);
+}
+
+/* 空态也要吃掉剩余高度，才能把栏底的账号条顶下去；否则没会话时它会紧跟在提示文字后面。
+   视觉（字号/内距/颜色）沿用全局 .empty，这里只补布局。 */
+.empty {
+  flex: 1;
 }
 
 /* 骨架占位：和真实行等高（约 34px），切换时高度不跳 */
@@ -423,19 +668,25 @@ function whenOf(raw: string | null): string {
 }
 
 /* 栏底账号：一行到底，只有头像和名字，不加箭头和提示字样 */
+.me-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  margin: 0 var(--s2) var(--s2);
+}
+
 .me {
   display: flex;
   align-items: center;
   gap: 9px;
-  flex: 0 0 auto;
-  margin: 0 var(--s2) var(--s2);
+  width: 100%;
   padding: 8px 10px;
   border-radius: var(--r-lg);
   text-align: left;
   transition: background var(--dur) var(--ease);
 }
 
-.me:hover {
+.me:hover,
+.me[aria-expanded='true'] {
   background: var(--paper-sunken);
 }
 
@@ -454,6 +705,12 @@ function whenOf(raw: string | null): string {
   line-height: 1;
 }
 
+.me-avatar.large {
+  width: 34px;
+  height: 34px;
+  font-size: var(--t-sm);
+}
+
 .me-name {
   flex: 1;
   min-width: 0;
@@ -462,5 +719,167 @@ function whenOf(raw: string | null): string {
   white-space: nowrap;
   font-size: var(--t-sm);
   color: var(--ink-soft);
+}
+
+/* 账号菜单：贴着账号条上方浮起来，宽度跟着左栏 */
+.me-pop {
+  position: absolute;
+  z-index: var(--z-pop);
+  left: 0;
+  bottom: calc(100% + 6px);
+  width: 100%;
+  min-width: 190px;
+  padding: 6px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-md);
+  background: var(--paper-raised);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 12%);
+}
+
+.me-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 6px 10px;
+}
+
+.me-pop-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-sm);
+  color: var(--ink);
+}
+
+/* 主题色入口：账号菜单里只占一行，显示当前档位和右箭头，点开再弹子菜单 */
+.me-pop-item.has-sub {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 0;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  border-radius: 0;
+}
+
+.me-pop-item.has-sub:hover,
+.me-pop-item.has-sub[aria-expanded='true'] {
+  color: var(--ink);
+  background: var(--paper-sunken);
+}
+
+.me-pop-item.has-sub :deep(svg) {
+  color: var(--muted-soft);
+}
+
+.sub-current {
+  margin-left: auto;
+  font-size: var(--t-xs);
+  color: var(--muted-soft);
+}
+
+/* 子菜单：贴在账号菜单右侧、底边对齐，不盖住会话列表 */
+.theme-menu {
+  position: absolute;
+  z-index: var(--z-pop);
+  left: calc(100% + 6px);
+  bottom: calc(100% + 6px);
+  width: 176px;
+  padding: 6px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-md);
+  background: var(--paper-raised);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 12%);
+}
+
+.theme-menu-back {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 6px 6px 9px;
+  border-bottom: 1px solid var(--rule);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  text-align: left;
+}
+
+.theme-menu-back:hover {
+  color: var(--ink);
+}
+
+.theme-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 6px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-sm);
+  color: var(--ink-soft);
+  text-align: left;
+}
+
+.theme-menu-item:first-of-type {
+  margin-top: 4px;
+}
+
+.theme-menu-item:hover {
+  background: var(--paper-sunken);
+}
+
+.theme-menu-item[data-on='true'] {
+  color: var(--signal);
+  background: var(--signal-soft);
+}
+
+.theme-menu-name {
+  flex: 1;
+}
+
+.tick {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.swatch {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--rule);
+  border-radius: 50%;
+}
+
+.me-pop-item {
+  display: block;
+  width: 100%;
+  margin-top: 2px;
+  padding: 8px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-sm);
+  color: var(--muted);
+  text-align: left;
+}
+
+.me-pop-item:hover {
+  color: var(--ink);
+  background: var(--paper-sunken);
+}
+
+.me-pop-item[data-on='true'] {
+  color: var(--signal);
+  background: var(--signal-soft);
+}
+
+.me-pop-item.danger:hover {
+  color: var(--alert);
+  background: var(--alert-soft);
 }
 </style>

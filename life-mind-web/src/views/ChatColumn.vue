@@ -8,7 +8,7 @@
  * 是这类界面最烦人的一处。
  */
 import { computed, nextTick, ref, watch } from 'vue'
-import { clearConversation, loadOlder, rewrite, send, state, stop, toast } from '../core/store'
+import { loadOlder, rewrite, send, state, stop, toast } from '../core/store'
 import type { UiMessage } from '../core/store'
 import { listTasks } from '../api/chat'
 import type { AgentTask } from '../core/types'
@@ -96,29 +96,6 @@ watch(() => state.sessionId, () => {
 /** AI 用品牌标，用户用账号首字母——和顶栏头像同一套口径 */
 const userInitial = computed(() => (state.account || '我').trim().charAt(0).toUpperCase())
 
-/** 清空记录两段式：点一次出确认，避免误触抹掉不可恢复的历史 */
-const confirmingClear = ref(false)
-const clearing = ref(false)
-
-// 换会话就把确认态收起来，别让上一条的「确认」留到下一条
-watch(() => state.sessionId, () => {
-  confirmingClear.value = false
-})
-
-async function doClear() {
-  if (state.sessionId === null || clearing.value) return
-  clearing.value = true
-  try {
-    await clearConversation(state.sessionId)
-    confirmingClear.value = false
-    toast('已清空这个会话的记录')
-  } catch (error) {
-    toast(error instanceof Error ? error.message : '清空失败', 'error')
-  } finally {
-    clearing.value = false
-  }
-}
-
 const EXAMPLES = [
   '明天下午三点项目评审，提前半小时提醒我',
   '每周三晚上健身，先来 12 次',
@@ -204,17 +181,19 @@ function autoGrow(event: Event) {
           <template v-else>{{ userInitial }}</template>
         </span>
         <div class="body">
-          <!-- 改写态：这条消息换成输入框，旁边写清「之后的内容会被删掉」 -->
+          <!-- 改写态：行内编辑面板，两个动作收在面板右下角 -->
           <template v-if="rewriting && rewriting.id === message.id">
-            <textarea v-model="rewriting.text" class="rewrite-box" rows="3"></textarea>
-            <div class="rewrite-acts">
-              <span class="warn">这条之后的内容会被删掉，重新回答</span>
-              <button class="btn btn-text" type="button" :disabled="rewritingBusy" @click="cancelRewrite">
-                取消
-              </button>
-              <button class="btn btn-text danger" type="button" :disabled="rewritingBusy" @click="submitRewrite">
-                {{ rewritingBusy ? '重新生成中…' : '就按这句重来' }}
-              </button>
+            <div class="rewrite-panel">
+              <textarea v-model="rewriting.text" class="rewrite-box" rows="3"></textarea>
+              <div class="rewrite-acts">
+                <span class="warn">会删掉这条之后的内容，重新生成</span>
+                <button class="btn btn-text" type="button" :disabled="rewritingBusy" @click="cancelRewrite">
+                  取消
+                </button>
+                <button class="btn btn-primary" type="button" :disabled="rewritingBusy" @click="submitRewrite">
+                  {{ rewritingBusy ? '重新生成中…' : '重新生成' }}
+                </button>
+              </div>
             </div>
           </template>
 
@@ -222,15 +201,20 @@ function autoGrow(event: Event) {
             <template v-if="message.content">{{ message.content }}</template>
             <span v-else-if="message.streaming" class="thinking">正在想办法…</span>
             <span v-if="message.streaming && message.content" class="caret" aria-hidden="true"></span>
-            <button
-              v-if="message.role === 'user' && message.id !== null && !state.streaming"
-              class="rewrite"
-              type="button"
-              title="改写这句话，从这一句重新生成"
-              @click="startRewrite(message)"
-            >
-              改写
-            </button>
+            <!-- 改写入口：悬停出现的细线铅笔图标，收在消息下方右侧 -->
+            <div v-if="message.role === 'user' && message.id !== null && !state.streaming" class="rewrite-bar">
+              <button
+                class="rewrite-icon"
+                type="button"
+                title="改写这句话，从这一句重新生成"
+                aria-label="改写这句话"
+                @click="startRewrite(message)"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M4 16h4l8-8-4-4-8 8v4ZM11.5 4.5l4 4" />
+                </svg>
+              </button>
+            </div>
           </template>
         </div>
       </article>
@@ -267,27 +251,6 @@ function autoGrow(event: Event) {
           </button>
         </div>
 
-        <!-- 清空记录放在对话区：它是针对「这一条对话」的动作，跟会话栏的删除/归档不是一回事 -->
-        <div v-if="state.sessionId" class="clear-wrap">
-          <template v-if="confirmingClear">
-            <span class="ask">清空这个会话的全部记录？不可恢复</span>
-            <button class="btn btn-text danger" type="button" :disabled="clearing" @click="doClear">
-              {{ clearing ? '清空中…' : '确认清空' }}
-            </button>
-            <button class="btn btn-text" type="button" :disabled="clearing" @click="confirmingClear = false">
-              取消
-            </button>
-          </template>
-          <button
-            v-else
-            class="btn btn-text"
-            type="button"
-            :disabled="!state.messages.length || state.streaming"
-            @click="confirmingClear = true"
-          >
-            清空记录
-          </button>
-        </div>
       </div>
 
       <!-- 任务清单：它排了哪几步、走到哪了。done 只表示这条结束，不等于成功 -->
@@ -298,7 +261,8 @@ function autoGrow(event: Event) {
         </li>
       </ul>
 
-      <div class="input-row">
+      <!-- 输入框是一整条圆角容器，发送/停止图标收在框内右下角，不再像表单+按钮 -->
+      <div class="input-shell" :data-streaming="state.streaming">
         <textarea
           v-model="draft"
           class="box"
@@ -309,11 +273,25 @@ function autoGrow(event: Event) {
           @input="autoGrow"
         ></textarea>
 
-        <button v-if="state.streaming" class="btn btn-quiet stop" type="button" @click="stop">
-          停止
+        <button
+          v-if="state.streaming"
+          class="send-icon stop"
+          type="button"
+          title="停止生成"
+          aria-label="停止生成"
+          @click="stop"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 6.5h7v7h-7z" /></svg>
         </button>
-        <button v-else class="btn btn-primary" type="submit" :disabled="!draft.trim()">
-          发送
+        <button
+          v-else
+          class="send-icon"
+          type="submit"
+          title="发送（Enter）"
+          aria-label="发送"
+          :disabled="!draft.trim()"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15V5M5.5 9.5 10 5l4.5 4.5" /></svg>
         </button>
       </div>
     </form>
@@ -322,6 +300,7 @@ function autoGrow(event: Event) {
 
 <style scoped>
 .chat {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -332,7 +311,8 @@ function autoGrow(event: Event) {
 .stream {
   flex: 1;
   overflow-y: auto;
-  padding: var(--s7) max(var(--s5), calc((100% - 760px) / 2)) var(--s4);
+  /* 操作组已在中间列顶部单独占一行，这里只留常规上间距 */
+  padding: var(--s6) max(var(--s5), calc((100% - 760px) / 2)) var(--s4);
 }
 
 .intro {
@@ -356,7 +336,6 @@ function autoGrow(event: Event) {
 }
 
 .intro-lede {
-  max-width: 40em;
   margin-top: var(--s4);
   color: var(--ink-soft);
   font-size: var(--t-md);
@@ -364,7 +343,6 @@ function autoGrow(event: Event) {
 }
 
 .examples {
-  max-width: 40em;
   margin-top: var(--s7);
   border-top: 1px solid var(--rule);
 }
@@ -537,33 +515,67 @@ function autoGrow(event: Event) {
   color: var(--ink);
 }
 
-/* 改写入口只在悬停目标那一句时出现：它是「回头改口」的动作，不该抢正常阅读 */
-.rewrite {
-  display: block;
-  margin-top: 5px;
-  font-size: var(--t-xs);
-  color: var(--muted-soft);
+/* 改写入口：悬停才显的小铅笔圆钮，右对齐收在消息下方，不抢正常阅读 */
+.rewrite-bar {
+  display: flex;
+  justify-content: flex-end;
+  height: 26px;
+  margin-top: 2px;
   opacity: 0;
-  transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease);
+  transition: opacity var(--dur) var(--ease);
 }
 
-.turn:hover .rewrite,
-.turn:focus-within .rewrite {
+.turn:hover .rewrite-bar,
+.turn:focus-within .rewrite-bar {
   opacity: 1;
 }
 
-.rewrite:hover {
+.rewrite-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--rule);
+  border-radius: 50%;
+  color: var(--muted);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+.rewrite-icon:hover {
   color: var(--signal);
+  border-color: var(--signal-line);
+  background: var(--signal-soft);
+}
+
+.rewrite-icon svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* 改写面板：圆角纸面行内展开，两个动作收在右下角，和输入框同一套语言 */
+.rewrite-panel {
+  margin-top: var(--s2);
+  padding: var(--s3);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  background: var(--paper-raised);
 }
 
 .rewrite-box {
   display: block;
   width: 100%;
   min-width: 260px;
-  padding: 8px 10px;
-  border: 1px solid var(--rule-strong);
+  padding: 6px 8px;
+  border: 0;
   border-radius: var(--r-md);
-  background: var(--paper);
+  background: transparent;
   font: inherit;
   font-size: var(--t-sm);
   line-height: 1.7;
@@ -572,11 +584,18 @@ function autoGrow(event: Event) {
   white-space: pre-wrap;
 }
 
+.rewrite-box:focus {
+  outline: none;
+}
+
 .rewrite-acts {
   display: flex;
   align-items: center;
-  gap: var(--s3);
-  margin-top: 6px;
+  justify-content: flex-end;
+  gap: var(--s2);
+  margin-top: var(--s2);
+  padding-top: var(--s2);
+  border-top: 1px solid var(--rule);
 }
 
 .rewrite-acts .warn {
@@ -586,13 +605,21 @@ function autoGrow(event: Event) {
 }
 
 .rewrite-acts .btn-text {
-  padding: 0;
+  padding: 6px 12px;
+  border-radius: var(--r-pill);
   font-size: var(--t-xs);
   color: var(--muted);
 }
 
-.rewrite-acts .danger {
-  color: var(--alert);
+.rewrite-acts .btn-text:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--paper-sunken);
+}
+
+.rewrite-acts .btn-primary {
+  padding: 7px 16px;
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
 }
 
 /* 任务清单：一行一步，状态在左、目标在右，长目标换行不撑破 */
@@ -627,96 +654,109 @@ function autoGrow(event: Event) {
   overflow-wrap: anywhere;
 }
 
-.clear-wrap {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  margin-left: auto;
-}
-
-.clear-wrap .btn-text {
-  padding: 0;
-  font-size: var(--t-xs);
-  color: var(--muted);
-}
-
-.clear-wrap .btn-text:hover:not(:disabled) {
-  color: var(--ink);
-}
-
-.clear-wrap .btn-text:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.clear-wrap .ask {
-  font-size: var(--t-xs);
-  color: var(--alert);
-}
-
-.clear-wrap .danger:hover:not(:disabled) {
-  color: var(--alert);
-}
-
-.input-row {
+/* 输入框是一整条圆角容器，图标按钮贴在框内右下角 */
+.input-shell {
+  position: relative;
   display: flex;
   align-items: flex-end;
-  gap: var(--s2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  background: var(--paper-raised);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 
-/* 页脚要圆润：输入框大圆角，两个动作按钮胶囊 */
-.input-row .btn-primary,
-.input-row .btn-quiet {
-  border-radius: var(--r-pill);
-}
-
-.input-row .btn-primary {
-  padding: 12px 22px;
+.input-shell:focus-within {
+  border-color: var(--signal);
+  box-shadow: inset 0 0 0 1px var(--signal-line);
 }
 
 .box {
   flex: 1;
   min-width: 0;
   resize: none;
-  padding: 14px 18px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-lg);
-  background: var(--paper-raised);
+  /* 右侧留出图标按钮的位置，多行时长文本也不会压到按钮上 */
+  padding: 14px 60px 14px 18px;
+  border: 0;
+  background: transparent;
   font-size: var(--t-md);
   line-height: 1.6;
   max-height: 160px;
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 
 .box:focus {
   outline: none;
-  border-color: var(--signal);
-  box-shadow: inset 0 0 0 1px var(--signal-line);
 }
 
 .box:disabled {
-  background: var(--paper-sunken);
   color: var(--muted);
 }
 
-.stop {
-  flex: 0 0 auto;
-  padding: 12px 18px;
+/* 发送/停止共用一个圆形图标钮，贴在输入条右下角 */
+.send-icon {
+  position: absolute;
+  right: 9px;
+  bottom: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--signal);
+  color: var(--on-signal);
+  transition: opacity var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+
+.send-icon:hover:not(:disabled) {
+  background: var(--signal-deep);
+}
+
+.send-icon:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.send-icon.stop {
+  background: var(--alert-soft);
+  color: var(--alert);
+}
+
+.send-icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.send-icon.stop svg {
+  fill: currentColor;
+  stroke: none;
+}
+
+/* 窄屏靠底部三段开工作区，右上角开关不显示，免得点了看不到面板 */
+@media (max-width: 1180px) {
+  .workspace-op {
+    display: none;
+  }
 }
 
 /* 窄屏 placeholder 会折成两行，给输入框留够高度，别把提示文字裁掉 */
 @media (max-width: 720px) {
   .stream {
-    padding-top: var(--s6);
+    padding-top: calc(var(--s6) + 16px);
   }
 
   .box {
     min-height: 64px;
   }
 
-  .input-row .btn-primary {
-    align-self: stretch;
-    padding: 12px 14px;
+  /* 窄屏图标按钮仍贴在输入条右下角，右侧留白加大，别压到折行的文字 */
+  .box {
+    padding-right: 56px;
   }
 }
 </style>
