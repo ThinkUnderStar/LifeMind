@@ -13,7 +13,9 @@
 3. 人工确认中断与结束标记。
 
 第 2 类必须按工具归属过滤：内置工具（记忆、联网搜索）只在 agent 内部发生，
-推给前端只会多出一种「无插件」的空状态要处理。任务分支里 `llm_node` 也在流式产出，
+推给前端只会多出一种「无插件」的空状态要处理。唯一例外是联网搜索——它耗时太长，
+不推进度用户会以为卡住，所以只给它推一条进度帧（不带面板）。
+任务分支里 `llm_node` 也在流式产出，
 但那是任务执行的中间流水（只该落到 agent_task.result），不是给用户看的话，
 所以文本必须按节点名过滤，不能见 chunk 就发。
 """
@@ -27,7 +29,12 @@ from langgraph.types import Command
 from sqlalchemy import func, select, update
 
 from app.agent.nodes import delete_session_memory_since, drop_session_memory_collection
-from app.agent.service_catalog import plugin_of_tool, tool_label, ui_panel_of
+from app.agent.service_catalog import (
+    BUILTIN_PROGRESS_LABELS,
+    plugin_of_tool,
+    tool_label,
+    ui_panel_of,
+)
 from app.client.base import Identity
 from app.db.mysql.entities import AgentTaskEntity, ChatMessageEntity
 from app.db.mysql.session import session_scope
@@ -164,6 +171,7 @@ async def _stream_graph(
 
     事件类型：
     - text      普通的回复片段，前端追加显示
+    - tasks     任务清单整表快照，前端挂在当前这条回复上方看每条执行状况
     - tool      服务插件工具开始/结束，前端可显示「正在创建事项」
     - ui        该打开哪个服务面板以及定位到什么数据，前端据此渲染子页面
     - interrupt approval_gate 触发人工确认，前端弹窗后用恢复接口继续
@@ -174,6 +182,9 @@ async def _stream_graph(
     它们是 agent 自己的能力，不属于任何插件，推了只会让前端多一种要处理的空插件状态。
     `plugin_of_tool` 返回 None 即跳过。
 
+    例外是 `BUILTIN_PROGRESS_LABELS` 里登记的内置工具（目前只有 web_search）：
+    它一次要跑十几到几十秒，全程静默用户会以为卡死，所以只推 tool 进度帧、不推 ui 面板帧。
+
     :param graph: 已编译的图
     :param graph_input: 图输入，普通字典或 Command(resume=...)
     :param config: 运行配置
@@ -181,6 +192,11 @@ async def _stream_graph(
     :yield: SSE 帧字符串
     """
     try:
+        # 任务清单只在下面这三个节点结束时变（planner 建表、assemble 置 running、
+        # check_step 置 done）；finalize 返回空表，见下面的跳过逻辑。
+        task_nodes = ("planner", "assemble", "check_step")
+        last_tasks = None
+
         async for event in graph.astream_events(
                 input=graph_input,
                 config=config,
@@ -195,6 +211,37 @@ async def _stream_graph(
                 content = getattr(chunk, "content", "")
                 if content:
                     yield _sse("text", content)
+
+            # 任务清单：整表覆盖推送，前端挂在当前这条回复上方，看到每条走到哪了。
+            # finalize 会返回空 task_list（收尾只清 State，结论已由 check_step 落库），
+            # 这里跳过空表，否则刚跑完就会把列表擦掉、用户来不及看结果。
+            if event_name == "on_chain_end" and metadata.get("langgraph_node") in task_nodes:
+                output = (event.get("data") or {}).get("output")
+                tasks = output.get("task_list") if isinstance(output, dict) else None
+                if tasks:
+                    rows = [
+                        task.model_dump() if hasattr(task, "model_dump") else dict(task)
+                        for task in tasks
+                    ]
+                    # 只推本轮的任务：上一轮停在人工确认上时 State 里的 task_list 没被清空，
+                    # planner 会把新任务接在旧任务后面。取最后一条的 bind 当本轮标识——
+                    # 新任务总是追加在末尾，同 bind 的才是这一轮排的。
+                    bind = rows[-1].get("task_bind_id")
+                    if bind:
+                        rows = [r for r in rows if r.get("task_bind_id") == bind]
+                    frames = [
+                        {
+                            "id": r.get("id"),
+                            "goal": r.get("goal"),
+                            "status": r.get("status"),
+                            "result": r.get("result"),
+                        }
+                        for r in rows
+                    ]
+                    # 同一步可能被两个节点连着返回同一份清单，重复帧会让前端白刷一次
+                    if frames != last_tasks:
+                        last_tasks = frames
+                        yield _sse("tasks", frames)
 
             # 服务插件工具：开始与结束成对推送，两端带同一个 id，前端据此配对
             # （开始显示进度、结束收起）。只给工具名派生的动作名，不给入参——
@@ -220,6 +267,15 @@ async def _stream_graph(
                         panel = ui_panel_of(tool_name, (event.get("data") or {}).get("input"))
                         if panel:
                             yield _sse("ui", {"id": run_id, **panel})
+                elif tool_name in BUILTIN_PROGRESS_LABELS:
+                    # 例外：耗时长到用户会以为卡住的内置工具，只推进度、不推面板
+                    # （plugin 写死 builtin，前端只读 action 文案，不会因此多出插件页）
+                    yield _sse("tool", {
+                        "id": str(event.get("run_id") or ""),
+                        "phase": "start" if event_name == "on_tool_start" else "end",
+                        "plugin": "builtin",
+                        "action": BUILTIN_PROGRESS_LABELS[tool_name],
+                    })
 
             # 人工确认中断：把确认信息原样交给前端，由前端决定 approve / reject
             if event_name == "on_chain_stream":

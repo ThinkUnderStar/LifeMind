@@ -7,13 +7,13 @@
  * 滚动策略：只在用户本来就贴着底部时才自动跟随。用户上滑看历史时如果被强行拽回底部，
  * 是这类界面最烦人的一处。
  */
-import { computed, nextTick, ref, watch } from 'vue'
-import { loadOlder, rewrite, send, state, stop, toast } from '../core/store'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { loadOlder, rewrite, send, state, stop, toast, toggleWebSearch } from '../core/store'
 import type { UiMessage } from '../core/store'
-import { listTasks } from '../api/chat'
-import type { AgentTask } from '../core/types'
 import ApprovalCard from '../components/ApprovalCard.vue'
+import TaskList from '../components/TaskList.vue'
 import brandLogo from '../assets/brand/lifemind-logo.png'
+import { renderMarkdown } from '../core/markdown'
 
 const draft = ref('')
 const streamEl = ref<HTMLElement | null>(null)
@@ -45,6 +45,7 @@ async function submitRewrite() {
   if (!text) return toast('内容不能为空', 'error')
   rewritingBusy.value = true
   try {
+    stick.value = true // 用户主动重新生成，回到贴底看新结果
     await rewrite(target.id, text)
     rewriting.value = null
   } finally {
@@ -52,46 +53,12 @@ async function submitRewrite() {
   }
 }
 
-/**
- * 当前会话的任务清单。任务的中间流水不进对话，但「它到底排了哪几步、走到哪了」
- * 用户有权看到，所以放在输入框上方按需展开，不占正文。
- */
-const tasks = ref<AgentTask[]>([])
-const showTasks = ref(false)
-
-const TASK_TEXT: Record<AgentTask['status'], string> = {
-  pending: '待执行',
-  running: '进行中',
-  done: '已结束',
-}
-
-async function loadTasks() {
-  if (!state.sessionId) {
-    tasks.value = []
-    return
-  }
-  try {
-    tasks.value = await listTasks(state.sessionId)
-  } catch {
-    // 任务清单是辅助信息，取不到就不显示，不打断对话
-    tasks.value = []
-  }
-}
-
-watch(
-  () => [state.sessionId, state.streaming] as const,
-  () => {
-    if (!state.streaming) void loadTasks()
-  },
-  { immediate: true },
-)
-
-// 换会话时把改名、改写这些临时态一起收起来
+// 换会话时把改名、改写这些临时态一起收起来，并回到最新消息（不管上个会话滚到哪）
 watch(() => state.sessionId, () => {
   rewriting.value = null
-  showTasks.value = false
+  stick.value = true
+  void scrollToEnd(true)
 })
-
 
 /** AI 用品牌标，用户用账号首字母——和顶栏头像同一套口径 */
 const userInitial = computed(() => (state.account || '我').trim().charAt(0).toUpperCase())
@@ -102,29 +69,63 @@ const EXAMPLES = [
   '我有哪些逾期的待办',
 ]
 
+const bodyEl = ref<HTMLElement | null>(null)
+// 程序贴底也会触发 scroll 事件，用它区分「用户主动上滑」和「我们自己滚到底」
+let programmatic = false
+let programmaticTimer: number | null = null
+
+function markProgrammatic() {
+  programmatic = true
+  if (programmaticTimer !== null) window.clearTimeout(programmaticTimer)
+  // scroll 事件是异步派发的，留一帧再解除标记
+  programmaticTimer = window.setTimeout(() => { programmatic = false }, 80)
+}
+
 function onScroll() {
+  // 自己滚的，不改贴底意愿
+  if (programmatic) return
   const el = streamEl.value
   if (!el) return
-  // 距底 80px 内算「贴着底部」，留一点余量，避免元素高度抖动时误判
-  stick.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  // 距底 60px 内算「贴着底部」。留一点余量，避免中文换行、任务行出现时抖动误判
+  stick.value = el.scrollHeight - el.scrollTop - el.clientHeight < 60
 }
 
-async function scrollToEnd(force = false) {
-  await nextTick()
+/** 把视图拉到最新一条。force 用于切会话/主动发消息：无视之前是否滚过，一律回到底部 */
+function scrollToEnd(force = false) {
   const el = streamEl.value
   if (!el) return
-  if (force || stick.value) el.scrollTop = el.scrollHeight
+  if (!force && !stick.value) return
+  markProgrammatic()
+  el.scrollTop = el.scrollHeight
 }
 
-watch(
-  () => state.messages.length,
-  () => void scrollToEnd(true),
-)
+// 内容高度一变就贴底——这是可靠的关键。
+// 只盯 content.length 的 watch 在「一帧塞进大段文本」时会漏：watch 只触发一次，
+// nextTick 时中文换行、任务行尚未把高度撑到最终值，之后没有第二次触发，最后一条就被留在输入框下面。
+// ResizeObserver 观察内容容器的真实高度，任何一次布局增长（文本、换行、任务行）都会回调。
+let ro: ResizeObserver | null = null
 
-// 流式追加时逐帧跟随；不能 watch 整个数组，那样每个 token 都会触发一次深比较
+onMounted(() => {
+  if (typeof ResizeObserver === 'undefined') return
+  const body = bodyEl.value
+  if (!body) return
+  ro = new ResizeObserver(() => scrollToEnd())
+  ro.observe(body)
+  // 首屏：消息在挂载前就位时也要贴到底部
+  scrollToEnd(true)
+})
+
+onBeforeUnmount(() => {
+  ro?.disconnect()
+  ro = null
+  if (programmaticTimer !== null) window.clearTimeout(programmaticTimer)
+})
+
+// 末尾消息 key 变化（用户发出、AI 回复、流式首帧）：交给 RO + 这里双保险。
+// loadOlder 往数组前面插历史、末尾那条不变，不会触发，看历史时位置保持不动。
 watch(
-  () => state.messages[state.messages.length - 1]?.content.length ?? 0,
-  () => void scrollToEnd(),
+  () => state.messages[state.messages.length - 1]?.key ?? null,
+  () => nextTick(() => scrollToEnd()),
 )
 
 function submit() {
@@ -157,6 +158,7 @@ function autoGrow(event: Event) {
 <template>
   <section class="chat">
     <div ref="streamEl" class="stream" @scroll="onScroll">
+     <div ref="bodyEl" class="stream-body">
       <div v-if="!state.messages.length" class="intro">
         <h1>说一件事，它替你去记。</h1>
         <p class="intro-lede">
@@ -198,7 +200,19 @@ function autoGrow(event: Event) {
           </template>
 
           <template v-else>
-            <template v-if="message.content">{{ message.content }}</template>
+            <!-- 这一轮排了哪几步、每条走到哪：生成中自动展开，回复结束后收起，可再点开 -->
+            <TaskList
+              v-if="message.role === 'assistant' && message.tasks?.length"
+              :tasks="message.tasks"
+              :streaming="message.streaming"
+            />
+            <!-- AI 回复按 markdown 渲染（串行逐帧更新已修，格式随字长出来）；用户原话保持纯文本 -->
+            <div
+              v-if="message.content && message.role === 'assistant'"
+              class="md"
+              v-html="renderMarkdown(message.content)"
+            ></div>
+            <template v-else-if="message.content">{{ message.content }}</template>
             <span v-else-if="message.streaming" class="thinking">正在想办法…</span>
             <span v-if="message.streaming && message.content" class="caret" aria-hidden="true"></span>
             <!-- 改写入口：悬停出现的细线铅笔图标，收在消息下方右侧 -->
@@ -228,11 +242,26 @@ function autoGrow(event: Event) {
       </ul>
 
       <ApprovalCard v-if="state.pending" />
+     </div>
     </div>
 
     <form class="composer" @submit.prevent="submit">
       <div class="composer-top">
         <div class="left-ops">
+          <button
+            class="web-toggle"
+            :class="{ on: state.webSearch }"
+            type="button"
+            :aria-pressed="state.webSearch"
+            :title="state.webSearch ? '联网已开启，本轮可用搜索查最新信息' : '联网已关闭，点一下开启'"
+            @click="toggleWebSearch"
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <circle cx="10" cy="10" r="6.4" />
+              <path d="M3.6 10h12.8M10 3.6c3.3 3.7 3.3 9 0 12.8M10 3.6c-3.3 3.7-3.3 9 0 12.8" />
+            </svg>
+            <span>联网</span>
+          </button>
           <button
             v-if="state.historyHasMore"
             class="btn btn-text older"
@@ -241,25 +270,9 @@ function autoGrow(event: Event) {
           >
             更早的消息
           </button>
-          <button
-            v-if="tasks.length"
-            class="btn btn-text"
-            type="button"
-            @click="showTasks = !showTasks"
-          >
-            {{ showTasks ? '收起任务' : `任务 ${tasks.length}` }}
-          </button>
         </div>
 
       </div>
-
-      <!-- 任务清单：它排了哪几步、走到哪了。done 只表示这条结束，不等于成功 -->
-      <ul v-if="showTasks && tasks.length" class="tasks">
-        <li v-for="task in tasks" :key="task.id" :data-status="task.status">
-          <span class="task-status">{{ TASK_TEXT[task.status] }}</span>
-          <span class="task-goal">{{ task.goal }}</span>
-        </li>
-      </ul>
 
       <!-- 输入框是一整条圆角容器，发送/停止图标收在框内右下角，不再像表单+按钮 -->
       <div class="input-shell" :data-streaming="state.streaming">
@@ -307,15 +320,30 @@ function autoGrow(event: Event) {
   min-width: 0;
 }
 
-/* 内容列居中：宽屏不散开，窄屏至少留 24px。左右用同一个表达式，滚动条出现时也不歪 */
+/* 内容列居中：宽屏不散开，窄屏至少留 24px。左右用同一个表达式，滚动条出现时也不歪。
+   .stream 是唯一的滚动容器；.stream-body 包住全部内容，高度随消息真实增长，
+   由 ResizeObserver 观察它来贴底——比盯 content.length 可靠（大帧/换行/任务行都能捕获）。
+   消息从顶部往下正常排列（主流网页对话式）：不贴底、不撑杆。只有内容超过一屏时，
+   scrollToEnd 才会把它滚到最新一条；消息少时 scrollTop=0，自然停在顶部。 */
 .stream {
   flex: 1;
   overflow-y: auto;
   /* 操作组已在中间列顶部单独占一行，这里只留常规上间距 */
   padding: var(--s6) max(var(--s5), calc((100% - 760px) / 2)) var(--s4);
+  overflow-anchor: none;
 }
 
+/* 普通块级容器：消息从顶部排列。min-height 让空态 intro 能垂直居中 */
+.stream-body {
+  min-height: 100%;
+}
+
+/* 空态欢迎语垂直居中；有消息时它不渲染，不影响消息的顶部对齐 */
 .intro {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 100%;
   padding-top: var(--s5);
 }
 
@@ -372,6 +400,7 @@ function autoGrow(event: Event) {
   align-items: flex-start;
   gap: 10px;
   padding: var(--s4) 0;
+  flex: 0 0 auto;
 }
 
 /* AI 头像在左、用户头像在右；正文跟随各自一侧 */
@@ -422,6 +451,118 @@ function autoGrow(event: Event) {
   color: var(--ink-soft);
 }
 
+/* ============ Markdown 正文 ============
+   .body 的 white-space:pre-wrap 是给纯文本用户消息留的，markdown 渲染出的 HTML
+   要恢复默认空白处理，否则标签间的换行会被显示成多余空行。 */
+.md {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.md > :first-child {
+  margin-top: 0;
+}
+
+.md > :last-child {
+  margin-bottom: 0;
+}
+
+.md p,
+.md ul,
+.md ol,
+.md blockquote,
+.md pre,
+.md table {
+  margin: 0.6em 0;
+}
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  margin: 1em 0 0.5em;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.md h1 { font-size: 1.4em; }
+.md h2 { font-size: 1.25em; }
+.md h3 { font-size: 1.12em; }
+
+.md ul,
+.md ol {
+  padding-left: 1.5em;
+}
+
+.md ul { list-style: disc; }
+.md ol { list-style: decimal; }
+.md li { margin: 0.2em 0; }
+.md li > p { margin: 0; }
+
+.md strong { font-weight: 650; color: var(--ink); }
+
+.md em { font-style: italic; }
+
+.md a {
+  color: var(--signal);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.md a:hover { color: var(--signal-deep); }
+
+.md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  background: var(--paper-sunken);
+  color: var(--ink);
+}
+
+.md pre {
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-md);
+  background: var(--paper-sunken);
+  overflow-x: auto;
+  line-height: 1.55;
+}
+
+.md pre code {
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  font-size: 0.88em;
+}
+
+.md blockquote {
+  padding-left: 0.9em;
+  border-left: 3px solid var(--signal-line);
+  color: var(--ink-soft);
+}
+
+.md hr {
+  margin: 1em 0;
+  border: 0;
+  border-top: 1px solid var(--rule);
+}
+
+.md table {
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+
+.md th,
+.md td {
+  padding: 6px 10px;
+  border: 1px solid var(--rule);
+  text-align: left;
+}
+
+.md th { background: var(--paper-sunken); font-weight: 600; }
+
 .thinking {
   color: var(--muted);
   font-size: var(--t-sm);
@@ -449,6 +590,7 @@ function autoGrow(event: Event) {
   flex-wrap: wrap;
   gap: var(--s2);
   padding: var(--s2) 0 var(--s4);
+  flex: 0 0 auto;
 }
 
 .tool {
@@ -513,6 +655,46 @@ function autoGrow(event: Event) {
 
 .left-ops .btn-text:hover:not(:disabled) {
   color: var(--ink);
+}
+
+/* 联网开关：关着是一枚安静的描边胶囊，开启后实心反白——一眼能看出这轮会不会上网 */
+.web-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px 2px 7px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--t-xs);
+  line-height: 1.6;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+.web-toggle svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}
+
+.web-toggle:hover:not(.on) {
+  color: var(--ink);
+  border-color: var(--signal-line);
+}
+
+.web-toggle.on {
+  border-color: transparent;
+  background: var(--signal);
+  color: var(--on-signal);
+}
+
+.web-toggle.on:hover {
+  background: var(--signal-deep);
 }
 
 /* 改写入口：悬停才显的小铅笔圆钮，右对齐收在消息下方，不抢正常阅读 */
@@ -620,38 +802,6 @@ function autoGrow(event: Event) {
   padding: 7px 16px;
   border-radius: var(--r-pill);
   font-size: var(--t-xs);
-}
-
-/* 任务清单：一行一步，状态在左、目标在右，长目标换行不撑破 */
-.tasks {
-  margin-bottom: var(--s2);
-  border-top: 1px solid var(--rule);
-}
-
-.tasks li {
-  display: grid;
-  grid-template-columns: 52px minmax(0, 1fr);
-  gap: 8px;
-  padding: 5px 0;
-  border-bottom: 1px solid var(--rule);
-  font-size: var(--t-xs);
-}
-
-.task-status {
-  color: var(--muted);
-}
-
-.tasks li[data-status='running'] .task-status {
-  color: var(--signal);
-}
-
-.tasks li[data-status='done'] .task-goal {
-  color: var(--muted);
-}
-
-.task-goal {
-  color: var(--ink-soft);
-  overflow-wrap: anywhere;
 }
 
 /* 输入框是一整条圆角容器，图标按钮贴在框内右下角 */

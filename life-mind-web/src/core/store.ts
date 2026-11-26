@@ -36,6 +36,10 @@ export interface UiMessage {
   content: string
   /** 正在长出来的气泡，用来显示光标 */
   streaming: boolean
+  /** 与后端 chat_message.task_bind_id 同值，历史消息据此挂上那一轮的任务清单 */
+  taskBindId?: string | null
+  /** 这一轮排了哪几步、各自走到哪；流式时由 tasks 帧整表覆盖，历史消息按 bind id 回填 */
+  tasks?: AgentTask[]
 }
 
 export interface Toast {
@@ -46,6 +50,7 @@ export interface Toast {
 
 const ACCOUNT_KEY = 'lm.account'
 const PANEL_OPEN_KEY = 'lm.panel.open'
+const WEB_SEARCH_KEY = 'lm.websearch'
 
 let seq = 0
 const nextKey = () => `t-${++seq}`
@@ -81,10 +86,14 @@ export const state = reactive({
   historyHasMore: false,
 
   streaming: false,
+  /**
+   * 本轮是否允许联网搜索。默认关（后端也是显式 1 才联网），用户点一次记住选择。
+   * 开关放运行时 config 传给 agent，模型改不了它，只能在开着时调搜索工具。
+   */
+  webSearch: localStorage.getItem(WEB_SEARCH_KEY) === '1',
   /** 正在跑的工具，成对出现，start 时加、end 时移除 */
   liveTools: [] as ToolFrame[],
   pending: null as ApprovalPayload | null,
-  tasks: [] as AgentTask[],
 
   plugins: [] as PluginInfo[],
 
@@ -117,6 +126,14 @@ export const state = reactive({
 let controller: AbortController | null = null
 let toastSeq = 0
 let panelTimer: number | null = null
+
+/* =========================== 联网开关 =========================== */
+
+/** 切一次联网开关，顺手记住——下次打开还是上次的选择 */
+export function toggleWebSearch() {
+  state.webSearch = !state.webSearch
+  localStorage.setItem(WEB_SEARCH_KEY, state.webSearch ? '1' : '0')
+}
 
 /* =========================== 提示 =========================== */
 
@@ -463,7 +480,6 @@ export async function newSession(): Promise<void> {
   state.sessionId = null
   state.messages = []
   state.pending = null
-  state.tasks = []
   state.panelParams = {}
   state.historyCursor = null
   state.historyHasMore = false
@@ -481,7 +497,6 @@ export async function clearConversation(id: number): Promise<void> {
   if (state.sessionId === id) {
     state.messages = []
     state.pending = null
-    state.tasks = []
     state.panelParams = {}
     state.historyCursor = null
     state.historyHasMore = false
@@ -491,6 +506,23 @@ export async function clearConversation(id: number): Promise<void> {
   await loadSessions(true)
 }
 
+/**
+ * 一轮对话的任务清单。按 task_bind_id 分组：任务属于哪条 AI 回复由后端共用的那个 UUID 决定，
+ * 不靠时间或顺序猜。整份缓存一次，翻历史分页时直接查，不用每页再请求一遍任务接口。
+ */
+let tasksByBind = new Map<string, AgentTask[]>()
+
+function groupTasksByBind(tasks: AgentTask[]): Map<string, AgentTask[]> {
+  const byBind = new Map<string, AgentTask[]>()
+  for (const task of tasks) {
+    if (!task.task_bind_id) continue
+    const list = byBind.get(task.task_bind_id)
+    if (list) list.push(task)
+    else byBind.set(task.task_bind_id, [task])
+  }
+  return byBind
+}
+
 export async function openSession(id: number): Promise<void> {
   // 左栏是全局导航：在插件库/通知页点某条会话要回对话视图，否则主区域停在独立页
   state.mainView = 'chat'
@@ -498,11 +530,15 @@ export async function openSession(id: number): Promise<void> {
   state.sessionId = id
   state.messages = []
   state.pending = null
-  state.tasks = []
   state.panelParams = {}
 
   try {
-    const page = await chatApi.listMessages(id, null, 30)
+    const [page, allTasks] = await Promise.all([
+      chatApi.listMessages(id, null, 30),
+      // 任务清单是辅助信息：取不到就当没有，不能因为它让整个会话打不开
+      chatApi.listTasks(id).catch(() => [] as AgentTask[]),
+    ])
+    tasksByBind = groupTasksByBind(allTasks)
     state.messages = page.records
       // system 是给模型看的项目约定，不是对话内容
       .filter((m) => m.role !== 'system')
@@ -512,6 +548,8 @@ export async function openSession(id: number): Promise<void> {
         role: m.role === 'user' ? 'user' : 'assistant',
         content: m.content,
         streaming: false,
+        taskBindId: m.task_bind_id,
+        tasks: m.task_bind_id ? tasksByBind.get(m.task_bind_id) : undefined,
       }))
     state.historyCursor = page.next_before_id
     state.historyHasMore = page.has_more
@@ -536,6 +574,9 @@ export async function loadOlder(): Promise<void> {
         role: (m.role === 'user' ? 'user' : 'assistant') as UiMessage['role'],
         content: m.content,
         streaming: false,
+        taskBindId: m.task_bind_id,
+        // 任务清单只随会话整体取一次（含更早的轮次），翻历史时直接查这份分组
+        tasks: m.task_bind_id ? tasksByBind.get(m.task_bind_id) : undefined,
       }))
     state.messages = [...older, ...state.messages]
     state.historyCursor = page.next_before_id
@@ -565,10 +606,29 @@ function applyUiFrame(frame: UiFrame) {
   }, 220)
 }
 
-function handleEvent(evt: SseEvent, reply: UiMessage | null) {
+/**
+ * 按 key 从 state.messages 里取回响应式 Proxy。
+ *
+ * 关键：state 是 reactive，push 进去的普通对象在数组里会被包成 Proxy，
+ * 而 push 前持有的原始引用改属性不会触发视图更新——流式逐字就会"攒着不显示"，
+ * 直到别的状态变化牵连重渲染才一次性刷出来。所有流式写入都必须走数组里的 Proxy。
+ */
+function findReply(key: string | null): UiMessage | null {
+  if (key === null) return null
+  return state.messages.find((m) => m.key === key) ?? null
+}
+
+function handleEvent(evt: SseEvent, replyKey: string | null) {
+  // 每帧重新查找：既拿到响应式 Proxy，也兼容 rewrite 延迟赋值数组的场景
+  const reply = findReply(replyKey)
   switch (evt.type) {
     case 'text':
       if (reply) reply.content += evt.data
+      break
+
+    case 'tasks':
+      // 整表覆盖：后端每次给的是完整清单（pending/running/done 都在），不做增量合并
+      if (reply) reply.tasks = evt.data
       break
 
     case 'tool':
@@ -599,10 +659,11 @@ function handleEvent(evt: SseEvent, reply: UiMessage | null) {
   }
 }
 
-function pushReply(): UiMessage {
-  const reply: UiMessage = { key: nextKey(), id: null, role: 'assistant', content: '', streaming: true }
-  state.messages.push(reply)
-  return reply
+/** 追加一条空的 AI 回复占位，返回它的 key（用 key 而不是对象，避免持有非响应式原始引用） */
+function pushReply(): string {
+  const key = nextKey()
+  state.messages.push({ key, id: null, role: 'assistant', content: '', streaming: true })
+  return key
 }
 
 export async function send(text: string): Promise<void> {
@@ -623,7 +684,7 @@ export async function send(text: string): Promise<void> {
   }
 
   state.messages.push({ key: nextKey(), id: null, role: 'user', content, streaming: false })
-  const reply = pushReply()
+  const replyKey = pushReply()
 
   state.streaming = true
   state.liveTools = []
@@ -631,19 +692,21 @@ export async function send(text: string): Promise<void> {
 
   try {
     await chatApi.sendChat(
-      { conversationId: state.sessionId, content },
-      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, reply) },
+      { conversationId: state.sessionId, content, webSearch: state.webSearch },
+      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey) },
     )
   } catch (error) {
+    const reply = findReply(replyKey)
     if ((error as Error)?.name === 'AbortError') {
-      reply.content += '\n\n（已停止）'
+      if (reply) reply.content += '\n\n（已停止）'
     } else {
       // 空回复就别留一个空气泡在界面上
-      if (!reply.content) state.messages = state.messages.filter((m) => m.key !== reply.key)
+      if (reply && !reply.content) state.messages = state.messages.filter((m) => m.key !== replyKey)
       toast(messageOf(error), 'error')
     }
   } finally {
-    reply.streaming = false
+    const reply = findReply(replyKey)
+    if (reply) reply.streaming = false
     state.streaming = false
     state.liveTools = []
     controller = null
@@ -655,7 +718,7 @@ export async function send(text: string): Promise<void> {
 /** 回应确认卡。之后可能再次收到 interrupt（多个工具逐个确认） */
 export async function respond(choice: 'approve' | 'reject', editContent?: string): Promise<void> {
   if (!state.sessionId || !state.pending) return
-  const reply = pushReply()
+  const replyKey = pushReply()
   state.pending = null
   state.streaming = true
   state.liveTools = []
@@ -663,14 +726,16 @@ export async function respond(choice: 'approve' | 'reject', editContent?: string
 
   try {
     await chatApi.resumeChat(
-      { conversationId: state.sessionId, choice, editContent },
-      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, reply) },
+      { conversationId: state.sessionId, choice, editContent, webSearch: state.webSearch },
+      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey) },
     )
   } catch (error) {
-    if (!reply.content) state.messages = state.messages.filter((m) => m.key !== reply.key)
+    const reply = findReply(replyKey)
+    if (reply && !reply.content) state.messages = state.messages.filter((m) => m.key !== replyKey)
     if ((error as Error)?.name !== 'AbortError') toast(messageOf(error), 'error')
   } finally {
-    reply.streaming = false
+    const reply = findReply(replyKey)
+    if (reply) reply.streaming = false
     state.streaming = false
     state.liveTools = []
     controller = null
@@ -706,7 +771,8 @@ export async function rewrite(messageId: number, content: string): Promise<void>
   }
 
   const user: UiMessage = { key: nextKey(), id: null, role: 'user', content: text, streaming: false }
-  const reply: UiMessage = { key: nextKey(), id: null, role: 'assistant', content: '', streaming: true }
+  const replyKey = nextKey()
+  const reply: UiMessage = { key: replyKey, id: null, role: 'assistant', content: '', streaming: true }
 
   let begun = false
   const begin = () => {
@@ -727,19 +793,21 @@ export async function rewrite(messageId: number, content: string): Promise<void>
         signal: controller.signal,
         onEvent: (evt) => {
           begin()
-          handleEvent(evt, reply)
+          handleEvent(evt, replyKey)
         },
       },
     )
   } catch (error) {
+    const live = findReply(replyKey)
     if ((error as Error)?.name === 'AbortError') {
-      if (begun) reply.content += '\n\n（已停止）'
+      if (live) live.content += '\n\n（已停止）'
     } else {
       toast(messageOf(error), 'error')
     }
   } finally {
     // 没 begun 说明请求在进图前就被拒了：界面保持原样，不截断、不留空气泡
-    if (begun) reply.streaming = false
+    const live = findReply(replyKey)
+    if (live) live.streaming = false
     state.streaming = false
     state.liveTools = []
     controller = null

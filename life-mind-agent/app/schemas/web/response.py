@@ -79,6 +79,10 @@ class TaskDto(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int = Field(description="任务ID，也是 update_tasks 工具里改任务用的 id")
+    task_bind_id: Optional[str] = Field(
+        default=None,
+        description="任务绑定ID：与该轮 AI 回复的 chat_message.task_bind_id 同值，前端据此把任务挂到对应那条回复上",
+    )
     goal: str = Field(description="任务目标")
     status: str = Field(description="pending-待执行 running-执行中 done-本条已结束")
     result: Optional[str] = Field(default=None, description="执行结果；未执行完为 None")

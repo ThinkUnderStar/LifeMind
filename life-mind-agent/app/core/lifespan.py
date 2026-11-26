@@ -1,7 +1,9 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncContextManager
+from typing import AsyncContextManager, Optional
 
+import httpx
 import yaml
 from fastapi import FastAPI
 from v2.nacos import RegisterInstanceParam, DeregisterInstanceParam, ConfigParam
@@ -13,6 +15,73 @@ from app.db.milvus.client import init_milvus_client
 from app.db.mysql.session import init_mysql_db
 from app.db.postgresql.session import connect_postgresql_db, close_postgresql_db
 from app.util.server_tool import get_local_ip
+
+# Nacos 临时实例保活：SDK 的 gRPC 长连接被服务端断开后不会自动重注册，实例会被剔除，
+# 网关随之报 "No servers available"。这里用独立 HTTP 探测做兜底。
+_NACOS_KEEPALIVE_INTERVAL = 5  # 探测间隔（秒），远小于临时实例 15~30s 的过期剔除时间
+_NACOS_REBUILD_AFTER = 3       # 连续补注册失败达到该次数则重建 gRPC 客户端
+
+
+async def _nacos_register_keepalive(
+    logger: logging.Logger,
+    get_client,
+    set_client,
+    register_param: RegisterInstanceParam,
+) -> None:
+    """后台兜底：独立于 SDK 的 gRPC 连接，用 Nacos HTTP OpenAPI 探测本实例是否仍在，
+    掉线就补注册；补注册连续失败则重建 naming 客户端（新建 gRPC 连接）。
+
+    get_client/set_client 用于读写 lifespan 持有的当前客户端引用，重建后主流程注销用的是新客户端。
+    """
+    ip = register_param.ip
+    port = register_param.port
+    service = register_param.service_name
+    group = register_param.group_name
+    probe_url = f"http://{settings.NACOS_SERVER}/nacos/v1/ns/instance/list"
+    probe_params = {"serviceName": service, "groupName": group, "healthyOnly": "true"}
+    fail_streak = 0
+
+    async with httpx.AsyncClient(timeout=5.0) as http:
+        while True:
+            await asyncio.sleep(_NACOS_KEEPALIVE_INTERVAL)
+            try:
+                resp = await http.get(probe_url, params=probe_params)
+                resp.raise_for_status()
+                hosts = resp.json().get("hosts") or []
+                alive = any(
+                    h.get("ip") == ip and int(h.get("port") or 0) == port and h.get("healthy", True)
+                    for h in hosts
+                )
+                if alive:
+                    if fail_streak:
+                        print(f"✅ Nacos 实例已恢复在册: {ip}:{port}", flush=True)
+                    fail_streak = 0
+                    continue
+
+                # 实例不在册 → 补注册
+                fail_streak += 1
+                print(f"⚠️ Nacos 实例不在册，补注册（第 {fail_streak} 次）: {ip}:{port}", flush=True)
+                try:
+                    await get_client().register_instance(request=register_param)
+                    print("✅ Nacos 补注册成功", flush=True)
+                    fail_streak = 0
+                except Exception as e:
+                    print(f"Nacos 补注册失败: {e}", flush=True)
+                    if fail_streak >= _NACOS_REBUILD_AFTER:
+                        print(f"补注册连续失败 {fail_streak} 次，重建 Nacos gRPC 客户端", flush=True)
+                        try:
+                            new_client = await get_nacos_service()
+                            set_client(new_client)
+                            await new_client.register_instance(request=register_param)
+                            print("✅ Nacos 客户端重建并注册成功", flush=True)
+                            fail_streak = 0
+                        except Exception as e2:
+                            print(f"Nacos 客户端重建失败: {e2}", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # 探测本身失败（Nacos 短暂不可用）不应中断守护循环
+                print(f"Nacos 保活探测异常: {e}", flush=True)
 
 
 @asynccontextmanager
@@ -80,6 +149,22 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
     await nacos_name_client.register_instance(request=register_param)
     print(f"🚀 服务 [{settings.APP_NAME}] 注册成功: {local_ip}:{settings.SERVER_PORT}")
 
+    # 客户端引用放到容器里，保活任务重建客户端后能写回，注销时用最新的客户端
+    client_ref = {"client": nacos_name_client}
+
+    def _get_client():
+        return client_ref["client"]
+
+    def _set_client(new_client):
+        client_ref["client"] = new_client
+
+    # ====================== nacos 注册保活兜底任务 ======================
+    # SDK 的 gRPC 长连接断开后不自动重注册，独立 HTTP 探测兜底，避免网关路由不到 agent
+    keepalive_task: Optional[asyncio.Task] = asyncio.create_task(
+        _nacos_register_keepalive(logger, _get_client, _set_client, register_param)
+    )
+    print(f"🔄 Nacos 注册保活任务已启动（间隔 {_NACOS_KEEPALIVE_INTERVAL}s）", flush=True)
+
     # ========================= 初始化mysql数据库连接 ==============================
     init_mysql_db()
 
@@ -95,14 +180,25 @@ async def lifespan(app: FastAPI) -> AsyncContextManager:
 
     logger.info("🔌 正在关闭系统依赖...")
 
+    # 先停保活任务，避免注销后又被补注册
+    if keepalive_task:
+        keepalive_task.cancel()
+        try:
+            await keepalive_task
+        except asyncio.CancelledError:
+            pass
+
     # ======================= 注销nacos注册的服务 ===============================
-    await nacos_name_client.deregister_instance(DeregisterInstanceParam(
-        service_name=settings.APP_NAME,
-        group_name=settings.NACOS_GROUP,
-        ip=local_ip,
-        port=settings.SERVER_PORT
-    ))
-    logger.info("✅ Nacos 服务已注销")
+    try:
+        await client_ref["client"].deregister_instance(DeregisterInstanceParam(
+            service_name=settings.APP_NAME,
+            group_name=settings.NACOS_GROUP,
+            ip=local_ip,
+            port=settings.SERVER_PORT
+        ))
+        logger.info("✅ Nacos 服务已注销")
+    except Exception as e:
+        logger.warning("Nacos 注销失败（进程即将退出，可忽略）: %s", e)
 
     # ========================关闭postgresql连接 =================================
     await close_postgresql_db()

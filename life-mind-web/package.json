@@ -11,6 +11,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "dompurify": "^3.5.0",
+    "marked": "^15.0.12",
     "vue": "^3.4.38"
   },
   "devDependencies": {

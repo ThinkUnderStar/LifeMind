@@ -70,11 +70,13 @@ export interface MessagePage {
 /** 任务清单。status 只有 pending/running/done 三值，done 表示「这条结束了」而非「成功」 */
 export interface AgentTask {
   id: number
+  /** 与生成本任务的那条 AI 回复同值；流式帧里可能为空（历史接口回填） */
+  task_bind_id?: string | null
   goal: string
   status: 'pending' | 'running' | 'done'
   result: string | null
-  create_time: string | null
-  update_time: string | null
+  create_time?: string | null
+  update_time?: string | null
 }
 
 /** 挂起的人工确认。interrupt 的形状与 SSE 的 interrupt 帧同源 */
@@ -287,6 +289,7 @@ export interface Notice {
  */
 export type SseEvent =
   | { type: 'text'; data: string }
+  | { type: 'tasks'; data: AgentTask[] }
   | { type: 'tool'; data: ToolFrame }
   | { type: 'ui'; data: UiFrame }
   | { type: 'interrupt'; data: ApprovalPayload }

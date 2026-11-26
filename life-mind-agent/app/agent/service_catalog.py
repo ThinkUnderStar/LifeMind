@@ -46,6 +46,17 @@ BUILTIN_SENSITIVE_TOOL_NAMES: FrozenSet[str] = frozenset({
     "save_user_memory",
 })
 
+# 内置工具里「耗时长到用户会以为卡住」的那几个，需要往流里推一条进度提示。
+#
+# 其余内置工具（记忆检索、保存记忆、任务清单）都是毫秒级，推了只会让界面闪一下，
+# 所以不在这里登记——没登记就等于「不推进度」。
+# 联网搜索一次要十几到几十秒，全程静默时前端只显示占位文案，用户会以为卡死。
+#
+# 只影响进度文案，不进前端插件面板：这些工具不属于任何插件，`plugin_of_tool` 仍返回 None。
+BUILTIN_PROGRESS_LABELS: Dict[str, str] = {
+    "web_search": "正在联网搜索…",
+}
+
 # 服务插件工具：plugin_key → 该插件提供的工具。
 # plugin_key 必须与 account 库 `plugin.plugin_key` 一致，否则网关算出来的
 # `LifeMind-User-Plugins` 永远匹配不上，表现为「用户勾了插件但 agent 什么都不做」。

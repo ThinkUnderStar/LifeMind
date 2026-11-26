@@ -30,11 +30,13 @@ Agent 图节点集合（add_node 注册 17 个：编号 N1–N16，外加 gate �
    代价是主键不承载业务含义，`upsert` 无从下手——节点重放会重复写行，要收口只能按
    message_id 过滤删除后重写，或从 MySQL 全量重建索引。
 """
+import asyncio
 import json
 import logging
 import uuid
 from typing import List, Dict
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langchain_core.runnables import RunnableConfig
@@ -44,7 +46,13 @@ from pymilvus import CollectionSchema, DataType, FieldSchema
 from pymilvus.milvus_client import IndexParams
 from sqlalchemy import Select, select
 
-from app.agent.prompts import VIOLATION_REPLY, SYSTEM_PROMPT_TEMPLATE, TASK_EXECUTION_SYSTEM_PROMPT
+from app.agent.prompts import (
+    VIOLATION_REPLY,
+    SYSTEM_PROMPT_TEMPLATE,
+    TASK_EXECUTION_SYSTEM_PROMPT,
+    GATE_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+)
 from app.component_manager.agent_component import ChatLlmWithToolsManager, GateLlmManager, PlannerLlmManager, \
     ChatLlmManager
 from app.core.settings import settings
@@ -649,17 +657,39 @@ async def run_tool(state: State, config: RunnableConfig) -> Dict:
 async def gate(state: State) -> Dict:
     """意图分流：把本轮用户原话交给 gate 模型做三分类，只写 type 字段。
 
-    判据（0违规 / 1纯对话 / 2任务）写在 GateOutput 的 Field(description) 里，
+    判据（0违规 / 1纯对话 / 2任务）在 prompts.GATE_SYSTEM_PROMPT 里，作为 system message 传入；
+    GateOutput 的字段描述只声明取值含义（判据塞进 schema 时 8B 模型不读，实测搜索类会全判成纯对话）。
     本节点用 with_structured_output 拿实例、取 out.type，不做任何分流判断 ——
     分流是 graph.py 里 route_after_gate 条件边的事。零副作用，不写库、不改 messages。
+
+    容错：deepseek-r1:8b 偶发返回空串（推理 token 耗尽或格式抖动），
+    with_structured_output 的 Pydantic 解析会抛 OutputParserException，
+    不兜底就会让整轮对话失败。这里重试 3 次；仍失败降级为「纯对话」(type=1)，
+    走正常聊天回复、不判违规也不动工具，保证用户至少能收到一条回复。
     """
     human_message = state.messages[-1]
     gate_llm = GateLlmManager.get_gate_llm()
+    # 判据走 system message：写在 GateOutput 的 Field(description) 里 8B 模型基本不读。
     # langchain_core 1.x 起 ainvoke 只接受 PromptValue / str / list[BaseMessage]，
-    # 单个 BaseMessage 会抛 ValueError（Invalid input type）。这里必须包成 list。
-    output = await gate_llm.ainvoke([human_message])
+    # 单个 BaseMessage 会抛 ValueError（Invalid input type），所以统一包成 list。
+    gate_messages = [SystemMessage(content=GATE_SYSTEM_PROMPT), human_message]
+    for attempt in range(1, 4):
+        try:
+            output = await gate_llm.ainvoke(gate_messages)
+            if getattr(output, "type", None) in (0, 1, 2):
+                return {"type": output.type}
+            logger.warning("gate 返回非法 type：%r，重试 %d/3", getattr(output, "type", None), attempt)
+        except OutputParserException as e:
+            logger.warning("gate 输出解析失败（%d/3）：%s", attempt, str(e).splitlines()[0][:160])
+        except Exception as e:  # 模型瞬断/超时等，同样先重试再降级
+            logger.warning("gate 调用异常（%d/3）：%s: %s", attempt, type(e).__name__,
+                           str(e).splitlines()[0][:160])
+        if attempt < 3:
+            await asyncio.sleep(0.3 * attempt)
 
-    return {"type": output.type}
+    # 三次都拿不到合法分类：宁可当普通聊天，也不能让整轮请求报错或误判违规/误动工具
+    logger.error("gate 连续 3 次失败，降级为纯对话(type=1)")
+    return {"type": 1}
 
 async def violation_reply(state: State) -> Dict:
     """违规轮次的回复：写死 VIOLATION_REPLY，不调模型、不复述违规原因。
@@ -793,8 +823,10 @@ async def planner(state: State,config: RunnableConfig) -> Dict:
     task_list = state.task_list
 
     planner_llm = PlannerLlmManager.get_planner_llm()
-    # 同 gate：langchain_core 1.x 只接受 list[BaseMessage]，单个消息对象会报错
-    output = await planner_llm.ainvoke([state.messages[-1]])
+    # 同 gate：langchain_core 1.x 只接受 list[BaseMessage]，单个消息对象会报错。
+    # 判据必须走 system message，塞进 PlannerOutput 的 schema 说明里模型不读
+    # （实测会产出英文 snake_case goal、并把没查过的事实编进 goal）。
+    output = await planner_llm.ainvoke([SystemMessage(content=PLANNER_SYSTEM_PROMPT), state.messages[-1]])
 
     # 添加任务
     async with session_scope() as db:
