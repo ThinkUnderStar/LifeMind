@@ -27,6 +27,10 @@ http {
     sendfile on;
     keepalive_timeout 65;
 
+    # 头像上传走 multipart，后端校验上限 2MB；nginx 默认 client_max_body_size 1m
+    # 会把 1~2MB 的图在反代层就拒掉（413），请求到不了网关。这里放到 4m 留余量。
+    client_max_body_size 4m;
+
     # 临时目录全部落在项目内。Windows 上 nginx 装完默认没有写自己目录的权限，
     # 不改这几行会在启动时报 "CreateFile() failed (5: Access is denied)"。
     client_body_temp_path tmp/client_body;

@@ -63,6 +63,20 @@ class BacktrackDto(BaseModel):
     content: str = Field(..., min_length=1, description="改写后的消息内容")
 
 
+class AttachDto(BaseModel):
+    """断线重连：把断线期间攒下的 SSE 帧补发给前端。
+
+    不启动新一轮图执行，也不新增用户消息——纯粹从会话的帧缓冲读。
+    after_seq 是前端已收到的最后一帧下标，后端只补发它之后的帧。
+    """
+
+    conversation_id: int = Field(..., description="会话ID，与发起时一致；也是归属校验依据")
+    after_seq: int = Field(
+        default=-1,
+        description="已收到的最后一帧下标；-1 表示从第一帧开始补发",
+    )
+
+
 class CreateSessionDto(BaseModel):
     """创建会话的请求体。标题可以不给，由服务端落默认值。"""
 

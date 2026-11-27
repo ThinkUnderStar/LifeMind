@@ -42,6 +42,42 @@ export interface UiMessage {
   tasks?: AgentTask[]
 }
 
+/**
+ * 一轮还在跑的对话。切会话不打断别处的流，所以消息数组、确认卡、工具提示
+ * 都得跟着这一轮走，不能只挂在全局那一份 state 上——否则 A 会话的确认卡
+ * 会跑到 B 会话，A 的流式文字也会被 B 的 openSession 冲掉。
+ *
+ * messages 就是 state.messages 背后的那个响应式数组：当前显示时两者是同一个对象，
+ * 切走后 state.messages 指向别处，这一轮仍持有原数组继续写，切回来原样接上。
+ */
+interface SessionRun {
+  sessionId: number
+  messages: UiMessage[]
+  replyKey: string | null
+  /** 这一轮已收到的最后一帧下标（-1 表示还没收到）；刷新后据此从后端续传 */
+  lastSeq: number
+  pending: ApprovalPayload | null
+  liveTools: ToolFrame[]
+  streaming: boolean
+  /** fetch 被中断（用户点停止或刷新页面）时置位：这轮的半截回复要留给快照 */
+  aborted: boolean
+  controller: AbortController | null
+  historyCursor: number | null
+  historyHasMore: boolean
+}
+
+/**
+ * 刷新后用来续传的状态。图和帧都活在后端，浏览器这边只需要：
+ * 当前消息数组（含还没落库的半截回复）+ 该从哪一帧继续读。
+ */
+interface StreamSnapshot {
+  sessionId: number
+  messages: UiMessage[]
+  replyKey: string | null
+  lastSeq: number
+  pending: ApprovalPayload | null
+}
+
 export interface Toast {
   id: number
   text: string
@@ -51,6 +87,14 @@ export interface Toast {
 const ACCOUNT_KEY = 'lm.account'
 const PANEL_OPEN_KEY = 'lm.panel.open'
 const WEB_SEARCH_KEY = 'lm.websearch'
+const SESSION_KEY = 'lm.session'
+const SESSION_VIEW_KEY = 'lm.session.view'
+/**
+ * 刷新会杀掉 SSE 连接，但图在后端后台照跑。浏览器只需记住「读到第几帧」，
+ * 刷新后用这个游标重连，把断线期间的帧补回来接着输出。
+ * 用 sessionStorage：只活在当前标签页，关掉标签就没了，不会把半截话带到下次打开。
+ */
+const SNAPSHOT_KEY = 'lm.stream.snapshot'
 
 let seq = 0
 const nextKey = () => `t-${++seq}`
@@ -84,6 +128,8 @@ export const state = reactive({
   messages: [] as UiMessage[],
   historyCursor: null as number | null,
   historyHasMore: false,
+  /** 刷新后正在拉会话和历史消息。此时别把空的 messages 当成「欢迎页」渲染 */
+  chatLoading: false,
 
   streaming: false,
   /**
@@ -123,9 +169,120 @@ export const state = reactive({
   toasts: [] as Toast[],
 })
 
-let controller: AbortController | null = null
 let toastSeq = 0
 let panelTimer: number | null = null
+
+/** 所有还在跑（或刚跑完、尚未重新拉过历史）的轮次，按会话 id 索引 */
+const runs = new Map<number, SessionRun>()
+let snapshotTimer: number | null = null
+/** 区分「用户点停止」和「刷新/关闭页面」：前者标「已停止」，后者交给快照复原 */
+let unloading = false
+
+function runOf(sid: number | null): SessionRun | null {
+  return sid == null ? null : runs.get(sid) ?? null
+}
+
+/** 某会话开始新一轮时认领它当前显示的数组；没有就把空数组交给它 */
+function ensureRun(sid: number): SessionRun {
+  let run = runs.get(sid)
+  if (!run) {
+    const active = state.sessionId === sid
+    run = {
+      sessionId: sid,
+      messages: active ? state.messages : [],
+      replyKey: null,
+      lastSeq: -1,
+      pending: active ? state.pending : null,
+      liveTools: [],
+      streaming: false,
+      aborted: false,
+      controller: null,
+      historyCursor: active ? state.historyCursor : null,
+      historyHasMore: active ? state.historyHasMore : false,
+    }
+    runs.set(sid, run)
+  }
+  return run
+}
+
+/** 后台轮次的状态只在它正显示时同步到界面，避免串到别的会话 */
+function syncActive(run: SessionRun | null) {
+  if (!run || run.sessionId !== state.sessionId) return
+  state.messages = run.messages
+  state.pending = run.pending
+  state.liveTools = run.liveTools
+  state.streaming = run.streaming
+  state.historyCursor = run.historyCursor
+  state.historyHasMore = run.historyHasMore
+}
+
+function persistSelected(id: number | null) {
+  if (id === null) localStorage.removeItem(SESSION_KEY)
+  else localStorage.setItem(SESSION_KEY, String(id))
+}
+
+/* ---------------- 半截回复的刷新快照 ---------------- */
+
+function readSnapshots(): Record<string, StreamSnapshot> {
+  try {
+    return JSON.parse(sessionStorage.getItem(SNAPSHOT_KEY) || '{}') as Record<string, StreamSnapshot>
+  } catch {
+    return {}
+  }
+}
+
+function writeSnapshots(map: Record<string, StreamSnapshot>) {
+  try {
+    sessionStorage.setItem(SNAPSHOT_KEY, JSON.stringify(map))
+  } catch {
+    // 存不下就算了：快照是兜底，不该因为配额把对话打断
+  }
+}
+
+/** 把一轮的消息与续传游标写进快照。done 之后就删，免得刷新时重连一个已结束的流 */
+function saveSnapshot(run: SessionRun) {
+  // aborted 也算：刷新时 fetch 先被中止把 streaming 置 false，
+  // 但这时候半截文本正是最该留给快照的，不能因为流已停就跳过。
+  if (!run.streaming && !run.pending && !run.aborted) return
+  const map = readSnapshots()
+  map[String(run.sessionId)] = {
+    sessionId: run.sessionId,
+    messages: JSON.parse(JSON.stringify(run.messages)) as UiMessage[],
+    replyKey: run.replyKey,
+    lastSeq: run.lastSeq,
+    pending: run.pending,
+  }
+  writeSnapshots(map)
+}
+
+/** 文本帧来得很快，节流写，避免逐字序列化整个气泡 */
+function scheduleSnapshot() {
+  if (snapshotTimer !== null) return
+  snapshotTimer = window.setTimeout(() => {
+    snapshotTimer = null
+    for (const run of runs.values()) saveSnapshot(run)
+  }, 500)
+}
+
+function dropSnapshot(sid: number) {
+  const map = readSnapshots()
+  if (!(String(sid) in map)) return
+  delete map[String(sid)]
+  writeSnapshots(map)
+}
+
+/** 页面被关掉/刷新时最后存一次，接住节流窗口里还没落盘的那几百毫秒 */
+window.addEventListener('beforeunload', () => {
+  unloading = true
+})
+window.addEventListener('pagehide', () => {
+  unloading = true
+  if (snapshotTimer !== null) {
+    window.clearTimeout(snapshotTimer)
+    snapshotTimer = null
+  }
+  for (const run of runs.values()) saveSnapshot(run)
+})
 
 /* =========================== 联网开关 =========================== */
 
@@ -163,7 +320,12 @@ export async function login(payload: {
   localStorage.setItem(ACCOUNT_KEY, payload.username)
   state.account = payload.username
   state.authed = true
-  await Promise.all([loadPlugins(), loadSessions()])
+  state.chatLoading = true
+  try {
+    await Promise.all([loadPlugins(), loadSessions()])
+  } finally {
+    state.chatLoading = false
+  }
 }
 
 /** 改完账户名后同步本地记录：栏底账号与下次启动读的都是这里 */
@@ -184,12 +346,31 @@ export async function enterWithToken(jwtToken: string, label: string): Promise<v
   localStorage.setItem(ACCOUNT_KEY, label)
   state.account = label
   state.authed = true
-  await Promise.all([loadPlugins(), loadSessions()])
+  state.chatLoading = true
+  try {
+    await Promise.all([loadPlugins(), loadSessions()])
+  } finally {
+    state.chatLoading = false
+  }
 }
 
 export function logout() {
   writeToken(null)
-  stop()
+  // 登出要把所有后台还在跑的流一起收掉，不能只停当前显示的那轮
+  for (const run of runs.values()) run.controller?.abort()
+  runs.clear()
+  clearLateReplyTimers()
+  persistSelected(null)
+  if (snapshotTimer !== null) {
+    window.clearTimeout(snapshotTimer)
+    snapshotTimer = null
+  }
+  try {
+    sessionStorage.removeItem(SNAPSHOT_KEY)
+  } catch {
+    /* 忽略 */
+  }
+  state.streaming = false
   state.authed = false
   state.sessions = []
   state.sessionId = null
@@ -372,18 +553,44 @@ export function selectWorkspacePage(key: string) {
   state.panelEpoch += 1
 }
 
+/** 工作区默认页 = 没绑定插件的空白页（显示插件列表那张） */
+function isDefaultPage(page: WorkspacePage | undefined): boolean {
+  return !!page && !page.pluginKey
+}
+
+/**
+ * 关一张页：
+ * - 只剩最后一张、且它不是默认页 → 回到默认页（补一张空白页），工作区保持打开；
+ * - 只剩最后一张、且它就是默认页 → 关闭整个工作区；
+ * - 还有别的页 → 正常移除，当前页则切到相邻那张。
+ */
 export function closeWorkspacePage(key: string) {
-  if (state.workspacePages.length <= 1) {
-    // 最后一张关掉就补张空白页，工作区不会剩个空壳
+  const idx = state.workspacePages.findIndex((p) => p.key === key)
+  if (idx < 0) return
+  const closing = state.workspacePages[idx]
+  const wasCurrent = state.workspacePage === key
+
+  if (state.workspacePages.length === 1) {
+    if (isDefaultPage(closing)) {
+      // 默认页是最后一张：关掉即收起工作区，页面清空，下次打开会补一张新的默认页
+      state.workspacePages = []
+      state.workspacePage = ''
+      state.workspaceOpen = false
+      state.activePlugin = ''
+      state.activeTab = 'day'
+      state.panelParams = {}
+      persistPanelOpen()
+      return
+    }
+    // 最后一张是插件页：不关工作区，回到默认页
     const blank = blankPage()
     state.workspacePages = [blank]
     state.workspacePage = blank.key
     syncPage()
+    state.panelEpoch += 1
     return
   }
-  const idx = state.workspacePages.findIndex((p) => p.key === key)
-  if (idx < 0) return
-  const wasCurrent = state.workspacePage === key
+
   state.workspacePages.splice(idx, 1)
   if (wasCurrent) {
     state.workspacePage = state.workspacePages[Math.min(idx, state.workspacePages.length - 1)].key
@@ -457,6 +664,7 @@ export async function loadSessions(silent = false): Promise<void> {
 export async function switchSessionView(view: 'active' | 'archived'): Promise<void> {
   if (state.sessionView === view) return
   state.sessionView = view
+  localStorage.setItem(SESSION_VIEW_KEY, view)
   await loadSessions()
 }
 
@@ -477,12 +685,16 @@ export async function newSession(): Promise<void> {
     await loadSessions()
   }
 
+  // 只清界面：别的会话可能还在流式跑，它们的 run 留在 Map 里继续写，切回去能接上
   state.sessionId = null
   state.messages = []
   state.pending = null
+  state.liveTools = []
+  state.streaming = false
   state.panelParams = {}
   state.historyCursor = null
   state.historyHasMore = false
+  persistSelected(null)
 }
 
 /**
@@ -492,11 +704,19 @@ export async function newSession(): Promise<void> {
  * 标题保留（后端不动 conversation 行）：这是「清空记录」，不是「删除会话」。
  */
 export async function clearConversation(id: number): Promise<void> {
-  if (state.sessionId === id && state.streaming) stop()
+  const run = runs.get(id)
+  if (run) {
+    run.controller?.abort()
+    runs.delete(id)
+  }
+  dropSnapshot(id)
+  syncActive(runOf(state.sessionId))
   await chatApi.clearConversationMemory(id)
   if (state.sessionId === id) {
     state.messages = []
     state.pending = null
+    state.liveTools = []
+    state.streaming = false
     state.panelParams = {}
     state.historyCursor = null
     state.historyHasMore = false
@@ -511,6 +731,8 @@ export async function clearConversation(id: number): Promise<void> {
  * 不靠时间或顺序猜。整份缓存一次，翻历史分页时直接查，不用每页再请求一遍任务接口。
  */
 let tasksByBind = new Map<string, AgentTask[]>()
+/** 同一会话可能被连续打开多次，只让最后一次的异步结果落到界面上 */
+let openSeq = 0
 
 function groupTasksByBind(tasks: AgentTask[]): Map<string, AgentTask[]> {
   const byBind = new Map<string, AgentTask[]>()
@@ -523,14 +745,124 @@ function groupTasksByBind(tasks: AgentTask[]): Map<string, AgentTask[]> {
   return byBind
 }
 
-export async function openSession(id: number): Promise<void> {
+/* 刷新落在「后端还没落库」的窗口里时，openSession 只能拉到用户消息或一条半截回复。
+ * 快照在上一轮续流结束时已经删掉，后面再刷新也不会主动回头看，于是看起来像 AI 没回。
+ * 这里给这种会话挂几次延迟对账，后端一旦落库就把完整回复补回来。 */
+const lateReplyTimers: number[] = []
+
+function clearLateReplyTimers(): void {
+  while (lateReplyTimers.length) window.clearTimeout(lateReplyTimers.pop()!)
+}
+
+/**
+ * 把后端已落库的回复补到当前会话。返回 true 表示已经完整（或本来就完整）。
+ *
+ * 判断依据是「最后一条用户消息之后有没有带真实 id 的 assistant」：
+ * 本地半截/空回复的 id 是 null（pushReply 建的），后端落库的才有 id。
+ * 所以末尾是 user、是空气泡、还是半截文本，都能被识别成「还没落库」，不会再漏。
+ *
+ * 只动最后一条用户消息之后的那段，不整表覆盖——翻历史加载的更早消息要原样留着。
+ */
+async function reconcileReplyOnce(sid: number): Promise<boolean> {
+  if (state.sessionId !== sid || state.streaming) return false
+  // 看这一轮是否真的还在流式，而不是「Map 里有没有 run」——
+  // send 结束后 run 会一直留在 Map 里（没删），用它判断会让对账永远跳过。
+  const run = runOf(sid)
+  if (run && run.streaming) return false
+
+  let lastUserIdx = -1
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    if (state.messages[i].role === 'user') { lastUserIdx = i; break }
+  }
+  if (lastUserIdx < 0) return true // 还没有用户消息，无需对账
+
+  const committed = state.messages.slice(lastUserIdx + 1)
+    .some((m) => m.role === 'assistant' && m.id !== null)
+  if (committed) return true
+
+  try {
+    const [page, allTasks] = await Promise.all([
+      chatApi.listMessages(sid, null, 30),
+      chatApi.listTasks(sid).catch(() => [] as AgentTask[]),
+    ])
+    // await 期间用户可能切了会话或这一轮又开跑，迟到的结果不能盖上去
+    const currentRun = runOf(sid)
+    if (state.sessionId !== sid || state.streaming || (currentRun && currentRun.streaming)) return false
+    const records = page.records.filter((m) => m.role !== 'system')
+    const backendLast = [...records].reverse().find((m) => m.role === 'assistant')
+    if (!backendLast) return false // 后端也还没落库，等下一次定时器
+
+    tasksByBind = groupTasksByBind(allTasks)
+    const reply: UiMessage = {
+      key: `m-${backendLast.id}`,
+      id: backendLast.id,
+      role: 'assistant',
+      content: backendLast.content,
+      streaming: false,
+      taskBindId: backendLast.task_bind_id,
+      tasks: backendLast.task_bind_id ? tasksByBind.get(backendLast.task_bind_id) : undefined,
+    }
+    // 末尾那条未落库的 assistant（空气泡或半截）直接换成后端完整回复，否则追加
+    const tail = state.messages[state.messages.length - 1]
+    state.messages = tail && tail.role === 'assistant' && tail.id === null
+      ? [...state.messages.slice(0, -1), reply]
+      : [...state.messages, reply]
+    state.historyCursor = page.next_before_id
+    state.historyHasMore = page.has_more
+    // 残留的 run 也认回补回后的数组与游标，否则切走再切回来会被它的旧状态盖掉
+    if (currentRun) {
+      currentRun.messages = state.messages
+      currentRun.historyCursor = state.historyCursor
+      currentRun.historyHasMore = state.historyHasMore
+    }
+    return true
+  } catch {
+    return false // 对账失败不影响当前界面，下一次定时器再试
+  }
+}
+
+function scheduleLateReplyCheck(sid: number): void {
+  // 纯对话也要过 gate + 记忆检索 + responder，慢的时候二三十秒才落库，兜到 80s。
+  // 每次定时器都重新判断「是否已有落库回复」，补上后其余定时器自然空转。
+  for (const delay of [1500, 4000, 10000, 20000, 35000, 55000, 80000]) {
+    lateReplyTimers.push(window.setTimeout(() => {
+      void reconcileReplyOnce(sid)
+    }, delay))
+  }
+}
+
+export async function openSession(id: number, silent = false): Promise<boolean> {
   // 左栏是全局导航：在插件库/通知页点某条会话要回对话视图，否则主区域停在独立页
   state.mainView = 'chat'
-  if (state.streaming) stop()
+  const seq = ++openSeq
+  clearLateReplyTimers()
+
+  // 切走不 stop()：A 会话还在流就让它继续跑，别把半截回复掐掉。
+  // 只把界面上这几个可能与上次同步后又被改过的字段写回它自己的 run。
+  const previous = runOf(state.sessionId)
+  if (previous) {
+    previous.pending = state.pending
+    previous.liveTools = state.liveTools
+    previous.streaming = state.streaming
+  }
+
   state.sessionId = id
+  state.panelParams = {}
+  persistSelected(id)
+
+  // 回到还有自己在跑的那一轮：直接用它攒下的数组，不重新拉历史（会把没落库的半截冲掉）
+  const run = runs.get(id)
+  if (run) {
+    syncActive(run)
+    return true
+  }
+
   state.messages = []
   state.pending = null
-  state.panelParams = {}
+  state.liveTools = []
+  state.streaming = false
+  state.historyCursor = null
+  state.historyHasMore = false
 
   try {
     const [page, allTasks] = await Promise.all([
@@ -538,6 +870,8 @@ export async function openSession(id: number): Promise<void> {
       // 任务清单是辅助信息：取不到就当没有，不能因为它让整个会话打不开
       chatApi.listTasks(id).catch(() => [] as AgentTask[]),
     ])
+    // 用户可能在等接口时又切了一轮，迟到的结果不能盖到别的会话上
+    if (state.sessionId !== id || seq !== openSeq) return false
     tasksByBind = groupTasksByBind(allTasks)
     state.messages = page.records
       // system 是给模型看的项目约定，不是对话内容
@@ -556,9 +890,20 @@ export async function openSession(id: number): Promise<void> {
 
     // 断线重连：上次卡在确认上，这次进来要接着问，否则用户以为 agent 死了
     const pending = await chatApi.getPendingInterrupt(id)
+    if (state.sessionId !== id || seq !== openSeq) return false
     if (pending.has_pending && pending.interrupt) state.pending = pending.interrupt
+
+    // 没有本地流就挂延迟对账：后端可能还在生成（末尾是 user），
+    // 或刚落库但拉历史时还没写完（末尾是半截/空 assistant）。
+    // reconcileReplyOnce 自己判断要不要补，所以这里无条件挂、可重复挂。
+    if (!runs.has(id)) scheduleLateReplyCheck(id)
+    return true
   } catch (error) {
-    toast(messageOf(error), 'error')
+    // 拉历史失败可能只是后端这一刻不可用。挂上持续对账，后端恢复后自动补回，
+    // 别让用户卡在一个空会话里。
+    if (!runs.has(id)) scheduleLateReplyCheck(id)
+    if (!silent) toast(messageOf(error), 'error')
+    return false
   }
 }
 
@@ -581,6 +926,13 @@ export async function loadOlder(): Promise<void> {
     state.messages = [...older, ...state.messages]
     state.historyCursor = page.next_before_id
     state.historyHasMore = page.has_more
+    // 重新赋值过数组，后台那一轮要认回新的这个，翻页游标也跟着存一份
+    const run = runOf(state.sessionId)
+    if (run) {
+      run.messages = state.messages
+      run.historyCursor = state.historyCursor
+      run.historyHasMore = state.historyHasMore
+    }
   } catch (error) {
     toast(messageOf(error), 'error')
   }
@@ -613,17 +965,27 @@ function applyUiFrame(frame: UiFrame) {
  * 而 push 前持有的原始引用改属性不会触发视图更新——流式逐字就会"攒着不显示"，
  * 直到别的状态变化牵连重渲染才一次性刷出来。所有流式写入都必须走数组里的 Proxy。
  */
-function findReply(key: string | null): UiMessage | null {
+function findReply(messages: UiMessage[], key: string | null): UiMessage | null {
   if (key === null) return null
-  return state.messages.find((m) => m.key === key) ?? null
+  return messages.find((m) => m.key === key) ?? null
 }
 
-function handleEvent(evt: SseEvent, replyKey: string | null) {
+/**
+ * 事件落到发起它的那一轮，不是当前显示的那一轮。
+ * 这样切走以后 A 的流继续写 A 的数组，B 的确认卡也不会被 A 的 interrupt 顶掉。
+ */
+function handleEvent(evt: SseEvent, replyKey: string | null, sid: number) {
+  const run = runOf(sid)
+  if (!run) return
+  // 重连游标：后端帧列表从 0 编号，我们收到一帧就 +1（初始 -1）。
+  // expired 是重连失败的特殊帧，不在后端帧序列里，不能计数。
+  if (evt.type !== 'expired') run.lastSeq += 1
   // 每帧重新查找：既拿到响应式 Proxy，也兼容 rewrite 延迟赋值数组的场景
-  const reply = findReply(replyKey)
+  const reply = findReply(run.messages, replyKey)
   switch (evt.type) {
     case 'text':
       if (reply) reply.content += evt.data
+      scheduleSnapshot()
       break
 
     case 'tasks':
@@ -633,19 +995,21 @@ function handleEvent(evt: SseEvent, replyKey: string | null) {
 
     case 'tool':
       if (evt.data.phase === 'start') {
-        state.liveTools = [...state.liveTools, evt.data]
+        run.liveTools = [...run.liveTools, evt.data]
       } else {
-        state.liveTools = state.liveTools.filter((t) => t.id !== evt.data.id)
+        run.liveTools = run.liveTools.filter((t) => t.id !== evt.data.id)
       }
       break
 
     case 'ui':
-      applyUiFrame(evt.data)
+      // 后台会话的工具面板不能把当前界面的工作区页顶掉
+      if (run.sessionId === state.sessionId) applyUiFrame(evt.data)
       break
 
     case 'interrupt':
       // 一次可能有多个工具要确认，服务端是逐个弹的，所以这里不合并、只覆盖当前这张
-      state.pending = evt.data
+      run.pending = evt.data
+      saveSnapshot(run)
       break
 
     case 'done':
@@ -656,13 +1020,62 @@ function handleEvent(evt: SseEvent, replyKey: string | null) {
       if (reply) reply.streaming = false
       toast(evt.data || '对话执行失败', 'error')
       break
+
+    case 'expired':
+      // 后端缓存已清（重启或轮次过期）：图可能已落库也可能没有。
+      // 重新拉一次历史；历史里没有这条回复时，才把本地半截标成中断。
+      if (reply) reply.streaming = false
+      void recoverAfterExpiry(sid, replyKey)
+      break
   }
+  syncActive(run)
+}
+
+/**
+ * 重连时发现后端帧缓冲已过期。后台图可能仍在跑（稍后落库），也可能进程重启被终止。
+ * 稍等一下再拉历史：有完整回复就用它替换半截；仍然没有才标中断。
+ */
+async function recoverAfterExpiry(sid: number, replyKey: string | null): Promise<void> {
+  await new Promise((r) => window.setTimeout(r, 1200))
+
+  // 先从帧缓冲之外的一条路找完整回复：直接读后端历史。
+  // 走 run 而不是 reconcileReplyOnce，是因为此刻续流 run 还在 runs 里，
+  // reconcileReplyOnce 会因为「有活跃流」而跳过。
+  const run = runOf(sid)
+  if (run && state.sessionId === sid) {
+    try {
+      const page = await chatApi.listMessages(sid, null, 30)
+      const last = page.records.filter((m) => m.role === 'assistant').pop()
+      const reply = findReply(run.messages, replyKey)
+      if (last && reply) {
+        const index = run.messages.findIndex((m) => m.key === replyKey)
+        if (index >= 0) {
+          run.messages[index] = {
+            ...reply,
+            id: last.id,
+            content: last.content,
+            streaming: false,
+            taskBindId: last.task_bind_id,
+          }
+        }
+        syncActive(run)
+        return
+      }
+    } catch {
+      /* 拉不到就走下面的持续对账 */
+    }
+  }
+
+  // 后端这一刻还没落库很正常（纯对话二三十秒才写完）。
+  // 不再打「输出已中断」——那会把本来能补回来的回复判死刑；
+  // 改成挂持续对账，图一旦落库就自动补上。
+  scheduleLateReplyCheck(sid)
 }
 
 /** 追加一条空的 AI 回复占位，返回它的 key（用 key 而不是对象，避免持有非响应式原始引用） */
-function pushReply(): string {
+function pushReply(run: SessionRun): string {
   const key = nextKey()
-  state.messages.push({ key, id: null, role: 'assistant', content: '', streaming: true })
+  run.messages.push({ key, id: null, role: 'assistant', content: '', streaming: true })
   return key
 }
 
@@ -683,33 +1096,55 @@ export async function send(text: string): Promise<void> {
     }
   }
 
-  state.messages.push({ key: nextKey(), id: null, role: 'user', content, streaming: false })
-  const replyKey = pushReply()
+  // 整轮绑定这个会话：请求发出后再切走，事件仍写回这里，不会串到新会话
+  const sid = state.sessionId
+  const run = ensureRun(sid)
+  persistSelected(sid)
+  run.messages.push({ key: nextKey(), id: null, role: 'user', content, streaming: false })
+  const replyKey = pushReply(run)
+  run.replyKey = replyKey
+  run.lastSeq = -1
+  run.pending = null
+  run.liveTools = []
+  run.streaming = true
+  run.aborted = false
+  const controller = new AbortController()
+  run.controller = controller
+  // 立刻写一份空快照：可能在第一个字吐出来之前就刷新，那时也要知道这里中断过
+  dropSnapshot(sid)
+  saveSnapshot(run)
+  syncActive(run)
 
-  state.streaming = true
-  state.liveTools = []
-  controller = new AbortController()
-
+  let aborted = false
   try {
     await chatApi.sendChat(
-      { conversationId: state.sessionId, content, webSearch: state.webSearch },
-      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey) },
+      { conversationId: sid, content, webSearch: state.webSearch },
+      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey, sid) },
     )
   } catch (error) {
-    const reply = findReply(replyKey)
-    if ((error as Error)?.name === 'AbortError') {
-      if (reply) reply.content += '\n\n（已停止）'
+    const reply = findReply(run.messages, replyKey)
+    // 刷新时浏览器可能抛 AbortError，也可能抛普通 "Failed to fetch"；
+    // 两种都是连接被切断，快照都得留着，否则刷新后这轮就彻底没了。
+    if ((error as Error)?.name === 'AbortError' || unloading) {
+      aborted = true
+      run.aborted = true
+      // 刷新页面不是用户主动停止，别往快照里塞「已停止」；复原时会标「输出已中断」
+      if (!unloading && reply) reply.content += '\n\n（已停止）'
+      saveSnapshot(run)
     } else {
       // 空回复就别留一个空气泡在界面上
-      if (reply && !reply.content) state.messages = state.messages.filter((m) => m.key !== replyKey)
+      if (reply && !reply.content) run.messages = run.messages.filter((m) => m.key !== replyKey)
       toast(messageOf(error), 'error')
     }
   } finally {
-    const reply = findReply(replyKey)
+    const reply = findReply(run.messages, replyKey)
     if (reply) reply.streaming = false
-    state.streaming = false
-    state.liveTools = []
-    controller = null
+    // 中断的这轮要留住 replyKey，pagehide 时才能把半截文本写进快照
+    if (!aborted) run.replyKey = null
+    run.streaming = false
+    run.controller = null
+    if (!aborted) dropSnapshot(sid)
+    syncActive(run)
     // 首轮之后后端可能把标题从「新对话」改成了摘要，静默重取，别把会话栏闪成骨架
     loadSessions(true)
   }
@@ -717,37 +1152,68 @@ export async function send(text: string): Promise<void> {
 
 /** 回应确认卡。之后可能再次收到 interrupt（多个工具逐个确认） */
 export async function respond(choice: 'approve' | 'reject', editContent?: string): Promise<void> {
-  if (!state.sessionId || !state.pending) return
-  const replyKey = pushReply()
-  state.pending = null
-  state.streaming = true
-  state.liveTools = []
-  controller = new AbortController()
+  const sid = state.sessionId
+  if (sid === null || !state.pending) return
+  // 只回应当前这张卡所属的会话；后台那轮的卡不会跑到这里来
+  const run = ensureRun(sid)
+  const replyKey = pushReply(run)
+  run.replyKey = replyKey
+  run.lastSeq = -1
+  run.pending = null
+  run.liveTools = []
+  run.streaming = true
+  run.aborted = false
+  const controller = new AbortController()
+  run.controller = controller
+  // 立刻写一份空快照：可能在第一个字吐出来之前就刷新，那时也要知道这里中断过
+  dropSnapshot(sid)
+  saveSnapshot(run)
+  syncActive(run)
 
+  let aborted = false
   try {
     await chatApi.resumeChat(
-      { conversationId: state.sessionId, choice, editContent, webSearch: state.webSearch },
-      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey) },
+      { conversationId: sid, choice, editContent, webSearch: state.webSearch },
+      { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey, sid) },
     )
   } catch (error) {
-    const reply = findReply(replyKey)
-    if (reply && !reply.content) state.messages = state.messages.filter((m) => m.key !== replyKey)
-    if ((error as Error)?.name !== 'AbortError') toast(messageOf(error), 'error')
+    const reply = findReply(run.messages, replyKey)
+    if (reply && !reply.content) run.messages = run.messages.filter((m) => m.key !== replyKey)
+    if ((error as Error)?.name === 'AbortError' || unloading) {
+      aborted = true
+      run.aborted = true
+      saveSnapshot(run)
+    } else {
+      toast(messageOf(error), 'error')
+    }
   } finally {
-    const reply = findReply(replyKey)
+    const reply = findReply(run.messages, replyKey)
     if (reply) reply.streaming = false
-    state.streaming = false
-    state.liveTools = []
-    controller = null
+    if (!aborted) run.replyKey = null
+    run.streaming = false
+    run.controller = null
+    if (!aborted) dropSnapshot(sid)
+    syncActive(run)
     loadSessions(true)
   }
 }
 
+/** 只停当前显示的这一轮；别的会话的流继续跑 */
 export function stop() {
-  controller?.abort()
-  controller = null
-  state.streaming = false
-  state.liveTools = []
+  const run = runOf(state.sessionId)
+  if (!run) {
+    state.streaming = false
+    state.liveTools = []
+    return
+  }
+  run.controller?.abort()
+  run.controller = null
+  run.streaming = false
+  const reply = findReply(run.messages, run.replyKey)
+  if (reply) reply.streaming = false
+  run.replyKey = null
+  dropSnapshot(run.sessionId)
+  syncActive(run)
 }
 
 /**
@@ -762,9 +1228,11 @@ export function stop() {
  */
 export async function rewrite(messageId: number, content: string): Promise<void> {
   const text = content.trim()
-  if (!text || state.streaming || !state.sessionId) return
+  const sid = state.sessionId
+  if (!text || state.streaming || sid === null) return
 
-  const index = state.messages.findIndex((m) => m.id === messageId)
+  const run = ensureRun(sid)
+  const index = run.messages.findIndex((m) => m.id === messageId)
   if (index < 0) {
     toast('这条消息已不在当前列表里，刷新后再试', 'error')
     return
@@ -778,39 +1246,54 @@ export async function rewrite(messageId: number, content: string): Promise<void>
   const begin = () => {
     if (begun) return
     begun = true
-    state.messages = [...state.messages.slice(0, index), user, reply]
+    run.messages = [...run.messages.slice(0, index), user, reply]
+    syncActive(run)
   }
 
-  state.streaming = true
-  state.liveTools = []
-  state.pending = null
-  controller = new AbortController()
+  run.replyKey = replyKey
+  run.lastSeq = -1
+  run.streaming = true
+  run.aborted = false
+  run.liveTools = []
+  run.pending = null
+  const controller = new AbortController()
+  run.controller = controller
+  // 立刻写一份空快照：可能在第一个字吐出来之前就刷新，那时也要知道这里中断过
+  dropSnapshot(sid)
+  saveSnapshot(run)
+  syncActive(run)
 
+  let aborted = false
   try {
     await chatApi.backtrackChat(
-      { conversationId: state.sessionId, messageId, content: text },
+      { conversationId: sid, messageId, content: text },
       {
         signal: controller.signal,
         onEvent: (evt) => {
           begin()
-          handleEvent(evt, replyKey)
+          handleEvent(evt, replyKey, sid)
         },
       },
     )
   } catch (error) {
-    const live = findReply(replyKey)
-    if ((error as Error)?.name === 'AbortError') {
-      if (live) live.content += '\n\n（已停止）'
+    const live = findReply(run.messages, replyKey)
+    if ((error as Error)?.name === 'AbortError' || unloading) {
+      aborted = true
+      run.aborted = true
+      if (!unloading && live) live.content += '\n\n（已停止）'
+      saveSnapshot(run)
     } else {
       toast(messageOf(error), 'error')
     }
   } finally {
     // 没 begun 说明请求在进图前就被拒了：界面保持原样，不截断、不留空气泡
-    const live = findReply(replyKey)
+    const live = findReply(run.messages, replyKey)
     if (live) live.streaming = false
-    state.streaming = false
-    state.liveTools = []
-    controller = null
+    if (!aborted) run.replyKey = null
+    run.streaming = false
+    run.controller = null
+    if (!aborted) dropSnapshot(sid)
+    syncActive(run)
     loadSessions(true)
   }
 }
@@ -901,12 +1384,169 @@ export async function dismissNotice(id: number): Promise<void> {
 
 /* =========================== 启动 =========================== */
 
-export async function boot(): Promise<void> {
-  if (readToken()) {
-    state.authed = true
-    await Promise.all([loadPlugins(), loadSessions()])
+/**
+ * 历史里已经有「快照这一轮」的完整回复时，直接用历史，不再用快照覆盖。
+ *
+ * 旧逻辑只在本地已有半截文字且和历史前缀一致时才跳过。若刷新发生在第一个字
+ * 之前，本地快照里是一条空回复，即使后端已经落库，也会拿空快照把历史盖掉，
+ * 用户就看到「只剩一句用户消息」。匹配时只认历史里最后一条用户消息，避免
+ * 用户重复发同一句话时误命中上一轮的回复。
+ */
+function historyAlreadyHasReply(snap: StreamSnapshot): boolean {
+  const snapshotUser = [...snap.messages].reverse().find((m) => m.role === 'user')
+  if (!snapshotUser) return false
+  const history = state.messages
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role !== 'user') continue
+    if (history[i].content !== snapshotUser.content) return false
+    return history.slice(i + 1).some((m) => m.role === 'assistant')
   }
-  state.booted = true
+  return false
+}
+
+/**
+ * 续流结束后再向后端对一次账：把本地这条回复换成已落库的完整内容。
+ *
+ * 正常补帧时两者一致，这里只是兜底——万一重连期间帧缓冲被别的轮次替换、
+ * 或某帧没落到响应式数组上，也不会给用户留下半截话。
+ */
+async function adoptHistoryReply(sid: number, run: SessionRun, replyKey: string | null): Promise<void> {
+  if (!replyKey || runs.get(sid) !== run) return
+  try {
+    const page = await chatApi.listMessages(sid, null, 30)
+    const last = page.records.filter((m) => m.role === 'assistant').pop()
+    const reply = findReply(run.messages, replyKey)
+    if (!last || !reply || runs.get(sid) !== run) return
+    if (reply.content !== last.content || reply.id === null) {
+      reply.content = last.content
+      reply.id = last.id
+      reply.streaming = false
+      reply.taskBindId = last.task_bind_id
+      syncActive(run)
+    }
+  } catch {
+    /* 历史暂时拉不到就维持续流结果，不打扰用户 */
+  }
+}
+
+/**
+ * 刷新后用快照里的游标重连后端，把断线期间攒下的帧补回来继续输出。
+ *
+ * 图在后端后台独立跑，刷新只是断了 SSE，不终止生成。所以这里不再补「输出已中断」
+ * 的静态消息，而是恢复消息数组 + 游标，让后半截字接着长出来。
+ * 只有后端缓存已过期（进程重启等）才会退回静态中断提示。
+ */
+async function restoreSnapshot(sid: number): Promise<void> {
+  const snap = readSnapshots()[String(sid)]
+  // 刷新后所有流都没了，其余会话的快照也一起作废
+  try {
+    sessionStorage.removeItem(SNAPSHOT_KEY)
+  } catch {
+    /* 忽略 */
+  }
+  if (!snap || state.sessionId !== sid) return
+
+  const partial = snap.replyKey
+    ? snap.messages.find((m) => m.key === snap.replyKey)
+    : null
+  // 后端已经落库了完整回复：openSession 拉到的历史就是终态，不用再重连，
+  // 否则半截 + 补帧会和历史里那条完整回复并排出现两次。
+  // 快照为空时也要走这里——这正是「刷新太早」导致只剩用户消息的那个坑。
+  if (historyAlreadyHasReply(snap)) return
+  const historyLast = state.messages.filter((m) => m.role === 'assistant').pop()
+  if (historyLast && historyLast.content.includes('输出已中断')) return
+
+  // 恢复这一轮的状态：消息数组（含还没落库的半截）+ 帧游标。
+  // 快照反序列化出的是普通数组，必须先放进 state.messages 拿到 Vue 的 Proxy，
+  // 再让 run.messages 指向它——直接持有原始数组，逐字写入不会触发视图更新。
+  state.messages = snap.messages
+  const run: SessionRun = {
+    sessionId: sid,
+    messages: state.messages,
+    replyKey: snap.replyKey,
+    lastSeq: snap.lastSeq,
+    pending: snap.pending,
+    liveTools: [],
+    streaming: true,
+    aborted: false,
+    controller: null,
+    historyCursor: state.historyCursor,
+    historyHasMore: state.historyHasMore,
+  }
+  runs.set(sid, run)
+  if (snap.pending) state.pending = snap.pending
+  state.streaming = true
+  // 把半截那条设回流式：TaskList 展开、输入框变停止，重连完成后再收起
+  const livePartial = findReply(run.messages, snap.replyKey)
+  if (livePartial) livePartial.streaming = true
+  syncActive(run)
+
+  const controller = new AbortController()
+  run.controller = controller
+  try {
+    await chatApi.attachChat(sid, snap.lastSeq, {
+      signal: controller.signal,
+      onEvent: (evt) => handleEvent(evt, snap.replyKey, sid),
+    })
+  } catch (error) {
+    // 重连本身失败（网络问题、用户切走导致 abort）：保留半截，交给持续对账补回。
+    // 不打「输出已中断」——后端后台任务多半还在跑，稍后就会落库。
+    scheduleLateReplyCheck(sid)
+    if ((error as Error)?.name !== 'AbortError') toast(messageOf(error), 'error')
+  } finally {
+    // 重连可能没补齐（帧缓冲被顶掉、某帧漏渲染等）：结束时以后端历史为准校正这条回复
+    await adoptHistoryReply(sid, run, snap.replyKey)
+    const reply = findReply(run.messages, snap.replyKey)
+    if (reply) reply.streaming = false
+    run.replyKey = null
+    run.streaming = false
+    run.controller = null
+    runs.delete(sid)
+    // 续流期间 handleEvent 的节流又把快照写回来了，这里彻底删掉，
+    // 否则下次刷新会拿一个已完成轮次的旧游标去重连
+    dropSnapshot(sid)
+    syncActive(run)
+    // adoptHistoryReply 只拉了一次；若那一刻后端还没落库，这里再挂持续对账兜底。
+    // 此刻 run 已从 Map 删除，reconcileReplyOnce 能正常执行。
+    scheduleLateReplyCheck(sid)
+    // 首轮之后后端可能改了标题，静默重取
+    loadSessions(true)
+  }
+}
+
+export async function boot(): Promise<void> {
+  // 数据没回来之前 messages 必然是空的，别让 ChatColumn 把它当成欢迎页闪出来
+  state.chatLoading = true
+  try {
+    if (readToken()) {
+      state.authed = true
+      const view = localStorage.getItem(SESSION_VIEW_KEY)
+      if (view === 'active' || view === 'archived') state.sessionView = view
+      await Promise.all([loadPlugins(), loadSessions()])
+
+      // 刷新后回到上次选中的会话。不要依赖会话列表里能不能找到它：列表只取第一页，
+      // 会话被归档/排序靠后时会找不到，但按 id 仍可能正常打开，直接拿它试。
+      const stored = Number(localStorage.getItem(SESSION_KEY) || '')
+      if (stored) {
+        const opened = await openSession(stored, true)
+        if (opened) {
+          // 快照续流要一直跑到图结束（可能几十秒），不能 await——
+          // 否则 boot 的 finally 迟迟不执行，loading 转圈会盖住整段流式输出。
+          // openSession 已把历史拉回来了，先让首屏显示，续流在后台补帧即可。
+          void restoreSnapshot(stored)
+        } else {
+          // 打开失败（后端暂时不可用、会话在归档视图等）不要清选中态：
+          // 一清掉下次刷新就回「新对话」，用户会以为消息丢了。保留 id，
+          // 下次刷新还能重试；这一轮先把消息区留空。
+          state.sessionId = stored
+          persistSelected(stored)
+        }
+      }
+    }
+  } finally {
+    state.chatLoading = false
+    state.booted = true
+  }
 }
 
 window.addEventListener('lm:unauthorized', () => {

@@ -24,6 +24,22 @@ export interface StreamOptions {
 }
 
 /**
+ * 断线重连接口。图在后端后台独立跑，SSE 断了不影响它；
+ * 刷新后带「已收到的最后一帧下标」重连，服务端把攒下的帧补发并继续实时推。
+ */
+export function attachChat(
+  conversationId: number,
+  afterSeq: number,
+  options: StreamOptions,
+): Promise<void> {
+  return stream(
+    `${SERVICE.agent}/v1/chat/attach`,
+    { conversation_id: conversationId, after_seq: afterSeq },
+    options,
+  )
+}
+
+/**
  * 发一个流式请求并逐帧回调。
  *
  * 不返回聚合结果：调用方（store）在 onEvent 里就地更新状态，

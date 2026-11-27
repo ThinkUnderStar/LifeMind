@@ -16,12 +16,13 @@ from starlette.responses import StreamingResponse
 from app.agent.graph import get_graph
 from app.api.v1.deps import current_identity, current_plugins, current_user_id
 from app.client.base import Identity
-from app.schemas.web.request import BacktrackDto, ChatDto, ResumeDto
+from app.schemas.web.request import AttachDto, BacktrackDto, ChatDto, ResumeDto
 from app.schemas.web.response import MessageListDto, PendingInterruptDto, TaskDto
 from app.schemas.web.result import Result
 from app.services.v1 import history_service
 from app.services.v1.chat_service import (
     assert_has_pending_interrupt,
+    attach_stream_service,
     backtrack_chat_service,
     chat_with_agent_service,
     clear_conversation_memory_service,
@@ -129,6 +130,29 @@ async def resume_chat(
 
     return _sse_response(
         resume_chat_service(graph, identity, resume_dto, enabled_plugins=enabled_plugins))
+
+
+@chat_router.post("/attach")
+async def attach_chat_stream(
+        attach_dto: AttachDto = Body(..., description="会话ID + 前端已收到的最后一帧下标"),
+        user_id: int = Depends(current_user_id),
+) -> StreamingResponse:
+    """
+    断线重连：接着某一轮还在跑（或刚跑完）的流读帧。
+
+    刷新页面会切断 SSE，但图在后台独立跑，所以这里只把断线期间攒下的帧补回去，
+    再实时续推后面的帧。不启动新图、不新增用户消息。
+
+    找不到帧缓冲（agent 重启、轮次过期）时流里发一帧 `expired` 后结束，
+    前端收到后退回「输出已中断」的静态提示，不会卡在等待状态。
+
+    :param attach_dto: conversation_id 与 after_seq
+    :param user_id: 网关注入的用户ID，用于归属校验
+    :return: text/event-stream 流
+    :raises BusinessException: 会话不存在或不属于当前用户（404）
+    """
+    await require_owned_conversation(user_id, attach_dto.conversation_id)
+    return _sse_response(attach_stream_service(attach_dto))
 
 
 @chat_router.post("/backtrack")

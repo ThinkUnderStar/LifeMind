@@ -7,7 +7,7 @@
  * 滚动策略：只在用户本来就贴着底部时才自动跟随。用户上滑看历史时如果被强行拽回底部，
  * 是这类界面最烦人的一处。
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
 import { loadOlder, rewrite, send, state, stop, toast, toggleWebSearch } from '../core/store'
 import type { UiMessage } from '../core/store'
 import ApprovalCard from '../components/ApprovalCard.vue'
@@ -28,6 +28,30 @@ const stick = ref(true)
  */
 const rewriting = ref<{ id: number; text: string } | null>(null)
 const rewritingBusy = ref(false)
+
+/**
+ * 改写框默认固定两行高；内容变长时自动长到上限，再长就在框内滚动。
+ * 不允许手动拉伸，否则一长条会把整屏消息顶走。
+ */
+const REWRITE_MIN_HEIGHT = 56
+const REWRITE_MAX_HEIGHT = 240
+const rewriteBoxEl = ref<HTMLTextAreaElement | null>(null)
+
+// 改写框在 v-for 里，字符串 ref 会被 Vue 收成数组；用函数 ref 直接拿到当前那一个元素
+function setRewriteBoxEl(el: Element | ComponentPublicInstance | null) {
+  rewriteBoxEl.value = el instanceof HTMLTextAreaElement ? el : null
+}
+
+function fitRewriteBox() {
+  const el = rewriteBoxEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  const need = el.scrollHeight
+  el.style.height = `${Math.max(REWRITE_MIN_HEIGHT, Math.min(need, REWRITE_MAX_HEIGHT))}px`
+  el.style.overflowY = need > REWRITE_MAX_HEIGHT ? 'auto' : 'hidden'
+}
+
+watch(() => rewriting.value?.text, () => void nextTick(fitRewriteBox))
 
 function startRewrite(message: UiMessage) {
   if (state.streaming || message.id === null) return
@@ -63,11 +87,66 @@ watch(() => state.sessionId, () => {
 /** AI 用品牌标，用户用账号首字母——和顶栏头像同一套口径 */
 const userInitial = computed(() => (state.account || '我').trim().charAt(0).toUpperCase())
 
-const EXAMPLES = [
-  '明天下午三点项目评审，提前半小时提醒我',
-  '每周三晚上健身，先来 12 次',
-  '我有哪些逾期的待办',
-]
+/**
+ * 首个字出来之前的等待态。纯静态文案会让人以为卡住了，
+ * 用跳点 + 轮播的中性提示告诉用户「还在干活」，但不承诺具体在做哪一步。
+ */
+const THINKING_HINTS = ['正在理解你的问题', '正在梳理相关信息', '正在组织回答']
+const thinkingStep = ref(0)
+const waitingFirstToken = computed(() =>
+  state.messages.some((m) => m.role === 'assistant' && m.streaming && !m.content),
+)
+let thinkingTimer: number | undefined
+
+watch(
+  waitingFirstToken,
+  (waiting) => {
+    if (thinkingTimer !== undefined) {
+      window.clearInterval(thinkingTimer)
+      thinkingTimer = undefined
+    }
+    if (!waiting) return
+    thinkingStep.value = 0
+    thinkingTimer = window.setInterval(() => {
+      thinkingStep.value = (thinkingStep.value + 1) % THINKING_HINTS.length
+    }, 2600)
+  },
+  { immediate: true },
+)
+
+/**
+ * 一键复制这条消息的原文。AI 回复复制的是 markdown 源，粘到别处不丢格式；
+ * 用户消息就是原话。剪贴板 API 在非安全上下文可能不可用，降级到 execCommand。
+ */
+async function copyMessage(message: UiMessage) {
+  const text = message.content
+  if (!text) return
+  // 先试现代剪贴板 API；它抛错（非安全上下文、无权限）时再降级到 execCommand。
+  // 两条路都走不通才提示手动复制。
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      toast('已复制')
+      return
+    }
+  } catch {
+    /* 落到下面的 execCommand */
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    if (!ok) throw new Error('copy failed')
+    toast('已复制')
+  } catch {
+    toast('复制失败，请手动选择文本', 'error')
+  }
+}
 
 const bodyEl = ref<HTMLElement | null>(null)
 // 程序贴底也会触发 scroll 事件，用它区分「用户主动上滑」和「我们自己滚到底」
@@ -119,6 +198,7 @@ onBeforeUnmount(() => {
   ro?.disconnect()
   ro = null
   if (programmaticTimer !== null) window.clearTimeout(programmaticTimer)
+  if (thinkingTimer !== undefined) window.clearInterval(thinkingTimer)
 })
 
 // 末尾消息 key 变化（用户发出、AI 回复、流式首帧）：交给 RO + 这里双保险。
@@ -134,10 +214,6 @@ function submit() {
   draft.value = ''
   stick.value = true
   void send(text)
-}
-
-function useExample(text: string) {
-  draft.value = text
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -157,19 +233,20 @@ function autoGrow(event: Event) {
 
 <template>
   <section class="chat">
+    <!-- 刷新后后端还没回数据时，空 messages 不是「欢迎页」，先给一个明确的加载态 -->
+    <div v-if="state.chatLoading" class="chat-loading" aria-live="polite">
+      <span class="loading-mark" aria-hidden="true"></span>
+      <span>正在载入对话…</span>
+    </div>
+
+    <template v-else>
     <div ref="streamEl" class="stream" @scroll="onScroll">
      <div ref="bodyEl" class="stream-body">
       <div v-if="!state.messages.length" class="intro">
         <h1>说一件事，它替你去记。</h1>
         <p class="intro-lede">
-          日程、待办、提醒、备忘都收在工作区里，需要时从右上角展开。你只要说清楚什么时候、做什么，
-          它会先把要做的操作摆出来问你是否同意，再落库。
+          日程、待办、提醒和备忘都收在工作区里。说清楚什么时候、做什么，它会把要做的事摆出来问你，确认后再落库。
         </p>
-        <ul class="examples">
-          <li v-for="text in EXAMPLES" :key="text">
-            <button type="button" @click="useExample(text)">{{ text }}</button>
-          </li>
-        </ul>
       </div>
 
       <article
@@ -186,7 +263,12 @@ function autoGrow(event: Event) {
           <!-- 改写态：行内编辑面板，两个动作收在面板右下角 -->
           <template v-if="rewriting && rewriting.id === message.id">
             <div class="rewrite-panel">
-              <textarea v-model="rewriting.text" class="rewrite-box" rows="3"></textarea>
+              <textarea
+                :ref="setRewriteBoxEl"
+                v-model="rewriting.text"
+                class="rewrite-box"
+                @input="fitRewriteBox"
+              ></textarea>
               <div class="rewrite-acts">
                 <span class="warn">会删掉这条之后的内容，重新生成</span>
                 <button class="btn btn-text" type="button" :disabled="rewritingBusy" @click="cancelRewrite">
@@ -213,12 +295,28 @@ function autoGrow(event: Event) {
               v-html="renderMarkdown(message.content)"
             ></div>
             <template v-else-if="message.content">{{ message.content }}</template>
-            <span v-else-if="message.streaming" class="thinking">正在想办法…</span>
+            <span v-else-if="message.streaming" class="thinking" role="status" aria-label="正在生成回复">
+              <span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span :key="thinkingStep" class="thinking-text" aria-hidden="true">{{ THINKING_HINTS[thinkingStep] }}</span>
+            </span>
             <span v-if="message.streaming && message.content" class="caret" aria-hidden="true"></span>
-            <!-- 改写入口：悬停出现的细线铅笔图标，收在消息下方右侧 -->
-            <div v-if="message.role === 'user' && message.id !== null && !state.streaming" class="rewrite-bar">
+            <!-- 消息操作条：每条都有一键复制；用户消息额外有改写。悬停才显，不抢阅读 -->
+            <div v-if="message.content && !message.streaming" class="msg-actions">
               <button
-                class="rewrite-icon"
+                class="msg-icon"
+                type="button"
+                title="复制这条内容"
+                aria-label="复制这条内容"
+                @click="copyMessage(message)"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <rect x="7" y="7" width="9" height="10" rx="1.5" />
+                  <path d="M13 4.5H5.5A1.5 1.5 0 0 0 4 6v8" />
+                </svg>
+              </button>
+              <button
+                v-if="message.role === 'user' && message.id !== null && !state.streaming"
+                class="msg-icon"
                 type="button"
                 title="改写这句话，从这一句重新生成"
                 aria-label="改写这句话"
@@ -308,6 +406,7 @@ function autoGrow(event: Event) {
         </button>
       </div>
     </form>
+    </template>
   </section>
 </template>
 
@@ -370,28 +469,28 @@ function autoGrow(event: Event) {
   line-height: 1.8;
 }
 
-.examples {
-  margin-top: var(--s7);
-  border-top: 1px solid var(--rule);
-}
-
-.examples li {
-  border-bottom: 1px solid var(--rule);
-}
-
-.examples button {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 14px 0;
-  font-size: var(--t-sm);
+/* 刷新后数据未就绪时的加载态：居中一小段，不闪欢迎页 */
+.chat-loading {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
   color: var(--muted);
-  transition: color var(--dur) var(--ease), padding-left var(--dur) var(--ease);
+  font-size: var(--t-sm);
 }
 
-.examples button:hover {
-  color: var(--signal);
-  padding-left: var(--s2);
+.loading-mark {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--rule-strong);
+  border-top-color: var(--signal);
+  border-radius: 50%;
+  animation: chat-loading-spin 0.8s linear infinite;
+}
+
+@keyframes chat-loading-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* 头像在正文侧边，不在上方——消息谁说的靠位置和头像就够，不必再占一行标签 */
@@ -564,8 +663,48 @@ function autoGrow(event: Event) {
 .md th { background: var(--paper-sunken); font-weight: 600; }
 
 .thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   color: var(--muted);
   font-size: var(--t-sm);
+}
+
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 1em;
+}
+
+.thinking-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--signal);
+  animation: think-bounce 1.2s var(--ease) infinite;
+}
+
+.thinking-dots i:nth-child(2) { animation-delay: 0.15s; }
+.thinking-dots i:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes think-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.32; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+.thinking-text {
+  animation: think-in 0.45s var(--ease);
+}
+
+@keyframes think-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-dots i,
+  .thinking-text { animation: none; }
 }
 
 /* 光标只在一个地方出现：正在长出来的那句末尾 */
@@ -697,22 +836,27 @@ function autoGrow(event: Event) {
   background: var(--signal-deep);
 }
 
-/* 改写入口：悬停才显的小铅笔圆钮，右对齐收在消息下方，不抢正常阅读 */
-.rewrite-bar {
+/* 消息操作条：悬停才显的小圆钮，收在消息下方各自一侧（AI 靠左、用户靠右），不抢阅读 */
+.msg-actions {
   display: flex;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  gap: var(--s2);
   height: 26px;
   margin-top: 2px;
   opacity: 0;
   transition: opacity var(--dur) var(--ease);
 }
 
-.turn:hover .rewrite-bar,
-.turn:focus-within .rewrite-bar {
+.turn[data-role='user'] .msg-actions {
+  justify-content: flex-end;
+}
+
+.turn:hover .msg-actions,
+.turn:focus-within .msg-actions {
   opacity: 1;
 }
 
-.rewrite-icon {
+.msg-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -725,13 +869,13 @@ function autoGrow(event: Event) {
     background var(--dur) var(--ease);
 }
 
-.rewrite-icon:hover {
+.msg-icon:hover {
   color: var(--signal);
   border-color: var(--signal-line);
   background: var(--signal-soft);
 }
 
-.rewrite-icon svg {
+.msg-icon svg {
   width: 13px;
   height: 13px;
   fill: none;
@@ -754,6 +898,8 @@ function autoGrow(event: Event) {
   display: block;
   width: 100%;
   min-width: 260px;
+  height: 56px; /* 默认固定两行；实际高度由 fitRewriteBox 按内容算，上限 240px */
+  max-height: 240px;
   padding: 6px 8px;
   border: 0;
   border-radius: var(--r-md);
@@ -762,7 +908,8 @@ function autoGrow(event: Event) {
   font-size: var(--t-sm);
   line-height: 1.7;
   color: var(--ink);
-  resize: vertical;
+  resize: none; /* 高度只跟内容走，不让手动拖成无限长 */
+  overflow-y: hidden; /* 到上限后才由 fitRewriteBox 切成 auto */
   white-space: pre-wrap;
 }
 

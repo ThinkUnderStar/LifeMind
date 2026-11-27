@@ -19,9 +19,10 @@
 但那是任务执行的中间流水（只该落到 agent_task.result），不是给用户看的话，
 所以文本必须按节点名过滤，不能见 chunk 就发。
 """
+import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph.state import CompiledStateGraph
@@ -41,12 +42,16 @@ from app.db.mysql.session import session_scope
 from app.db.postgresql.session import get_saver
 from app.exception.exceptions import BusinessException
 from app.schemas.graph.state import State
-from app.schemas.web.request import BacktrackDto, ChatDto, ResumeDto
+from app.schemas.web.request import AttachDto, BacktrackDto, ChatDto, ResumeDto
 from app.schemas.web.response import PendingInterruptDto
 from app.schemas.web.result import Result
 from app.services.v1.session_service import require_owned_conversation
+from app.services.v1 import stream_hub
 
 logger = logging.getLogger(__name__)
+
+# 后台跑图的任务必须留引用，否则可能被 GC 回收掉（asyncio 只保留弱引用）。
+_background_tasks: Set[asyncio.Task] = set()
 
 # 主会话那条 SystemMessage 的固定 id。
 # context_build 渲染完会沿用这个 id 写回，add_messages 按 id 合并，
@@ -295,6 +300,82 @@ async def _stream_graph(
         yield _sse("error", "对话执行失败，请稍后重试")
 
 
+def _spawn_stream(
+        session: stream_hub.StreamSession,
+        graph: CompiledStateGraph[State],
+        graph_input: Any,
+        config: Dict[str, Any],
+        scene: str,
+) -> None:
+    """
+    在独立后台任务里跑图，把帧写进会话缓冲；SSE 连接不参与图的生命周期。
+
+    这是刷新续传的关键：浏览器断开只会让 `_stream_from_hub` 停止读，
+    后台任务照常把整轮跑完并落库。任务引用放进模块级 set 防止被 GC。
+    """
+    async def drive() -> None:
+        try:
+            async for frame in _stream_graph(graph, graph_input, config, scene):
+                session.publish(frame)
+        except asyncio.CancelledError:
+            # 正常路径不会走到（没人 cancel 它）；真被取消也要收尾，否则重连会一直等
+            session.finish()
+            raise
+        except Exception:
+            logger.exception("%s 后台执行失败", scene)
+            session.publish(_sse("error", "对话执行失败，请稍后重试"))
+        finally:
+            session.finish()
+
+    task = asyncio.create_task(drive())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _stream_from_hub(
+        session: stream_hub.StreamSession,
+        after_seq: int = -1,
+) -> AsyncGenerator[str, None]:
+    """
+    从帧缓冲读 SSE：先补发前端没收到的帧，再跟着后台任务实时续推。
+
+    :param session: 该会话本轮的帧缓冲（由入口 create，或 attach 时按会话 id 找回）
+    :param after_seq: 前端已收到的最后一帧下标，-1 表示从头读
+    """
+    cursor = max(after_seq + 1, 0)
+
+    while True:
+        # 顺序不能反：先清事件再检查缓冲。反过来会漏掉「检查完、清事件前」写入的那一帧，
+        # 前端就永远等在那儿。清完之后有新帧会重新 set 事件，wait 立即返回。
+        session.changed.clear()
+
+        while cursor < len(session.frames):
+            frame = session.frames[cursor]
+            cursor += 1
+            yield frame
+
+        if session.done:
+            return
+        await session.changed.wait()
+
+
+async def attach_stream_service(attach_dto: AttachDto) -> AsyncGenerator[str, None]:
+    """
+    断线重连：从帧缓冲补发断线期间攒下的帧，然后跟着后台任务继续推。
+
+    缓存找不到（agent 重启、轮次已结束太久被清掉）时发一帧 `expired` 让前端降级，
+    不抛异常——重连失败不该把界面卡死，前端还有快照兜底。
+    """
+    session = stream_hub.get(attach_dto.conversation_id)
+    if session is None:
+        logger.info("重连未找到帧缓冲：conversation_id=%s", attach_dto.conversation_id)
+        yield _sse("expired")
+        return
+
+    async for frame in _stream_from_hub(session, attach_dto.after_seq):
+        yield frame
+
+
 async def assert_has_pending_interrupt(graph: CompiledStateGraph, conversation_id: int) -> None:
     """
     确认这条线程确实停在某个 interrupt 上，供 resume 前校验。
@@ -401,7 +482,9 @@ async def chat_with_agent_service(
         messages.append(SystemMessage(content="", id=SYSTEM_MESSAGE_ID))
     messages.append(HumanMessage(content=chat_dto.content))
 
-    async for frame in _stream_graph(graph, {"messages": messages}, config, "对话"):
+    session = stream_hub.create(chat_dto.conversation_id)
+    _spawn_stream(session, graph, {"messages": messages}, config, "对话")
+    async for frame in _stream_from_hub(session):
         yield frame
 
 
@@ -439,7 +522,9 @@ async def resume_chat_service(
         "edit": resume_dto.edit_content or "",
     })
 
-    async for frame in _stream_graph(graph, graph_input, config, "中断恢复"):
+    session = stream_hub.create(resume_dto.conversation_id)
+    _spawn_stream(session, graph, graph_input, config, "中断恢复")
+    async for frame in _stream_from_hub(session):
         yield frame
 
 
@@ -624,5 +709,7 @@ async def backtrack_chat_service(
         user_id, backtrack_dto.conversation_id, message_id, bool(from_checkpoint_id),
     )
 
-    async for frame in _stream_graph(graph, {"messages": messages}, config, "时间回溯"):
+    session = stream_hub.create(backtrack_dto.conversation_id)
+    _spawn_stream(session, graph, {"messages": messages}, config, "时间回溯")
+    async for frame in _stream_from_hub(session):
         yield frame

@@ -295,6 +295,7 @@ export type SseEvent =
   | { type: 'interrupt'; data: ApprovalPayload }
   | { type: 'done'; data?: null }
   | { type: 'error'; data: string }
+  | { type: 'expired'; data?: null }
 
 export interface ToolFrame {
   id: string
