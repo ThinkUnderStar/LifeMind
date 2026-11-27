@@ -63,10 +63,16 @@ __pycache__/
 *.egg-info/
 .eggs/
 
+# ============ 本地启动 / 运维脚本（只留在开发者本机，不进仓库） ============
+# 根目录 /scripts/：start/stop/status-backend.ps1 与「启动后端.cmd」入口，
+# 纯本机便利，路径与 jar 名写死，换机器必然要改，所以不纳入版本管理。
+# 必须带前导斜杠锚定根目录：life-mind-web/scripts/dev.mjs 是构建链路的一部分，仍要跟踪。
+/scripts/
+
 # ============ 日志与临时文件 ============
 *.log
 logs/
-# 本地启动脚本（scripts/start-backend.ps1）把各服务 stdout/stderr 落在这里
+# 启动脚本把各服务 stdout/stderr 落在这里
 .runlogs/
 # 临时构建 + 截图，用于没有 dev server 时验页面效果，验证完即弃
 .tmp_shot/
