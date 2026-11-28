@@ -23,6 +23,7 @@ import {
 } from '../core/store'
 import { applyTheme, currentTheme, THEMES, type ThemeKey } from '../core/theme'
 import ChevronIcon from '../components/ChevronIcon.vue'
+import UiIcon from '../components/UiIcon.vue'
 import * as sessionApi from '../api/session'
 import { parseDateTime, relativeDayText } from '../core/date'
 import brandLogo from '../assets/brand/lifemind-logo.png'
@@ -191,7 +192,7 @@ function whenOf(raw: string | null): string {
         :data-on="state.mainView === 'plugins'"
         @click="goPlugins"
       >
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 4h6v5H3zM11 4h6v5h-6zM3 11h6v5H3zM11 11h6v5h-6z" /></svg>
+        <UiIcon name="apps" :size="15" />
         <span>插件服务库</span>
       </button>
       <button
@@ -200,12 +201,12 @@ function whenOf(raw: string | null): string {
         :data-on="state.mainView === 'notice'"
         @click="goNotice"
       >
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a4.5 4.5 0 0 0-4.5 4.5v3L4 12.5h12L14.5 10V7A4.5 4.5 0 0 0 10 2.5ZM8.2 15a2 2 0 0 0 3.6 0" /></svg>
+        <UiIcon name="bell" :size="15" />
         <span>通知</span>
         <span v-if="state.noticeUnread" class="fn-badge">{{ state.noticeUnread > 99 ? '99+' : state.noticeUnread }}</span>
       </button>
       <button class="fn" type="button" :data-on="state.mainView === 'feedback'" @click="goFeedback">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3c4 0 7 2.3 7 5.2S14 13.4 10 13.4c-.8 0-1.5-.1-2.2-.3L4 15l1-3c-1.2-1-2-2.4-2-3.8C3 5.3 6 3 10 3Z" /></svg>
+        <UiIcon name="feedback" :size="15" />
         <span>意见反馈</span>
       </button>
     </nav>
@@ -341,9 +342,7 @@ function whenOf(raw: string | null): string {
         >
           <span class="swatch" :style="{ background: item.color }"></span>
           <span class="theme-menu-name">{{ item.name }}</span>
-          <svg v-if="theme === item.key" class="tick" viewBox="0 0 20 20" aria-hidden="true">
-            <path d="M4 10.5l4 4 8-9" />
-          </svg>
+          <UiIcon v-if="theme === item.key" name="check" :size="14" />
         </button>
       </div>
     </div>
@@ -420,11 +419,6 @@ function whenOf(raw: string | null): string {
   width: 15px;
   height: 15px;
   flex: 0 0 auto;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.4;
-  stroke-linecap: round;
-  stroke-linejoin: round;
 }
 
 .fn-badge {
@@ -836,16 +830,6 @@ function whenOf(raw: string | null): string {
 
 .theme-menu-name {
   flex: 1;
-}
-
-.tick {
-  width: 14px;
-  height: 14px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
 }
 
 .swatch {

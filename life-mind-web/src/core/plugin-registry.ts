@@ -30,8 +30,8 @@ export interface PluginManifest {
    * 映射不到就落在 defaultTab，宁可显示默认面板，也不要空白。
    */
   views: Record<string, string>
-  /** 图标路径。用内联 SVG 而不是图标字体：一个插件一条路径，不必为此引一个库 */
-  icon: string
+  /** 图标名，对应 core/icons.ts 里的 ICON_PATHS（阿里云 iconfont 线性图标） */
+  icon: keyof typeof import('./icons').ICON_PATHS
 }
 
 export const PLUGIN_MANIFESTS: PluginManifest[] = [
@@ -50,7 +50,7 @@ export const PLUGIN_MANIFESTS: PluginManifest[] = [
       reminder: 'day',
       stats: 'day',
     },
-    icon: 'M3 4.5h14M3 11h14M3 17.5h9',
+    icon: 'calendar',
   },
 ]
 

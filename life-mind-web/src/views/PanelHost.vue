@@ -17,16 +17,18 @@ import {
 import type { WorkspacePage } from '../core/types'
 import { PLUGIN_MANIFESTS, resolvePlugin } from '../core/plugin-registry'
 import ChevronIcon from '../components/ChevronIcon.vue'
+import UiIcon from '../components/UiIcon.vue'
+import type { ICON_PATHS } from '../core/icons'
 
 const current = computed(() => state.workspacePages.find((p) => p.key === state.workspacePage))
 const manifest = computed(() =>
   current.value?.pluginKey ? resolvePlugin(current.value.pluginKey) : undefined,
 )
 
-const BLANK_ICON = 'M4 4h5v5H4zM11 4h5v5h-5zM4 11h5v5H4zM11 11h5v5h-5z'
+type IconName = keyof typeof ICON_PATHS
 
-function iconOf(page: WorkspacePage): string {
-  return page.pluginKey ? (resolvePlugin(page.pluginKey)?.icon ?? BLANK_ICON) : BLANK_ICON
+function iconOf(page: WorkspacePage): IconName {
+  return page.pluginKey ? (resolvePlugin(page.pluginKey)?.icon ?? 'apps') : 'apps'
 }
 
 /**
@@ -71,9 +73,7 @@ const soon = computed(() =>
           :title="page.label"
           @click="selectWorkspacePage(page.key)"
         >
-          <svg class="favicon" viewBox="0 0 20 20" aria-hidden="true">
-            <path :d="iconOf(page)" />
-          </svg>
+          <UiIcon class="favicon" :name="iconOf(page)" :size="14" />
           <span class="tab-label">{{ page.label }}</span>
           <span
             class="tab-close"
@@ -105,7 +105,7 @@ const soon = computed(() =>
           <div v-for="item in entries" :key="item.key" class="card">
             <button class="open" type="button" :title="`打开${item.name}`" @click="openPluginHere(item.key)">
               <span class="card-icon">
-                <svg viewBox="0 0 20 20" aria-hidden="true"><path :d="item.icon" /></svg>
+                <UiIcon :name="item.icon" :size="17" />
               </span>
               <span class="card-text">
                 <strong>{{ item.name }}</strong>
@@ -194,16 +194,6 @@ const soon = computed(() =>
   text-overflow: ellipsis;
 }
 
-.favicon {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 auto;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.4;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
 
 .tab-close {
   display: inline-flex;
@@ -330,15 +320,6 @@ const soon = computed(() =>
   min-width: 0;
 }
 
-.card-icon svg {
-  width: 17px;
-  height: 17px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.5;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
 
 .card strong {
   font-size: var(--t-sm);

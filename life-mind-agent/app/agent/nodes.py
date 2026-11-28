@@ -667,12 +667,11 @@ async def gate(state: State) -> Dict:
     不兜底就会让整轮对话失败。这里重试 3 次；仍失败降级为「纯对话」(type=1)，
     走正常聊天回复、不判违规也不动工具，保证用户至少能收到一条回复。
     """
-    human_message = state.messages[-1]
     gate_llm = GateLlmManager.get_gate_llm()
     # 判据走 system message：写在 GateOutput 的 Field(description) 里 8B 模型基本不读。
     # langchain_core 1.x 起 ainvoke 只接受 PromptValue / str / list[BaseMessage]，
     # 单个 BaseMessage 会抛 ValueError（Invalid input type），所以统一包成 list。
-    gate_messages = [SystemMessage(content=GATE_SYSTEM_PROMPT), human_message]
+    gate_messages = [SystemMessage(content=GATE_SYSTEM_PROMPT), *state.messages]
     for attempt in range(1, 4):
         try:
             output = await gate_llm.ainvoke(gate_messages)

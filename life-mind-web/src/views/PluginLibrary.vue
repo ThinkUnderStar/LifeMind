@@ -7,21 +7,31 @@
  * 也不把这些服务当成工作区的标签——解绑后工作区就看不见它。
  *
  * 日程是默认绑定的插件（后端 default_enabled=1），和普通插件一样可解绑。
+ * 页面版式走「细线 + 留白」：不用阴影、不用彩色图标块，靠文字层级区分信息。
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { backToChat, openServicePage, state, togglePlugin } from '../core/store'
 import { resolvePlugin } from '../core/plugin-registry'
 import ChevronIcon from '../components/ChevronIcon.vue'
+import UiIcon from '../components/UiIcon.vue'
 
-const DEFAULT_ICON = 'M4 4h5v5H4zM11 4h5v5h-5zM4 11h5v5H4zM11 11h5v5h-5z'
+const query = ref('')
+const keyword = computed(() => query.value.trim().toLowerCase())
 
-/** 图标用前端 manifest 里的路径；后端还没做出面板的插件给个占位方块 */
-function iconOf(key: string): string {
-  return resolvePlugin(key)?.icon ?? DEFAULT_ICON
-}
+/** 名称、说明、插件标识都能搜；匹配不区分大小写 */
+const visiblePlugins = computed(() => {
+  if (!keyword.value) return state.plugins
+  return state.plugins.filter((item) =>
+    [item.name, item.description, item.pluginKey].some((field) =>
+      field.toLowerCase().includes(keyword.value),
+    ),
+  )
+})
 
 /** 已实现面板的插件才能点进去；后端列出来但前端还没做的，只显示绑定状态 */
-const readyKeys = computed(() => new Set(state.plugins.filter((p) => resolvePlugin(p.pluginKey)).map((p) => p.pluginKey)))
+const readyKeys = computed(
+  () => new Set(state.plugins.filter((p) => resolvePlugin(p.pluginKey)).map((p) => p.pluginKey)),
+)
 const boundCount = computed(() => state.plugins.filter((p) => p.enabled).length)
 const busy = computed(() => state.plugins.length === 0 && !state.booted)
 
@@ -34,39 +44,56 @@ function enter(key: string) {
 
 <template>
   <section class="library">
-    <header class="head">
-      <button class="back" type="button" @click="backToChat">
-        <ChevronIcon dir="left" :size="13" />回到对话
-      </button>
-      <div class="head-text">
-        <h1>插件服务库</h1>
-        <p>绑定服务后，对话里可以调用它，工作区也能打开它的面板。解绑后工作区不再显示。</p>
-      </div>
+    <button class="back" type="button" @click="backToChat">
+      <ChevronIcon dir="left" :size="13" />返回对话
+    </button>
+
+    <header class="hero">
+      <h1>插件服务库</h1>
     </header>
 
-    <div class="summary">
-      上架 {{ state.plugins.length }} 个服务 · 已绑定 {{ boundCount }} 个
+    <div class="toolbar">
+      <label class="search">
+        <UiIcon name="search" :size="17" />
+        <input
+          v-model="query"
+          type="search"
+          aria-label="搜索服务"
+          placeholder="搜索服务名称或功能"
+          autocomplete="off"
+        />
+        <button v-if="query" class="clear-search" type="button" aria-label="清除搜索" @click="query = ''">
+          <UiIcon name="close" :size="14" />
+        </button>
+      </label>
+      <span class="count">
+        {{ keyword ? `找到 ${visiblePlugins.length} 个` : `共 ${state.plugins.length} 个 · 已启用 ${boundCount} 个` }}
+      </span>
     </div>
 
     <p v-if="busy" class="hint">读取中…</p>
 
-    <div v-else-if="!state.plugins.length" class="empty-note">
-      还没有上架的服务。
+    <div v-else-if="!state.plugins.length" class="empty">
+      <p>还没有上架的服务。</p>
+    </div>
+
+    <div v-else-if="!visiblePlugins.length" class="empty">
+      <p>没有找到与「{{ query.trim() }}」相关的服务。</p>
+      <button type="button" @click="query = ''">清除搜索</button>
     </div>
 
     <ul v-else class="cards">
-      <li v-for="item in state.plugins" :key="item.pluginKey" class="card" :data-bound="item.enabled">
-        <span class="icon">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path :d="iconOf(item.pluginKey)" /></svg>
-        </span>
-
-        <div class="info">
-          <div class="line">
-            <strong>{{ item.name }}</strong>
-            <span v-if="!readyKeys.has(item.pluginKey)" class="tag">即将开放</span>
+      <li v-for="item in visiblePlugins" :key="item.pluginKey" class="card">
+        <div>
+          <div class="title-line">
+            <h2>{{ item.name }}</h2>
+            <span v-if="!readyKeys.has(item.pluginKey)" class="badge">即将开放</span>
           </div>
           <p class="desc">{{ item.description }}</p>
-          <p class="meta">{{ item.pluginKey }} · v{{ item.version }}</p>
+          <div class="foot">
+            <span class="meta">{{ item.pluginKey }} · v{{ item.version }}</span>
+            <span v-if="item.enabled" class="bound">已启用</span>
+          </div>
         </div>
 
         <div class="ops">
@@ -92,172 +119,199 @@ function enter(key: string) {
 
 <style scoped>
 .library {
-  display: flex;
-  flex-direction: column;
+  display: block;
   height: 100%;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--s6) var(--s6) var(--s7);
+  padding: 40px clamp(24px, 5vw, 72px) 64px;
   background: var(--paper);
-}
-
-.head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-start;
-  gap: var(--s5);
-}
-
-.head h1 {
-  font-size: 21px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-  color: var(--ink);
-}
-
-.head p {
-  margin-top: 7px;
-  font-size: var(--t-xs);
-  line-height: 1.7;
-  color: var(--muted);
 }
 
 .back {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  flex: 0 0 auto;
-  padding: 7px 14px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
+  gap: 4px;
+  padding: 4px 0;
   font-size: var(--t-xs);
   color: var(--muted);
-  white-space: nowrap;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease);
 }
 
 .back:hover {
   color: var(--ink);
-  border-color: var(--rule-strong);
 }
 
-.summary {
-  margin-top: var(--s5);
+.hero {
+  margin-top: 40px;
+}
+
+.hero h1 {
+  font-size: 30px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--s5);
+  margin-top: 44px;
   padding-bottom: var(--s3);
   border-bottom: 1px solid var(--rule);
-  font-size: var(--t-xs);
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  flex: 1;
+  max-width: 400px;
+  color: var(--muted);
+}
+
+.search input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--t-md);
+  color: var(--ink);
+}
+
+.search input::placeholder {
   color: var(--muted-soft);
 }
 
+.search input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.clear-search {
+  display: inline-flex;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.clear-search:hover {
+  color: var(--ink);
+}
+
+.count {
+  flex: 0 0 auto;
+  padding-bottom: 7px;
+  font-size: var(--t-xs);
+  color: var(--muted-soft);
+  white-space: nowrap;
+}
+
 .hint,
-.empty-note {
-  margin-top: var(--s5);
+.empty {
+  margin-top: var(--s6);
   font-size: var(--t-sm);
   color: var(--muted);
 }
 
-.cards {
-  display: grid;
-  gap: var(--s2);
+.empty button {
   margin-top: var(--s4);
-}
-
-/* 和服务入口一致：整行横条，不是方块 */
-.card {
-  display: flex;
-  align-items: center;
-  gap: var(--s4);
-  padding: 14px var(--s4);
+  padding: 7px 14px;
   border: 1px solid var(--rule);
-  border-radius: var(--r-lg);
-  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
-}
-
-.card:hover {
-  border-color: var(--rule-strong);
-}
-
-/* 解绑的条目淡下去，但绑定入口始终看得见 */
-.card:not([data-bound='true']) {
-  opacity: 0.66;
-}
-
-.card:not([data-bound='true']):hover {
-  opacity: 1;
-}
-
-.icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  width: 40px;
-  height: 40px;
-  border-radius: var(--r-md);
-  background: var(--signal-soft);
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
   color: var(--signal);
 }
 
-.card:not([data-bound='true']) .icon {
-  background: var(--paper-sunken);
-  color: var(--muted);
+.empty button:hover {
+  border-color: var(--signal-line);
 }
 
-.icon svg {
-  width: 18px;
-  height: 18px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.5;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+/* 编辑式网格：只有一条发丝分隔线，不开卡片盒子 */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  column-gap: clamp(24px, 4vw, 64px);
 }
 
-.info {
-  flex: 1;
-  min-width: 0;
-}
-
-.line {
+.card {
   display: flex;
-  align-items: center;
-  gap: var(--s2);
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 176px;
+  padding: var(--s5) 0 var(--s4);
+  border-bottom: 1px solid var(--rule);
 }
 
-.line strong {
-  font-size: var(--t-sm);
+.title-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+}
+
+.title-line h2 {
+  font-size: var(--t-lg);
   font-weight: 500;
   color: var(--ink);
 }
 
-.tag {
-  padding: 1px 7px;
+.badge {
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
   border-radius: var(--r-pill);
   font-size: 10px;
   color: var(--muted-soft);
-  background: var(--paper-sunken);
+  white-space: nowrap;
 }
 
 .desc {
-  margin-top: 3px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--t-xs);
+  margin-top: var(--s3);
+  font-size: var(--t-sm);
+  line-height: var(--lh-body);
   color: var(--muted);
 }
 
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  margin-top: var(--s4);
+}
+
 .meta {
-  margin-top: 3px;
+  font-family: var(--font-mono);
   font-size: 10px;
   color: var(--muted-soft);
+}
+
+.bound {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--t-xs);
+  color: var(--signal);
+  white-space: nowrap;
+}
+
+.bound::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .ops {
   display: flex;
   align-items: center;
-  gap: var(--s3);
-  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: var(--s5);
+  margin-top: var(--s4);
 }
 
 .enter {
@@ -265,16 +319,16 @@ function enter(key: string) {
   align-items: center;
   gap: 3px;
   font-size: var(--t-xs);
-  color: var(--signal);
+  color: var(--ink);
 }
 
 .enter:hover {
-  text-decoration: underline;
+  color: var(--signal);
 }
 
 .toggle {
-  min-width: 52px;
-  padding: 6px 12px;
+  min-width: 64px;
+  padding: 7px 14px;
   border: 1px solid var(--rule);
   border-radius: var(--r-pill);
   font-size: var(--t-xs);
@@ -287,7 +341,7 @@ function enter(key: string) {
   border-color: var(--rule-strong);
 }
 
-/* 已绑定：解绑是低调动作；未绑定：绑定是这张卡唯一该做的事，给信号色 */
+/* 未绑定时，绑定是这张卡唯一该做的事，给信号色 */
 .toggle[data-on='false'] {
   color: var(--signal);
   border-color: var(--signal-line);
@@ -295,20 +349,23 @@ function enter(key: string) {
 
 @media (max-width: 720px) {
   .library {
-    padding: var(--s5) var(--s4);
+    padding: var(--s5) var(--s4) var(--s6);
   }
 
-  .head {
-    flex-direction: column;
+  .hero {
+    margin-top: var(--s5);
   }
 
-  .card {
-    flex-wrap: wrap;
-    gap: var(--s3);
+  .hero h1 {
+    font-size: 24px;
   }
 
-  .ops {
-    margin-left: auto;
+  .toolbar {
+    margin-top: var(--s5);
+  }
+
+  .cards {
+    grid-template-columns: 1fr;
   }
 }
 </style>

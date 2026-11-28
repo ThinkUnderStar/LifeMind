@@ -24,6 +24,15 @@ class ChatDto(BaseModel):
         default=0,
         description="本轮是否允许联网搜索：1 开启、0 关闭；默认关闭，模型改不了这个开关",
     )
+    agent_permission: Literal["normal", "full"] = Field(
+        default="normal",
+        description="本会话的信任程度：normal 敏感工具逐次确认，full 完全信任直接执行；只接受这两个值",
+    )
+    chat_mode: Literal["work", "chat"] = Field(
+        default="work",
+        description="本轮运行模式：work 走完整流程（gate 判为任务就进任务链）；"
+                    "chat 强制纯对话，gate 判出的任务不执行，只按聊天回复；只接受这两个值",
+    )
 
 
 class ResumeDto(BaseModel):
@@ -49,6 +58,10 @@ class ResumeDto(BaseModel):
         default=0,
         description="恢复执行时的联网开关，需与本轮首次请求保持一致，否则工具行为会变",
     )
+    agent_permission: Literal["normal", "full"] = Field(
+        default="normal",
+        description="本会话的信任程度，需与本轮首次请求保持一致；只接受 normal/full",
+    )
 
 
 class BacktrackDto(BaseModel):
@@ -61,6 +74,18 @@ class BacktrackDto(BaseModel):
     conversation_id: int = Field(..., description="会话ID")
     message_id: int = Field(..., description="要被改写的那条用户消息ID；它及其之后的消息都会被替换")
     content: str = Field(..., min_length=1, description="改写后的消息内容")
+    enable_web_search: int = Field(
+        default=0,
+        description="本会话的联网开关，回溯重生成时沿用",
+    )
+    agent_permission: Literal["normal", "full"] = Field(
+        default="normal",
+        description="本会话的信任程度，回溯重生成时沿用；只接受 normal/full",
+    )
+    chat_mode: Literal["work", "chat"] = Field(
+        default="work",
+        description="本会话的运行模式，回溯重生成时沿用；chat 强制纯对话，只接受 work/chat",
+    )
 
 
 class AttachDto(BaseModel):

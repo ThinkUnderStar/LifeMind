@@ -82,10 +82,18 @@ async function stream(path: string, body: unknown, options: StreamOptions): Prom
   await readSseStream(res, (payload) => options.onEvent(payload as SseEvent))
 }
 
+/**
+ * 运行模式。work 走完整流程（该建任务就建任务）；
+ * chat 强制纯对话——后端仍会先过 gate 拦违规，但判出的任务一律不执行。
+ */
+export type ChatMode = 'work' | 'chat'
+
 export interface SendChatPayload {
   conversationId: number
   content: string
   webSearch?: boolean
+  agentPermission?: 'normal' | 'full'
+  chatMode?: ChatMode
 }
 
 export function sendChat(payload: SendChatPayload, options: StreamOptions): Promise<void> {
@@ -95,6 +103,8 @@ export function sendChat(payload: SendChatPayload, options: StreamOptions): Prom
       conversation_id: payload.conversationId,
       content: payload.content,
       enable_web_search: payload.webSearch ? 1 : 0,
+      agent_permission: payload.agentPermission ?? 'normal',
+      chat_mode: payload.chatMode ?? 'work',
     },
     options,
   )
@@ -105,6 +115,7 @@ export interface ResumePayload {
   choice: 'approve' | 'reject' | 'edit'
   editContent?: string
   webSearch?: boolean
+  agentPermission?: 'normal' | 'full'
 }
 
 export function resumeChat(payload: ResumePayload, options: StreamOptions): Promise<void> {
@@ -115,6 +126,7 @@ export function resumeChat(payload: ResumePayload, options: StreamOptions): Prom
       choice: payload.choice,
       edit_content: payload.editContent,
       enable_web_search: payload.webSearch ? 1 : 0,
+      agent_permission: payload.agentPermission ?? 'normal',
     },
     options,
   )
@@ -124,6 +136,9 @@ export interface BacktrackPayload {
   conversationId: number
   messageId: number
   content: string
+  webSearch?: boolean
+  agentPermission?: 'normal' | 'full'
+  chatMode?: ChatMode
 }
 
 export function backtrackChat(payload: BacktrackPayload, options: StreamOptions): Promise<void> {
@@ -133,6 +148,9 @@ export function backtrackChat(payload: BacktrackPayload, options: StreamOptions)
       conversation_id: payload.conversationId,
       message_id: payload.messageId,
       content: payload.content,
+      enable_web_search: payload.webSearch ? 1 : 0,
+      agent_permission: payload.agentPermission ?? 'normal',
+      chat_mode: payload.chatMode ?? 'work',
     },
     options,
   )

@@ -168,7 +168,10 @@ class PlannerLlmManager:
         if sig not in cls._cache:
             planner_llm = ChatOllama(
                 model=settings.PLANNER_MODEL_NAME,
-                temperature=0.2
+                temperature=0.2,
+                # deepseek-r1 默认开 thinking：哪怕只输出一份任务清单，也要先写 1300+ 字推理，
+                # 实测 24s vs 关掉后 0.7s。规划是结构化抽取，不需要推理，显式关掉。
+                reasoning=False,
             )
             # 模型结构化输出
             planner_llm_structured = planner_llm.with_structured_output(schema=PlannerOutput)

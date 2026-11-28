@@ -4,18 +4,12 @@
  *
  * 放在 AppShell 中间列的顶部：独占一行的高度，行内只有一个贴右上角（工作区
  * 左边界外）的窄条盒子，既不在视口最右压住工作区，也不占满整行挤对话正文。
- * 切到插件库/通知/个人主页等独立页时按钮组也不会消失。
+ * 只有对话页才渲染这一组；插件库/通知/个人主页等独立页由 AppShell 条件挂载。
  * 清空按钮恒定存在、不隐藏；没有会话、没有消息或正在流式输出时禁用（点不了）。
  */
 import { ref, watch } from 'vue'
-import {
-  backToChat,
-  clearConversation,
-  openWorkspace,
-  state,
-  toast,
-  toggleWorkspace,
-} from '../core/store'
+import { clearConversation, state, toast, toggleWorkspace } from '../core/store'
+import UiIcon from './UiIcon.vue'
 
 const confirmingClear = ref(false)
 const clearing = ref(false)
@@ -50,12 +44,7 @@ async function doClear() {
 }
 
 function onWorkspace() {
-  if (state.mainView === 'chat') {
-    toggleWorkspace()
-  } else {
-    backToChat()
-    openWorkspace()
-  }
+  toggleWorkspace()
 }
 </script>
 
@@ -73,9 +62,7 @@ function onWorkspace() {
       </button>
 
       <button class="top-op workspace-op" type="button" title="打开或收起工作区" @click="onWorkspace">
-        <svg class="work-icon" viewBox="0 0 20 20" aria-hidden="true">
-          <path d="M3 4h5v5H3zM11 4h6v5h-6zM3 12h5v4H3zM11 12h6v4h-6z" />
-        </svg>
+        <UiIcon name="apps" :size="14" />
         工作区
       </button>
     </div>
@@ -155,16 +142,6 @@ function onWorkspace() {
 
 .modal-acts .top-op.danger:hover:not(:disabled) {
   border-color: var(--alert);
-}
-
-.work-icon {
-  width: 14px;
-  height: 14px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.5;
-  stroke-linecap: round;
-  stroke-linejoin: round;
 }
 
 /* 确认弹窗：纸白实底 + 发丝边框，不用毛玻璃和发光 */

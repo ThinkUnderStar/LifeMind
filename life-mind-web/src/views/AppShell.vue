@@ -103,9 +103,9 @@ onBeforeUnmount(() => {
     <div class="main" :style="mainStyle" :data-view="state.mainView">
       <SessionRail class="rail" />
 
-      <!-- 中间列：顶部一行是操作组，下面才是视图内容；按钮不浮在内容上，滚动不遮挡 -->
+      <!-- 中间列：清空记录 / 工作区只属于对话，独立页不占这一行 -->
       <div class="center">
-        <TopActions />
+        <TopActions v-if="state.mainView === 'chat'" />
 
         <ChatColumn v-if="state.mainView === 'chat'" class="view chat" />
         <PluginLibrary v-else-if="state.mainView === 'plugins'" class="view library" />

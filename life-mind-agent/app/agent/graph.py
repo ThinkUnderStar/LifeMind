@@ -31,13 +31,19 @@ def route_after_gate(state: State) -> List[str]:
         return ["relevant_user_memories","recall"]
 
 def route_after_context(state: State) -> str:
-    """记忆装配完成后分流：type=1 纯对话走 responder，其余（2 任务）走 planner。
+    """记忆装配完成后分流：强制纯对话或 type=1 走 responder，其余（2 任务）走 planner。
+
+    两个条件取或，任一成立就走纯对话：
+    - state.chat_mode == "chat"：用户在界面上显式声明了纯对话模式。这是硬开关，
+      不依赖 gate 小模型理解意图（实测 qwen2.5:3b 不守长提示词里的「禁止」类规则），
+      所以哪怕 gate 判成 2，也不进任务链、不建任务、不动组件。
+    - state.type == 1：gate 判为纯对话。
+    违规（type=0）已在 route_after_gate 分走，到不了这里，所以 chat 模式仍会先被拦违规。
 
     chat 与 task 共用 N4/N5/N6 三层上下文，不能在 gate 处提前拆开。
     """
     # 0:违规对话 1:纯对话 2:需要执行任务
-    chat_type = state.type
-    if chat_type == 1:
+    if state.chat_mode == "chat" or state.type == 1:
         return "responder"
     else:
         return "planner"

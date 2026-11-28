@@ -85,6 +85,7 @@ def _build_config(
         from_checkpoint_id: Optional[str] = None,
         fork_checkpoint_id: Optional[str] = None,
         enabled_plugins: str = "",
+        agent_permission: str = "normal",
 ) -> Dict[str, Any]:
     """
     构造 LangGraph 的运行配置。
@@ -96,6 +97,7 @@ def _build_config(
     :param identity: 当前用户身份（ID + 角色 + 范围），三个值都进 configurable
     :param conversation_id: 会话ID，同时作为 thread_id
     :param enable_web_search: 本轮联网开关，放运行时 config，模型改不了
+    :param agent_permission: 本会话信任程度，full 时敏感工具不弹确认；未知值按 normal
     :param from_checkpoint_id: 要记录到消息行上的父快照
     :param fork_checkpoint_id: 要作为父节点分叉的快照
     :param enabled_plugins: 网关注入的插件标识串，llm_node 据此决定绑定哪些服务工具
@@ -113,6 +115,8 @@ def _build_config(
         "conversation_id": conversation_id,
         "thread_id": str(conversation_id),
         "enable_web_search": enable_web_search,
+        # 信任程度按会话走；只有显式 full 才放行，其他一律 normal（fail-closed）
+        "agent_permission": "full" if agent_permission == "full" else "normal",
         # 插件集合放在 configurable 而不是 State：它属于"这次请求的运行时上下文"，
         # 放进 State 会随 checkpoint 粘住，用户停用插件后旧快照里还留着旧集合
         "enabled_plugins": enabled_plugins or "",
@@ -464,7 +468,8 @@ async def chat_with_agent_service(
     has_history, checkpoint_id = await _load_thread_state(
         graph,
         _build_config(identity, chat_dto.conversation_id, chat_dto.enable_web_search,
-                      enabled_plugins=enabled_plugins),
+                      enabled_plugins=enabled_plugins,
+                      agent_permission=chat_dto.agent_permission),
     )
 
     config = _build_config(
@@ -473,6 +478,7 @@ async def chat_with_agent_service(
         enable_web_search=chat_dto.enable_web_search,
         from_checkpoint_id=checkpoint_id,
         enabled_plugins=enabled_plugins,
+        agent_permission=chat_dto.agent_permission,
     )
 
     messages: list = []
@@ -483,7 +489,10 @@ async def chat_with_agent_service(
     messages.append(HumanMessage(content=chat_dto.content))
 
     session = stream_hub.create(chat_dto.conversation_id)
-    _spawn_stream(session, graph, {"messages": messages}, config, "对话")
+    # chat_mode 随首轮输入写进 State：route_after_context 读它决定要不要强制走纯对话。
+    # 放 State 而不是 config，是因为条件边只拿得到 state；resume 时不重传，
+    # 靠 checkpoint 里的值继续生效（确认卡恢复不该改变本轮模式）。
+    _spawn_stream(session, graph, {"messages": messages, "chat_mode": chat_dto.chat_mode}, config, "对话")
     async for frame in _stream_from_hub(session):
         yield frame
 
@@ -515,7 +524,8 @@ async def resume_chat_service(
         raise BusinessException(message="选择编辑时必须提供修改后的内容", code=400)
 
     config = _build_config(identity, resume_dto.conversation_id, resume_dto.enable_web_search,
-                           enabled_plugins=enabled_plugins)
+                           enabled_plugins=enabled_plugins,
+                           agent_permission=resume_dto.agent_permission)
 
     graph_input = Command(resume={
         "choice": resume_dto.choice,
@@ -689,17 +699,21 @@ async def backtrack_chat_service(
     messages: list = []
     if from_checkpoint_id:
         config = _build_config(
-            user_id=user_id,
+            identity=identity,
             conversation_id=backtrack_dto.conversation_id,
+            enable_web_search=backtrack_dto.enable_web_search,
             from_checkpoint_id=from_checkpoint_id,
             fork_checkpoint_id=from_checkpoint_id,
             enabled_plugins=enabled_plugins,
+            agent_permission=backtrack_dto.agent_permission,
         )
     else:
         # 首条消息的回溯：没有可用快照，只能清空线程从头开始
         await get_saver().adelete_thread(str(backtrack_dto.conversation_id))
         config = _build_config(identity=identity, conversation_id=backtrack_dto.conversation_id,
-                               enabled_plugins=enabled_plugins)
+                               enable_web_search=backtrack_dto.enable_web_search,
+                               enabled_plugins=enabled_plugins,
+                               agent_permission=backtrack_dto.agent_permission)
         messages.append(SystemMessage(content="", id=SYSTEM_MESSAGE_ID))
 
     messages.append(HumanMessage(content=backtrack_dto.content))
@@ -710,6 +724,9 @@ async def backtrack_chat_service(
     )
 
     session = stream_hub.create(backtrack_dto.conversation_id)
-    _spawn_stream(session, graph, {"messages": messages}, config, "时间回溯")
+    # 回溯会从旧快照分叉重跑，旧快照里的 chat_mode 可能是切换前的，所以这里显式带上，
+    # 避免「刚切成纯对话、改写上一句却仍去动工具」这种模式串味
+    _spawn_stream(session, graph, {"messages": messages, "chat_mode": backtrack_dto.chat_mode},
+                  config, "时间回溯")
     async for frame in _stream_from_hub(session):
         yield frame

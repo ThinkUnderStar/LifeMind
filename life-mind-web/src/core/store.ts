@@ -23,6 +23,7 @@ import { login as loginApi } from '../api/auth'
 import { listPlugins, setPluginEnabled } from '../api/plugin'
 import * as sessionApi from '../api/session'
 import * as chatApi from '../api/chat'
+import type { ChatMode } from '../api/chat'
 import { popupNotices, markRead, pageNotices, unreadCount } from '../api/notice'
 import { readToken, writeToken } from '../api/http'
 import { resolvePlugin, resolveTab } from './plugin-registry'
@@ -86,9 +87,18 @@ export interface Toast {
 
 const ACCOUNT_KEY = 'lm.account'
 const PANEL_OPEN_KEY = 'lm.panel.open'
-const WEB_SEARCH_KEY = 'lm.websearch'
+/** 每个会话自己的联网/信任偏好；key 0 表示还没建库的新对话（输入框上先设好，发出时迁移过去） */
+const SESSION_PREFS_KEY = 'lm.session.prefs'
 const SESSION_KEY = 'lm.session'
 const SESSION_VIEW_KEY = 'lm.session.view'
+/** 顶层视图：刷新后停在用户正在看的功能页，而不是一律回对话 */
+const MAIN_VIEW_KEY = 'lm.main.view'
+const MAIN_VIEWS = ['chat', 'plugins', 'notice', 'feedback', 'profile'] as const
+type MainView = (typeof MAIN_VIEWS)[number]
+const readMainView = (): MainView => {
+  const v = localStorage.getItem(MAIN_VIEW_KEY)
+  return MAIN_VIEWS.find((item) => item === v) ?? 'chat'
+}
 /**
  * 刷新会杀掉 SSE 连接，但图在后端后台照跑。浏览器只需记住「读到第几帧」，
  * 刷新后用这个游标重连，把断线期间的帧补回来接着输出。
@@ -115,9 +125,9 @@ export const state = reactive({
    * 顶层界面。chat = 左栏 + 对话 + 右工作区；另外四个是左栏入口对应的独立整页。
    * 五者互斥：进独立页时对话侧整块收起，退回后原样恢复（会话、工作区页都还在）。
    * 规则：从左栏（功能区块与账号菜单）进去的，一律是独立页，不占工作区标签。
-   * 不持久化：刷新回到对话，避免停在已经不是工作区一页的页面上。
+   * 刷新后停在原来的功能页（见 MAIN_VIEW_KEY）；登出会重置回对话。
    */
-  mainView: 'chat' as 'chat' | 'plugins' | 'notice' | 'feedback' | 'profile',
+  mainView: readMainView() as MainView,
 
   sessions: [] as Conversation[],
   /** 会话栏当前看哪一类：正常会话 / 已归档。后端按 archived 参数过滤，前端不自己筛 */
@@ -133,10 +143,17 @@ export const state = reactive({
 
   streaming: false,
   /**
-   * 本轮是否允许联网搜索。默认关（后端也是显式 1 才联网），用户点一次记住选择。
-   * 开关放运行时 config 传给 agent，模型改不了它，只能在开着时调搜索工具。
+   * 当前显示会话的联网开关，值来自 getSessionPrefs（按会话隔离，不全局共享）。
+   * 默认关，后端也是显式 1 才联网；开关放运行时 config 传给 agent，模型改不了。
    */
-  webSearch: localStorage.getItem(WEB_SEARCH_KEY) === '1',
+  webSearch: false,
+  /** 当前显示会话的信任程度：normal 敏感工具逐次确认，full 直接执行 */
+  agentPermission: 'normal' as AgentPermission,
+  /**
+   * 当前显示会话的运行模式，同样按会话隔离。
+   * chat 时后端会强制走纯对话：gate 仍拦违规，但判出的任务一律不执行。
+   */
+  chatMode: 'work' as ChatMode,
   /** 正在跑的工具，成对出现，start 时加、end 时移除 */
   liveTools: [] as ToolFrame[],
   pending: null as ApprovalPayload | null,
@@ -214,6 +231,11 @@ function syncActive(run: SessionRun | null) {
   state.streaming = run.streaming
   state.historyCursor = run.historyCursor
   state.historyHasMore = run.historyHasMore
+  // 联网/信任跟着会话走：切回来还是自己那一份，不会被别的会话改掉
+  const prefs = getSessionPrefs(run.sessionId)
+  state.webSearch = prefs.webSearch
+  state.agentPermission = prefs.permission
+  state.chatMode = prefs.chatMode
 }
 
 function persistSelected(id: number | null) {
@@ -284,12 +306,91 @@ window.addEventListener('pagehide', () => {
   for (const run of runs.values()) saveSnapshot(run)
 })
 
-/* =========================== 联网开关 =========================== */
+/* =========================== 按会话的联网与信任偏好 =========================== */
 
-/** 切一次联网开关，顺手记住——下次打开还是上次的选择 */
+export type AgentPermission = 'normal' | 'full'
+
+interface SessionPrefs {
+  webSearch: boolean
+  permission: AgentPermission
+  chatMode: ChatMode
+}
+
+function blankPrefs(): SessionPrefs {
+  return { webSearch: false, permission: 'normal', chatMode: 'work' }
+}
+
+/** 坏数据全部当默认；信任程度未知时一律回落到 normal，不能因为脏数据被放大成 full */
+function readSessionPrefs(): Map<number, SessionPrefs> {
+  const map = new Map<number, SessionPrefs>()
+  try {
+    const raw = JSON.parse(localStorage.getItem(SESSION_PREFS_KEY) || '{}') as Record<string, Partial<SessionPrefs>>
+    for (const [key, value] of Object.entries(raw)) {
+      const sid = Number(key)
+      if (!Number.isInteger(sid) || sid < 0 || !value || typeof value !== 'object') continue
+      map.set(sid, {
+        webSearch: value.webSearch === true,
+        permission: value.permission === 'full' ? 'full' : 'normal',
+        // 只有明确写了 chat 才算纯对话，脏值一律回落到 work（宁可多干活也不静默吞任务）
+        chatMode: value.chatMode === 'chat' ? 'chat' : 'work',
+      })
+    }
+  } catch {
+    // 坏 JSON 当没有偏好
+  }
+  return map
+}
+
+const sessionPrefs = readSessionPrefs()
+
+function persistSessionPrefs() {
+  const obj: Record<string, SessionPrefs> = {}
+  for (const [sid, prefs] of sessionPrefs) obj[sid] = prefs
+  localStorage.setItem(SESSION_PREFS_KEY, JSON.stringify(obj))
+}
+
+/** sid=null 表示还没建库的新对话，用 key 0 那一份 */
+export function getSessionPrefs(sid: number | null): SessionPrefs {
+  return sessionPrefs.get(sid ?? 0) ?? blankPrefs()
+}
+
+function setSessionPrefs(sid: number, patch: Partial<SessionPrefs>) {
+  const next = { ...getSessionPrefs(sid === 0 ? null : sid), ...patch }
+  sessionPrefs.set(sid, next)
+  persistSessionPrefs()
+  // 正在显示的会话（含还没建库的 0）同步镜像，按钮立即反映
+  if (sid === (state.sessionId ?? 0)) {
+    state.webSearch = next.webSearch
+    state.agentPermission = next.permission
+    state.chatMode = next.chatMode
+  }
+}
+
+/** 首条消息真正创建会话后，把输入框上先设好的偏好转过去 */
+function adoptDraftPrefs(sid: number) {
+  const draft = sessionPrefs.get(0)
+  if (!draft) return
+  sessionPrefs.delete(0)
+  if (!sessionPrefs.has(sid)) sessionPrefs.set(sid, draft)
+  persistSessionPrefs()
+}
+
+/** 切一次联网开关，只影响当前会话 */
 export function toggleWebSearch() {
-  state.webSearch = !state.webSearch
-  localStorage.setItem(WEB_SEARCH_KEY, state.webSearch ? '1' : '0')
+  setSessionPrefs(state.sessionId ?? 0, { webSearch: !getSessionPrefs(state.sessionId).webSearch })
+}
+
+/** 切当前会话的信任程度：full 下敏感工具不弹确认卡，直接执行 */
+export function setAgentPermission(permission: AgentPermission) {
+  setSessionPrefs(state.sessionId ?? 0, { permission })
+}
+
+/**
+ * 切当前会话的运行模式：chat 只聊天不动手（后端 gate 仍拦违规，判出的任务不执行）。
+ * 只影响当前会话，切走再切回来还保持原样。
+ */
+export function setChatMode(mode: ChatMode) {
+  setSessionPrefs(state.sessionId ?? 0, { chatMode: mode })
 }
 
 /* =========================== 提示 =========================== */
@@ -381,7 +482,7 @@ export function logout() {
   state.noticeList = []
   state.noticeUnread = 0
   state.plugins = []
-  state.mainView = 'chat'
+  setMainView('chat')
   const fresh = blankPage()
   state.workspacePages = [fresh]
   state.workspacePage = fresh.key
@@ -427,28 +528,34 @@ function closePluginPages(pluginKey: string) {
   state.panelEpoch += 1
 }
 
+/** 顶层视图统一从这里切，顺手记下来供刷新恢复 */
+export function setMainView(view: MainView) {
+  state.mainView = view
+  localStorage.setItem(MAIN_VIEW_KEY, view)
+}
+
 /** 左栏四个功能入口：都切顶层独立页，不占工作区标签、不顶掉正在看的对话 */
 export function openPluginLibrary() {
-  state.mainView = 'plugins'
+  setMainView('plugins')
 }
 
 /** 通知进页时拉一次列表；弹窗队列与它无关，照常轮询 */
 export function openNotice() {
-  state.mainView = 'notice'
+  setMainView('notice')
   void loadNoticeList()
 }
 
 export function openFeedback() {
-  state.mainView = 'feedback'
+  setMainView('feedback')
 }
 
 /** 左栏底部账号菜单进个人主页 */
 export function openProfile() {
-  state.mainView = 'profile'
+  setMainView('profile')
 }
 
 export function backToChat() {
-  state.mainView = 'chat'
+  setMainView('chat')
 }
 
 /* =========================== 工作区页面 =========================== */
@@ -677,7 +784,7 @@ export async function switchSessionView(view: 'active' | 'archived'): Promise<vo
  */
 export async function newSession(): Promise<void> {
   // 左栏是全局导航：在插件库/通知页点「新对话」要回对话视图，否则界面没反应
-  state.mainView = 'chat'
+  setMainView('chat')
 
   // 归档视图里点新对话，先切回正常视图才能看到稍后创建的会话
   if (state.sessionView === 'archived') {
@@ -695,6 +802,11 @@ export async function newSession(): Promise<void> {
   state.historyCursor = null
   state.historyHasMore = false
   persistSelected(null)
+  // 新对话先用 key 0 那份偏好，首条消息建库后再迁过去
+  const draft = getSessionPrefs(null)
+  state.webSearch = draft.webSearch
+  state.agentPermission = draft.permission
+  state.chatMode = draft.chatMode
 }
 
 /**
@@ -769,6 +881,11 @@ async function reconcileReplyOnce(sid: number): Promise<boolean> {
   // send 结束后 run 会一直留在 Map 里（没删），用它判断会让对账永远跳过。
   const run = runOf(sid)
   if (run && run.streaming) return false
+  // 确认卡挂着说明这一轮停在中途（敏感工具等人批），不是「回复漏了」。
+  // 此时 send 的 SSE 已结束、streaming=false，但图还没跑完、本轮回复还没落库；
+  // 若放任对账，会把后端「上一条 assistant」当成漏掉的本轮回复补进来，
+  // 界面上就多出一条与上一轮一模一样的旧回复。等用户点完确认再对账。
+  if (run && run.pending) return false
 
   let lastUserIdx = -1
   for (let i = state.messages.length - 1; i >= 0; i--) {
@@ -788,9 +905,16 @@ async function reconcileReplyOnce(sid: number): Promise<boolean> {
     // await 期间用户可能切了会话或这一轮又开跑，迟到的结果不能盖上去
     const currentRun = runOf(sid)
     if (state.sessionId !== sid || state.streaming || (currentRun && currentRun.streaming)) return false
+    // await 期间也可能弹出了确认卡，同样不能再用旧回复补
+    if (currentRun && currentRun.pending) return false
     const records = page.records.filter((m) => m.role !== 'system')
     const backendLast = [...records].reverse().find((m) => m.role === 'assistant')
     if (!backendLast) return false // 后端也还没落库，等下一次定时器
+    // 后端最后一条 assistant 必须排在本轮末尾 user 之后才算「本轮回复」：
+    // chat_message.id 自增，本轮回复的 id 一定大于触发它的那条 user。
+    // 否则就是上一轮的旧回复（本轮还没落库），补进来会凭空多一条重复消息。
+    const lastUser = state.messages[lastUserIdx]
+    if (lastUser.id !== null && backendLast.id <= lastUser.id) return false
 
     tasksByBind = groupTasksByBind(allTasks)
     const reply: UiMessage = {
@@ -832,8 +956,9 @@ function scheduleLateReplyCheck(sid: number): void {
 }
 
 export async function openSession(id: number, silent = false): Promise<boolean> {
-  // 左栏是全局导航：在插件库/通知页点某条会话要回对话视图，否则主区域停在独立页
-  state.mainView = 'chat'
+  // 左栏是全局导航：点某条会话要回对话视图，否则主区域停在独立页。
+  // silent=true 是 boot 的后台恢复：那时不该改视图，刷新要停在原来的功能页。
+  if (!silent) setMainView('chat')
   const seq = ++openSeq
   clearLateReplyTimers()
 
@@ -849,6 +974,10 @@ export async function openSession(id: number, silent = false): Promise<boolean> 
   state.sessionId = id
   state.panelParams = {}
   persistSelected(id)
+  const prefs = getSessionPrefs(id)
+  state.webSearch = prefs.webSearch
+  state.agentPermission = prefs.permission
+  state.chatMode = prefs.chatMode
 
   // 回到还有自己在跑的那一轮：直接用它攒下的数组，不重新拉历史（会把没落库的半截冲掉）
   const run = runs.get(id)
@@ -1088,6 +1217,7 @@ export async function send(text: string): Promise<void> {
   if (!state.sessionId) {
     try {
       const created = await sessionApi.createSession()
+      adoptDraftPrefs(created.id)
       state.sessionId = created.id
       state.sessions = [created, ...state.sessions.filter((s) => s.id !== created.id)]
     } catch (error) {
@@ -1098,6 +1228,7 @@ export async function send(text: string): Promise<void> {
 
   // 整轮绑定这个会话：请求发出后再切走，事件仍写回这里，不会串到新会话
   const sid = state.sessionId
+  const prefs = getSessionPrefs(sid)
   const run = ensureRun(sid)
   persistSelected(sid)
   run.messages.push({ key: nextKey(), id: null, role: 'user', content, streaming: false })
@@ -1118,7 +1249,7 @@ export async function send(text: string): Promise<void> {
   let aborted = false
   try {
     await chatApi.sendChat(
-      { conversationId: sid, content, webSearch: state.webSearch },
+      { conversationId: sid, content, webSearch: prefs.webSearch, agentPermission: prefs.permission, chatMode: prefs.chatMode },
       { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey, sid) },
     )
   } catch (error) {
@@ -1139,6 +1270,12 @@ export async function send(text: string): Promise<void> {
   } finally {
     const reply = findReply(run.messages, replyKey)
     if (reply) reply.streaming = false
+    // 挂了确认卡：这一轮还没结束，只是等人批。send 时建的那条回复气泡还没写字，
+    // 而 replyKey 马上要清空、resume 时 respond() 会自己新建一条——
+    // 这里不删就是一条永远空着的气泡，界面看起来像多回复了一条。删掉它。
+    if (!aborted && run.pending && reply && !reply.content) {
+      run.messages = run.messages.filter((m) => m.key !== replyKey)
+    }
     // 中断的这轮要留住 replyKey，pagehide 时才能把半截文本写进快照
     if (!aborted) run.replyKey = null
     run.streaming = false
@@ -1155,6 +1292,7 @@ export async function respond(choice: 'approve' | 'reject', editContent?: string
   const sid = state.sessionId
   if (sid === null || !state.pending) return
   // 只回应当前这张卡所属的会话；后台那轮的卡不会跑到这里来
+  const prefs = getSessionPrefs(sid)
   const run = ensureRun(sid)
   const replyKey = pushReply(run)
   run.replyKey = replyKey
@@ -1173,7 +1311,7 @@ export async function respond(choice: 'approve' | 'reject', editContent?: string
   let aborted = false
   try {
     await chatApi.resumeChat(
-      { conversationId: sid, choice, editContent, webSearch: state.webSearch },
+      { conversationId: sid, choice, editContent, webSearch: prefs.webSearch, agentPermission: prefs.permission },
       { signal: controller.signal, onEvent: (evt) => handleEvent(evt, replyKey, sid) },
     )
   } catch (error) {
@@ -1231,6 +1369,7 @@ export async function rewrite(messageId: number, content: string): Promise<void>
   const sid = state.sessionId
   if (!text || state.streaming || sid === null) return
 
+  const prefs = getSessionPrefs(sid)
   const run = ensureRun(sid)
   const index = run.messages.findIndex((m) => m.id === messageId)
   if (index < 0) {
@@ -1266,7 +1405,7 @@ export async function rewrite(messageId: number, content: string): Promise<void>
   let aborted = false
   try {
     await chatApi.backtrackChat(
-      { conversationId: sid, messageId, content: text },
+      { conversationId: sid, messageId, content: text, webSearch: prefs.webSearch, agentPermission: prefs.permission, chatMode: prefs.chatMode },
       {
         signal: controller.signal,
         onEvent: (evt) => {
@@ -1523,6 +1662,10 @@ export async function boot(): Promise<void> {
       const view = localStorage.getItem(SESSION_VIEW_KEY)
       if (view === 'active' || view === 'archived') state.sessionView = view
       await Promise.all([loadPlugins(), loadSessions()])
+
+      // 刷新停在通知页时没经过 openNotice()，列表得在这里补拉一次；
+      // 其他功能页各自 onMounted 加载（或已被上面的 loadPlugins 覆盖），只有通知页靠入口函数。
+      if (state.mainView === 'notice') void loadNoticeList()
 
       // 刷新后回到上次选中的会话。不要依赖会话列表里能不能找到它：列表只取第一页，
       // 会话被归档/排序靠后时会找不到，但按 id 仍可能正常打开，直接拿它试。

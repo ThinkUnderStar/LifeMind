@@ -47,6 +47,10 @@ class State(BaseModel):
     has_tasks: bool = True
     # 当前正在运行的 task（agent_task.id，自增整数）；无任务时为 None
     running_task_id: Optional[int] = None
+    # 本轮运行模式：work 走完整流程 / chat 强制纯对话（gate 判出任务也不进任务链）。
+    # 由前端请求体的 chat_mode 随首轮输入写入，route_after_context 读它做或判断；
+    # 未知值一律按 work 处理（fail-open 到常规流程，不会因脏数据把任务静默吞掉）
+    chat_mode: str = "work"
     # 本轮对话的任务绑定UUID：save_human 之后由 generate_task_bind_id 生成，
     # save_ai 写进 AI 消息、planner 写进任务行，三者共用一个值把任务绑到具体对话
     task_bind_id: Optional[str] = None

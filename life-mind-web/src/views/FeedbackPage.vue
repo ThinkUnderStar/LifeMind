@@ -129,99 +129,103 @@ onBeforeUnmount(dropShot)
 
 <template>
   <section class="feedback">
-    <header class="head">
-      <button class="back" type="button" @click="backToChat">
-        <ChevronIcon dir="left" :size="13" />回到对话
-      </button>
-      <div>
-        <h1>意见反馈</h1>
-        <p class="lede">哪里不好用、哪里出错了，直接写。处理完会发一条通知给你。</p>
-      </div>
+    <button class="back" type="button" @click="backToChat">
+      <ChevronIcon dir="left" :size="13" />返回对话
+    </button>
+
+    <div class="page">
+    <header class="hero">
+      <h1>意见反馈</h1>
     </header>
 
     <template v-if="sent">
-      <p class="done">已经收到了。谢谢你说这些。</p>
-      <button class="act" type="button" @click="again">再写一条</button>
+      <div class="done-panel">
+        <h2>提交成功</h2>
+        <button class="subtle" type="button" @click="again">再写一条</button>
+      </div>
     </template>
 
     <template v-else>
-      <div class="field-row">
-        <span class="tag">类型</span>
-        <div class="chips">
-          <button
-            v-for="item in TYPES"
-            :key="item.value"
-            class="chip"
-            type="button"
-            :aria-pressed="type === item.value"
-            @click="type = item.value"
-          >
-            {{ item.label }}
-          </button>
+      <div class="compose">
+        <div class="form-row">
+          <span class="label">反馈类型</span>
+          <div class="types">
+            <button
+              v-for="item in TYPES"
+              :key="item.value"
+              class="type"
+              type="button"
+              :aria-pressed="type === item.value"
+              @click="type = item.value"
+            >
+              {{ item.label }}
+            </button>
+          </div>
         </div>
-      </div>
 
-      <div class="field-row top">
-        <span class="tag">内容</span>
-        <div class="grow">
+        <div class="form-row">
+          <label class="label" for="feedback-content">说说情况</label>
           <textarea
+            id="feedback-content"
             v-model="content"
-            class="box"
             rows="5"
             maxlength="1000"
             placeholder="发生了什么、你本来想做什么、现在变成了什么样"
           ></textarea>
           <p v-if="content.length > 800" class="count">{{ content.length }} / 1000</p>
         </div>
-      </div>
 
-      <div class="field-row">
-        <span class="tag">截图</span>
-        <div class="shot">
-          <template v-if="shotUrl">
-            <img class="thumb" :src="shotUrl" alt="待提交的截图" />
-            <span class="shot-name">{{ shot?.name }}</span>
-            <button class="act" type="button" @click="dropShot">移除</button>
-          </template>
-          <template v-else>
-            <button class="act" type="button" @click="fileInput?.click()">选一张图</button>
-            <span class="hint">可空，5MB 内</span>
-          </template>
+        <div class="form-row">
+          <span class="label">截图</span>
+          <div class="shot-row">
+            <template v-if="shotUrl">
+              <img class="thumb" :src="shotUrl" alt="待提交的截图" />
+              <span class="shot-name">{{ shot?.name }}</span>
+              <button class="subtle" type="button" @click="dropShot">移除</button>
+            </template>
+            <template v-else>
+              <button class="subtle" type="button" @click="fileInput?.click()">选择一张图片</button>
+              <span class="hint">可空，5MB 内</span>
+            </template>
+            <input
+              ref="fileInput"
+              type="file"
+              accept="image/jpeg,image/png,image/gif,image/webp,image/bmp"
+              hidden
+              @change="pickFile"
+            />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label class="label" for="feedback-contact">联系方式</label>
           <input
-            ref="fileInput"
-            type="file"
-            accept="image/jpeg,image/png,image/gif,image/webp,image/bmp"
-            hidden
-            @change="pickFile"
+            id="feedback-contact"
+            v-model="contact"
+            class="contact"
+            type="text"
+            maxlength="60"
+            placeholder="手机号或邮箱，可空"
           />
         </div>
-      </div>
 
-      <div class="field-row">
-        <span class="tag">联系</span>
-        <input
-          v-model="contact"
-          class="line"
-          type="text"
-          maxlength="60"
-          placeholder="手机号或邮箱，可空"
-        />
-      </div>
+        <p class="caution">
+          内容和截图工作人员都能看到，截图会存放在公开地址上。密码、身份证、银行卡这些别放进来。
+        </p>
 
-      <p class="caution">
-        内容和截图工作人员都能看到，截图还存在公开地址上。密码、身份证、银行卡这些别放进来。
-      </p>
-
-      <div class="foot">
-        <span class="hint">还想补一句？提交后可以接着再写一条。</span>
-        <button class="act primary" type="button" :disabled="sending" @click="submit">
-          {{ sending ? '提交中…' : '提交' }}
-        </button>
+        <div class="actions">
+          <button class="submit" type="button" :disabled="sending" @click="submit">
+            {{ sending ? '提交中…' : '提交反馈' }}
+          </button>
+        </div>
       </div>
     </template>
 
     <section v-if="rows.length || loadingList || listError" class="mine">
-      <h2 class="sec">我提交过的</h2>
+      <div class="mine-head">
+        <h2>我提交过的</h2>
+        <span v-if="total" class="mine-count">{{ total }} 条</span>
+      </div>
 
       <p v-if="loadingList && !rows.length" class="empty">正在取…</p>
       <p v-else-if="listError && !rows.length" class="empty">{{ listError }}</p>
@@ -246,162 +250,140 @@ onBeforeUnmount(dropShot)
 
       <p v-if="total > rows.length" class="more">还有 {{ total - rows.length }} 条没显示</p>
     </section>
+    </div>
   </section>
 </template>
 
 <style scoped>
 .feedback {
-  flex: 1;
+  display: block;
+  height: 100%;
   min-height: 0;
-  min-width: 0;
   overflow-y: auto;
-  padding: var(--s5) var(--s4) var(--s6);
+  padding: 40px clamp(24px, 5vw, 72px) 72px;
+  background: var(--paper);
 }
 
-.head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-start;
-  gap: var(--s5);
-}
-
-.head h1 {
-  font-size: 20px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
+/* 整页内容统一收在中间一栏，左右留白相等；外层 .feedback 只负责滚动和边缘 padding */
+.page {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
 }
 
 .back {
   display: inline-flex;
+  align-self: flex-start;
   align-items: center;
-  gap: 3px;
-  flex: 0 0 auto;
-  padding: 7px 14px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
+  gap: 4px;
+  padding: 4px 0;
   font-size: var(--t-xs);
   color: var(--muted);
-  white-space: nowrap;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease);
 }
 
 .back:hover {
   color: var(--ink);
-  border-color: var(--rule-strong);
 }
 
-.lede {
-  margin-top: 6px;
-  font-size: var(--t-xs);
-  line-height: 1.7;
-  color: var(--muted);
+.hero {
+  margin-top: 40px;
 }
 
-.field-row {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  min-height: 40px;
-  padding: 7px 0;
-  font-size: var(--t-sm);
+.hero h1 {
+  font-size: 30px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.compose {
+  margin-top: 44px;
+}
+
+.form-row {
+  padding: 22px 0;
+  border-top: 1px solid var(--rule);
+}
+
+.form-row:last-of-type {
   border-bottom: 1px solid var(--rule);
 }
 
-.field-row:first-of-type {
-  margin-top: var(--s4);
-}
-
-.field-row.top {
-  align-items: flex-start;
-}
-
-.tag {
-  flex: 0 0 42px;
-  color: var(--muted);
-  padding-top: 6px;
-}
-
-.grow {
-  flex: 1;
-  min-width: 0;
-}
-
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.chip {
-  padding: 4px 10px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
+.label {
+  display: block;
+  margin-bottom: 14px;
   font-size: var(--t-xs);
   color: var(--muted);
-  background: var(--paper);
 }
 
-.chip:hover {
+.types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+}
+
+.type {
+  padding: 8px 18px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  font-size: var(--t-sm);
+  color: var(--muted);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+.type:hover {
   color: var(--ink);
   border-color: var(--rule-strong);
 }
 
-.chip[aria-pressed='true'] {
+.type[aria-pressed='true'] {
   color: var(--signal);
   border-color: var(--signal-line);
   background: var(--signal-soft);
 }
 
-.box {
+textarea {
   display: block;
   width: 100%;
-  padding: 8px 10px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-md);
-  background: var(--paper);
+  min-height: 148px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
   font: inherit;
-  font-size: var(--t-sm);
-  line-height: 1.7;
+  font-size: var(--t-md);
+  line-height: 1.8;
   color: var(--ink);
   resize: vertical;
 }
 
-.box:focus,
-.line:focus {
-  border-color: var(--rule-strong);
+textarea::placeholder,
+.contact::placeholder {
+  color: var(--muted-soft);
 }
 
 .count {
-  margin-top: 3px;
+  margin-top: var(--s2);
   font-size: var(--t-xs);
   color: var(--muted-soft);
   text-align: right;
 }
 
-.line {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 9px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-md);
-  background: var(--paper);
-  font-size: var(--t-sm);
-  color: var(--ink);
-}
-
-.shot {
+.shot-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  min-width: 0;
+  gap: var(--s4);
+  min-height: 56px;
 }
 
 .thumb {
-  width: 36px;
-  height: 36px;
+  width: 56px;
+  height: 56px;
   object-fit: cover;
-  border-radius: var(--r-sm);
   border: 1px solid var(--rule);
+  border-radius: var(--r-md);
 }
 
 .shot-name {
@@ -410,102 +392,148 @@ onBeforeUnmount(dropShot)
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--t-xs);
-  color: var(--muted);
-}
-
-.caution {
-  margin-top: var(--s3);
-  font-size: var(--t-xs);
-  line-height: 1.7;
-  color: var(--muted-soft);
-}
-
-.foot {
-  display: flex;
-  align-items: center;
-  gap: var(--s3);
-  margin-top: var(--s4);
-}
-
-.hint {
-  flex: 1;
-  font-size: var(--t-xs);
-  color: var(--muted-soft);
-}
-
-.act {
-  padding: 5px 0;
-  font-size: var(--t-sm);
-  color: var(--muted);
-}
-
-.act:hover {
-  color: var(--ink);
-}
-
-.act.primary {
-  color: var(--signal);
-  font-weight: 500;
-}
-
-.act:disabled {
-  opacity: 0.5;
-}
-
-.done {
-  margin-top: var(--s5);
   font-size: var(--t-sm);
   color: var(--ink-soft);
 }
 
-.done + .act {
-  margin-top: 10px;
-}
-
-/* 「我提交过的」是回看区，不是主流程：标题小、分隔线轻，不与上面的表单抢注意力 */
-.mine {
-  margin-top: var(--s6);
-  padding-top: var(--s4);
-  border-top: 1px solid var(--rule);
-}
-
-.sec {
+.hint {
   font-size: var(--t-xs);
-  font-weight: 500;
-  letter-spacing: 0.04em;
-  color: var(--muted);
+  color: var(--muted-soft);
 }
 
-.empty {
-  margin-top: 10px;
+.contact {
+  width: 100%;
+  padding: 0 0 4px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--t-md);
+  color: var(--ink);
+}
+
+.caution {
+  max-width: 620px;
+  margin-top: var(--s4);
+  font-size: var(--t-xs);
+  line-height: var(--lh-body);
+  color: var(--muted-soft);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s4);
+  margin-top: var(--s5);
+}
+
+.subtle {
+  padding: 4px 0;
+  font-size: var(--t-sm);
+  color: var(--signal);
+}
+
+.subtle:hover {
+  color: var(--signal-deep);
+}
+
+.submit {
+  padding: 10px 28px;
+  border-radius: var(--r-pill);
+  background: var(--signal);
+  font-size: var(--t-sm);
+  color: var(--on-signal);
+  white-space: nowrap;
+  transition: opacity var(--dur) var(--ease);
+}
+
+.submit:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.submit:disabled {
+  opacity: 0.5;
+}
+
+.done-panel {
+  margin-top: 44px;
+  padding: var(--s6) 0;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+
+.done-panel h2 {
+  font-size: var(--t-xl);
+  font-weight: 400;
+  color: var(--ink);
+}
+
+.done-panel .subtle {
+  margin-top: var(--s5);
+}
+
+/* 历史是回看区：标题克制，正文不抢表单 */
+.mine {
+  margin-top: var(--s7);
+}
+
+.mine-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+  padding-bottom: var(--s3);
+  border-bottom: 1px solid var(--rule);
+}
+
+.mine-head h2 {
+  font-size: var(--t-lg);
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.mine-count {
+  font-size: var(--t-xs);
+  color: var(--muted-soft);
+}
+
+.empty,
+.more {
+  margin-top: var(--s4);
   font-size: var(--t-xs);
   color: var(--muted-soft);
 }
 
 .rec {
-  padding: 10px 0;
+  padding: var(--s5) 0;
   border-bottom: 1px solid var(--rule);
-}
-
-.rec:last-child {
-  border-bottom: none;
 }
 
 .rec-top {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--s3);
 }
 
 .kind {
-  font-size: var(--t-xs);
-  color: var(--ink-soft);
+  font-size: var(--t-sm);
+  color: var(--ink);
 }
 
 .state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: var(--t-xs);
   color: var(--muted);
+}
+
+.state::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .state[data-s='1'] {
@@ -513,7 +541,7 @@ onBeforeUnmount(dropShot)
 }
 
 .state[data-s='2'] {
-  color: var(--ink);
+  color: var(--done);
 }
 
 .state[data-s='3'] {
@@ -522,15 +550,15 @@ onBeforeUnmount(dropShot)
 
 .time {
   margin-left: auto;
-  font-size: var(--t-xs);
+  font-family: var(--font-mono);
+  font-size: 10px;
   color: var(--muted-soft);
-  font-variant-numeric: tabular-nums;
 }
 
 .rec-body {
-  margin-top: 4px;
+  margin-top: var(--s3);
   font-size: var(--t-sm);
-  line-height: 1.7;
+  line-height: var(--lh-body);
   color: var(--ink-soft);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -538,44 +566,51 @@ onBeforeUnmount(dropShot)
 
 .rec-shot {
   display: block;
-  max-width: 100%;
+  max-width: 240px;
   max-height: 160px;
-  margin-top: 6px;
+  margin-top: var(--s3);
   border: 1px solid var(--rule);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
   object-fit: cover;
 }
 
 .rec-reply {
-  margin-top: 6px;
-  padding-left: 9px;
-  border-left: 1px solid var(--rule-strong);
+  margin-top: var(--s4);
+  padding: var(--s3) var(--s4);
+  border-left: 2px solid var(--signal-line);
+  background: var(--signal-soft);
   font-size: var(--t-xs);
-  line-height: 1.7;
+  line-height: var(--lh-body);
   color: var(--ink-soft);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .who {
-  margin-right: 6px;
+  margin-right: var(--s2);
   color: var(--muted);
-}
-
-.more {
-  margin-top: 10px;
-  font-size: var(--t-xs);
-  color: var(--muted-soft);
 }
 
 @media (max-width: 720px) {
   .feedback {
-    padding: var(--s5) var(--s4);
+    padding: var(--s5) var(--s4) var(--s6);
   }
 
-  .head {
+  .hero {
+    margin-top: var(--s5);
+  }
+
+  .hero h1 {
+    font-size: 24px;
+  }
+
+  .actions {
     flex-direction: column;
-    gap: var(--s3);
+    align-items: stretch;
+  }
+
+  .submit {
+    align-self: flex-end;
   }
 }
 </style>

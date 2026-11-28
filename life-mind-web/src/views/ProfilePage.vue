@@ -328,514 +328,653 @@ async function pickAvatar(event: Event) {
 
 <template>
   <section class="profile">
-    <header class="head">
-      <button class="back" type="button" @click="backToChat">
-        <ChevronIcon dir="left" :size="13" />回到对话
-      </button>
-      <h1>个人主页</h1>
-    </header>
+    <button class="back" type="button" @click="backToChat">
+      <ChevronIcon dir="left" :size="13" />返回对话
+    </button>
 
-    <p v-if="loading" class="hint">读取中…</p>
-    <div v-else-if="failed" class="hint">
-      {{ failed }}
-      <button type="button" class="act" @click="load">重试</button>
-    </div>
-
-    <template v-else-if="profile">
-      <header class="ident">
-        <button
-          class="avatar"
-          type="button"
-          :disabled="uploading"
-          title="更换头像"
-          @click="avatarInput?.click()"
-        >
-          <img v-if="profile.avatar" :src="profile.avatar" alt="" />
-          <span v-else>{{ initial }}</span>
-        </button>
-        <div class="who">
-          <p class="name">{{ title }}</p>
-          <button class="act small" type="button" :disabled="uploading" @click="avatarInput?.click()">
-            {{ uploading ? '上传中…' : '更换头像' }}
-          </button>
-        </div>
-        <input ref="avatarInput" class="file" type="file" accept="image/*" @change="pickAvatar" />
-      </header>
-
-      <dl class="rows">
-        <div class="row">
-          <dt>昵称</dt>
-          <template v-if="editing === 'nickname'">
-            <input
-              v-model="draft.nickname"
-              class="field"
-              maxlength="16"
-              placeholder="1~16 位"
-              @keydown.enter="saveNickname"
-              @keydown.esc="cancel"
-            />
-            <button class="act on" type="button" :disabled="saving" @click="saveNickname">保存</button>
-            <button class="act" type="button" @click="cancel">取消</button>
-          </template>
-          <template v-else>
-            <dd>{{ profile.nickname || '未设置' }}</dd>
-            <button class="act" type="button" @click="start('nickname')">修改</button>
-          </template>
-        </div>
-
-        <div class="row">
-          <dt>账户名</dt>
-          <template v-if="editing === 'username'">
-            <input
-              v-model="draft.username"
-              class="field"
-              maxlength="16"
-              placeholder="字母开头，4~16 位"
-              @keydown.enter="saveUsername"
-              @keydown.esc="cancel"
-            />
-            <button class="act on" type="button" :disabled="saving" @click="saveUsername">保存</button>
-            <button class="act" type="button" @click="cancel">取消</button>
-          </template>
-          <template v-else>
-            <dd>{{ profile.username }}</dd>
-            <button
-              class="act"
-              type="button"
-              :disabled="usernameLocked"
-              :title="usernameLocked ? lockHint : '一年可以改一次'"
-              @click="start('username')"
-            >
-              {{ usernameLocked ? '一年内已改' : '修改' }}
-            </button>
-          </template>
-        </div>
-
-        <div class="row">
-          <dt>手机</dt>
-          <dd>{{ profile.phone || '未绑定' }}</dd>
-          <button class="act" type="button" @click="start('phone')">
-            {{ profile.phone ? '换绑' : '绑定' }}
-          </button>
-        </div>
-
-        <div class="row">
-          <dt>邮箱</dt>
-          <dd>{{ profile.email || '未绑定' }}</dd>
-          <button class="act" type="button" @click="start('email')">
-            {{ profile.email ? '换绑' : '绑定' }}
-          </button>
-        </div>
-
-        <div class="row">
-          <dt>登录密码</dt>
-          <template v-if="editing === 'password'">
-            <span class="pad"></span>
-            <button class="act" type="button" @click="cancel">收起</button>
-          </template>
-          <template v-else>
-            <dd>••••••</dd>
-            <button class="act" type="button" @click="start('password')">修改</button>
-          </template>
-        </div>
-      </dl>
-
-      <!-- 绑定 / 换绑：验证码发到新号码，先证明它是你的，再落库 -->
-      <div v-if="editing === 'phone' || editing === 'email'" class="pw">
-        <input
-          v-model="contactDraft"
-          class="field wide"
-          :type="editing === 'phone' ? 'tel' : 'email'"
-          :placeholder="editing === 'phone' ? '新手机号' : '新邮箱'"
-          autocomplete="off"
-        />
-        <div class="code-line">
-          <input
-            v-model="codeDraft"
-            class="field"
-            type="text"
-            inputmode="numeric"
-            maxlength="6"
-            placeholder="验证码"
-          />
-          <button
-            class="act on"
-            type="button"
-            :disabled="saving || sending || countdown > 0"
-            @click="sendBindCode"
-          >
-            {{ countdown > 0 ? `${countdown}s` : sending ? '发送中' : '发送' }}
-          </button>
-        </div>
-        <p class="note">
-          验证码发到新的{{ editing === 'phone' ? '手机号' : '邮箱' }}，用来证明它归你所有。
-        </p>
-        <div class="pw-acts">
-          <button class="act on" type="button" :disabled="saving" @click="saveContact">
-            {{ saving ? '保存中…' : '保存' }}
-          </button>
-          <button class="act" type="button" @click="cancel">取消</button>
-        </div>
+    <div class="page">
+      <!-- 报头：像一本档案的眉题，和下面的目录式资料行同一套语言 -->
+      <div class="masthead">
+        <span class="kicker">个人档案</span>
+        <span class="folio">PROFILE / 01</span>
       </div>
 
-      <!-- 改密：原密码 / 短信 / 邮箱三条路。没绑定的那条直接禁用，不等点了才报错 -->
-      <div v-if="editing === 'password'" class="pw">
-        <nav class="ways" aria-label="验证方式">
-          <button type="button" :aria-current="pwMode === 'original'" @click="pwMode = 'original'">原密码</button>
-          <button
-            type="button"
-            :aria-current="pwMode === 'phone'"
-            :disabled="!profile.phone"
-            :title="profile.phone ? '' : '还没绑定手机号'"
-            @click="pwMode = 'phone'"
-          >
-            短信
-          </button>
-          <button
-            type="button"
-            :aria-current="pwMode === 'email'"
-            :disabled="!profile.email"
-            :title="profile.email ? '' : '还没绑定邮箱'"
-            @click="pwMode = 'email'"
-          >
-            邮箱
-          </button>
-        </nav>
+      <p v-if="loading" class="hint">读取中…</p>
+      <div v-else-if="failed" class="hint">
+        {{ failed }}
+        <button type="button" class="mini solid" @click="load">重试</button>
+      </div>
 
-        <template v-if="pwMode === 'original'">
-          <input v-model="draft.original" class="field wide" type="password" placeholder="当前密码" autocomplete="current-password" />
-          <input v-model="draft.next" class="field wide" type="password" placeholder="新密码，8~20 位且含字母和数字" autocomplete="new-password" />
-          <input
-            v-model="draft.confirm"
-            class="field wide"
-            type="password"
-            placeholder="确认新密码"
-            autocomplete="new-password"
-            @keydown.enter="savePassword"
-          />
-        </template>
-
-        <template v-else>
-          <div class="code-line">
-            <input v-model="pwCode" class="field" type="text" inputmode="numeric" maxlength="6" placeholder="验证码" />
-            <button
-              class="act on"
-              type="button"
-              :disabled="saving || sending || countdown > 0"
-              @click="sendPasswordCode"
-            >
-              {{ countdown > 0 ? `${countdown}s` : sending ? '发送中' : '发送' }}
+      <template v-else-if="profile">
+        <!-- 身份区：顶部 2px 报头线 + 超大首字水印，是这页最重的记忆点 -->
+        <header class="identity">
+          <span class="watermark" aria-hidden="true">{{ initial }}</span>
+          <button
+            class="portrait"
+            type="button"
+            :disabled="uploading"
+            title="更换头像"
+            @click="avatarInput?.click()"
+          >
+            <img v-if="profile.avatar" :src="profile.avatar" alt="" />
+            <span v-else>{{ initial }}</span>
+          </button>
+          <div class="identity-copy">
+            <span class="eyebrow">MEMBER</span>
+            <h1 class="display-name">{{ title }}</h1>
+            <p class="handle"><span>@</span>{{ profile.username }}</p>
+            <button class="avatar-btn" type="button" :disabled="uploading" @click="avatarInput?.click()">
+              {{ uploading ? '上传中…' : '更换头像' }}
             </button>
           </div>
-          <input v-model="pwNext" class="field wide" type="password" placeholder="新密码，8~20 位且含字母和数字" autocomplete="new-password" />
-          <input v-model="pwConfirm" class="field wide" type="password" placeholder="确认新密码" autocomplete="new-password" />
-        </template>
+          <input ref="avatarInput" class="file" type="file" accept="image/*" @change="pickAvatar" />
+        </header>
 
-        <div class="pw-acts">
-          <button
-            class="act on"
-            type="button"
-            :disabled="saving"
-            @click="pwMode === 'original' ? savePassword() : savePasswordByCode()"
-          >
-            {{ saving ? '保存中…' : '保存' }}
-          </button>
-          <button class="act" type="button" @click="cancel">取消</button>
+        <div class="sections">
+          <!-- 账户 -->
+          <section class="group">
+            <div class="group-head"><h2>账户</h2><span>ACCOUNT</span></div>
+
+            <div class="entry" :class="{ 'is-editing': editing === 'nickname' }">
+              <span class="idx">01</span>
+              <span class="label">昵称</span>
+              <template v-if="editing === 'nickname'">
+                <div class="value">
+                  <input
+                    v-model="draft.nickname"
+                    class="ip"
+                    maxlength="16"
+                    placeholder="1~16 位"
+                    @keydown.enter="saveNickname"
+                    @keydown.esc="cancel"
+                  />
+                </div>
+                <div class="ops">
+                  <button class="mini solid" type="button" :disabled="saving" @click="saveNickname">保存</button>
+                  <button class="mini" type="button" @click="cancel">取消</button>
+                </div>
+              </template>
+              <template v-else>
+                <div class="value">{{ profile.nickname || '未设置' }}</div>
+                <div class="ops">
+                  <button class="mini" type="button" @click="start('nickname')">修改</button>
+                </div>
+              </template>
+            </div>
+
+            <div class="entry" :class="{ 'is-editing': editing === 'username' }">
+              <span class="idx">02</span>
+              <span class="label">账户名</span>
+              <template v-if="editing === 'username'">
+                <div class="value">
+                  <input
+                    v-model="draft.username"
+                    class="ip"
+                    maxlength="16"
+                    placeholder="字母开头，4~16 位"
+                    @keydown.enter="saveUsername"
+                    @keydown.esc="cancel"
+                  />
+                </div>
+                <div class="ops">
+                  <button class="mini solid" type="button" :disabled="saving" @click="saveUsername">保存</button>
+                  <button class="mini" type="button" @click="cancel">取消</button>
+                </div>
+              </template>
+              <template v-else>
+                <div class="value">{{ profile.username }}</div>
+                <div class="ops">
+                  <button
+                    class="mini"
+                    type="button"
+                    :disabled="usernameLocked"
+                    :title="usernameLocked ? lockHint : '一年可以改一次'"
+                    @click="start('username')"
+                  >
+                    {{ usernameLocked ? '一年内已改' : '修改' }}
+                  </button>
+                </div>
+              </template>
+            </div>
+
+            <div class="entry" :class="{ 'is-editing': editing === 'password' }">
+              <span class="idx">03</span>
+              <span class="label">登录密码</span>
+              <template v-if="editing === 'password'">
+                <div class="value dim">正在修改</div>
+                <div class="ops">
+                  <button class="mini" type="button" @click="cancel">收起</button>
+                </div>
+              </template>
+              <template v-else>
+                <div class="value">••••••</div>
+                <div class="ops">
+                  <button class="mini" type="button" @click="start('password')">修改</button>
+                </div>
+              </template>
+            </div>
+
+            <!-- 改密：原密码 / 短信 / 邮箱三条路。没绑定的那条直接禁用，不等点了才报错 -->
+            <div v-if="editing === 'password'" class="panel">
+              <nav class="ways" aria-label="验证方式">
+                <button type="button" :aria-current="pwMode === 'original'" @click="pwMode = 'original'">原密码</button>
+                <button
+                  type="button"
+                  :aria-current="pwMode === 'phone'"
+                  :disabled="!profile.phone"
+                  :title="profile.phone ? '' : '还没绑定手机号'"
+                  @click="pwMode = 'phone'"
+                >
+                  短信
+                </button>
+                <button
+                  type="button"
+                  :aria-current="pwMode === 'email'"
+                  :disabled="!profile.email"
+                  :title="profile.email ? '' : '还没绑定邮箱'"
+                  @click="pwMode = 'email'"
+                >
+                  邮箱
+                </button>
+              </nav>
+
+              <template v-if="pwMode === 'original'">
+                <input v-model="draft.original" class="ip wide" type="password" placeholder="当前密码" autocomplete="current-password" />
+                <input v-model="draft.next" class="ip wide" type="password" placeholder="新密码，8~20 位且含字母和数字" autocomplete="new-password" />
+                <input
+                  v-model="draft.confirm"
+                  class="ip wide"
+                  type="password"
+                  placeholder="确认新密码"
+                  autocomplete="new-password"
+                  @keydown.enter="savePassword"
+                />
+              </template>
+
+              <template v-else>
+                <div class="code-line">
+                  <input v-model="pwCode" class="ip" type="text" inputmode="numeric" maxlength="6" placeholder="验证码" />
+                  <button
+                    class="mini solid"
+                    type="button"
+                    :disabled="saving || sending || countdown > 0"
+                    @click="sendPasswordCode"
+                  >
+                    {{ countdown > 0 ? `${countdown}s` : sending ? '发送中' : '发送' }}
+                  </button>
+                </div>
+                <input v-model="pwNext" class="ip wide" type="password" placeholder="新密码，8~20 位且含字母和数字" autocomplete="new-password" />
+                <input v-model="pwConfirm" class="ip wide" type="password" placeholder="确认新密码" autocomplete="new-password" />
+              </template>
+
+              <div class="panel-acts">
+                <button
+                  class="mini solid"
+                  type="button"
+                  :disabled="saving"
+                  @click="pwMode === 'original' ? savePassword() : savePasswordByCode()"
+                >
+                  {{ saving ? '保存中…' : '保存' }}
+                </button>
+                <button class="mini" type="button" @click="cancel">取消</button>
+              </div>
+            </div>
+
+            <p v-if="editing === 'username'" class="note">账户名是登录名，改完下次登录要用新名字；一年只能改一次。</p>
+          </section>
+
+          <!-- 联系方式 -->
+          <section class="group">
+            <div class="group-head"><h2>联系方式</h2><span>CONTACT</span></div>
+
+            <div class="entry" :class="{ 'is-editing': editing === 'phone' }">
+              <span class="idx">04</span>
+              <span class="label">手机</span>
+              <div class="value" :class="{ dim: !profile.phone }">{{ profile.phone || '未绑定' }}</div>
+              <div class="ops">
+                <button class="mini" type="button" @click="start('phone')">
+                  {{ profile.phone ? '换绑' : '绑定' }}
+                </button>
+              </div>
+            </div>
+
+            <div class="entry" :class="{ 'is-editing': editing === 'email' }">
+              <span class="idx">05</span>
+              <span class="label">邮箱</span>
+              <div class="value" :class="{ dim: !profile.email }">{{ profile.email || '未绑定' }}</div>
+              <div class="ops">
+                <button class="mini" type="button" @click="start('email')">
+                  {{ profile.email ? '换绑' : '绑定' }}
+                </button>
+              </div>
+            </div>
+
+            <!-- 绑定 / 换绑：验证码发到新号码，先证明它是你的，再落库 -->
+            <div v-if="editing === 'phone' || editing === 'email'" class="panel">
+              <input
+                v-model="contactDraft"
+                class="ip wide"
+                :type="editing === 'phone' ? 'tel' : 'email'"
+                :placeholder="editing === 'phone' ? '新手机号' : '新邮箱'"
+                autocomplete="off"
+              />
+              <div class="code-line">
+                <input
+                  v-model="codeDraft"
+                  class="ip"
+                  type="text"
+                  inputmode="numeric"
+                  maxlength="6"
+                  placeholder="验证码"
+                />
+                <button
+                  class="mini solid"
+                  type="button"
+                  :disabled="saving || sending || countdown > 0"
+                  @click="sendBindCode"
+                >
+                  {{ countdown > 0 ? `${countdown}s` : sending ? '发送中' : '发送' }}
+                </button>
+              </div>
+              <p class="note">验证码发到新{{ editing === 'phone' ? '手机号' : '邮箱' }}</p>
+              <div class="panel-acts">
+                <button class="mini solid" type="button" :disabled="saving" @click="saveContact">
+                  {{ saving ? '保存中…' : '保存' }}
+                </button>
+                <button class="mini" type="button" @click="cancel">取消</button>
+              </div>
+            </div>
+          </section>
         </div>
-      </div>
 
-      <p v-if="editing === 'username'" class="note">账户名是登录名，改完下次登录要用新名字；一年只能改一次。</p>
+        <p v-if="armingKill" class="note warn">
+          注销后账号会被关闭，登录名与绑定信息一并解除，日程与记忆记录不再可用。这一步不可恢复。
+        </p>
 
-      <button class="feedback-link" type="button" @click="openFeedback">意见反馈</button>
-
-      <div class="signout">
-        <button class="quit" type="button" @click="logout">退出登录</button>
-        <button class="quit danger" type="button" :disabled="killing" @click="deactivate">
-          {{ armingKill ? (killing ? '注销中…' : '再点一次确认注销') : '注销账号' }}
-        </button>
-      </div>
-      <p v-if="armingKill" class="note warn">
-        注销后账号会被关闭，登录名与绑定信息一并解除，日程与记忆记录不再可用。这一步不可恢复。
-      </p>
-    </template>
+        <!-- 页脚：意见反馈在左，退出与注销在右，用一条重线收尾 -->
+        <footer class="tail">
+          <button class="feedback-link" type="button" @click="openFeedback">意见反馈</button>
+          <div class="signout">
+            <button class="quit" type="button" @click="logout">退出登录</button>
+            <button class="quit danger" type="button" :disabled="killing" @click="deactivate">
+              {{ armingKill ? (killing ? '注销中…' : '再点一次确认注销') : '注销账号' }}
+            </button>
+          </div>
+        </footer>
+      </template>
+    </div>
   </section>
 </template>
 
 <style scoped>
 .profile {
-  flex: 1;
+  height: 100%;
   min-height: 0;
   min-width: 0;
   overflow-y: auto;
-  padding: var(--s5) var(--s4) var(--s6);
+  padding: 32px clamp(24px, 5vw, 72px) 80px;
+  background: var(--paper);
 }
 
-.head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-start;
-  gap: var(--s5);
-}
-
-.head h1 {
-  font-size: 21px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-  color: var(--ink);
-}
-
+/* AppShell 的 .view 是 flex 容器，返回按钮要显式靠左，不被横向拉满 */
 .back {
   display: inline-flex;
+  align-self: flex-start;
   align-items: center;
-  gap: 3px;
-  flex: 0 0 auto;
-  padding: 7px 14px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
+  gap: 4px;
+  padding: 4px 0;
   font-size: var(--t-xs);
   color: var(--muted);
-  white-space: nowrap;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease);
 }
 
 .back:hover {
   color: var(--ink);
-  border-color: var(--rule-strong);
+}
+
+/* 整页内容收进中间一栏 */
+.page {
+  width: 100%;
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+/* 报头：报头线 + 等宽眉题，定下「档案 / 出版物」的调子 */
+.masthead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-top: 48px;
+  padding-bottom: 12px;
+}
+
+.kicker {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  letter-spacing: 0.18em;
+  color: var(--ink-soft);
+}
+
+.folio {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  letter-spacing: 0.1em;
+  color: var(--muted-soft);
 }
 
 .hint {
   display: flex;
   align-items: center;
-  gap: var(--s2);
+  gap: var(--s3);
+  margin-top: var(--s5);
   font-size: var(--t-sm);
   color: var(--muted);
 }
 
-.ident {
+/* 身份区：顶部 2px 重线 + 超大首字水印，这页最重的视觉记忆点 */
+.identity {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 28px;
+  padding: 40px 0 36px;
+  border-top: 2px solid var(--ink);
+  border-bottom: 1px solid var(--rule);
+  overflow: hidden;
 }
 
-.avatar {
+.watermark {
+  position: absolute;
+  right: -6px;
+  top: -52px;
+  font-size: 220px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--ink);
+  opacity: 0.055;
+  pointer-events: none;
+  user-select: none;
+}
+
+.portrait {
+  position: relative;
+  z-index: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  width: 44px;
-  height: 44px;
+  width: 96px;
+  height: 96px;
   overflow: hidden;
-  border-radius: 50%;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
   background: var(--paper-sunken);
   color: var(--ink-soft);
-  font-size: var(--t-md);
+  font-size: 34px;
   line-height: 1;
+  transition: border-color var(--dur) var(--ease);
 }
 
-.avatar img {
+.portrait:hover:not(:disabled) {
+  border-color: var(--rule-strong);
+}
+
+.portrait img {
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
 
-.who {
+.identity-copy {
+  position: relative;
+  z-index: 1;
   min-width: 0;
 }
 
-.name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--t-md);
+.eyebrow {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--muted-soft);
+}
+
+.display-name {
+  margin-top: 8px;
+  font-size: 34px;
   font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
   color: var(--ink);
+}
+
+.handle {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  color: var(--muted);
+}
+
+.handle span {
+  margin-right: 2px;
+  color: var(--muted-soft);
+}
+
+.avatar-btn {
+  position: relative;
+  z-index: 1;
+  margin-top: 14px;
+  padding: 6px 14px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
+  color: var(--ink-soft);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+
+.avatar-btn:hover:not(:disabled) {
+  color: var(--signal);
+  border-color: var(--signal-line);
+}
+
+.avatar-btn:disabled {
+  color: var(--muted-soft);
 }
 
 .file {
   display: none;
 }
 
-/* 一行一条：左标签、中间值或输入框、右侧文字按钮 */
-.rows {
-  margin-top: var(--s5);
+/* 资料分区：中英对照小标题 + 目录式编号行，和横线表单彻底分开 */
+.group {
+  margin-top: 36px;
 }
 
-.row {
+.group-head {
   display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--ink);
+}
+
+.group-head h2 {
+  font-size: var(--t-md);
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.group-head span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--muted-soft);
+}
+
+.entry {
+  display: grid;
+  grid-template-columns: 34px 104px minmax(0, 1fr) auto;
   align-items: center;
-  gap: var(--s2);
-  min-height: 40px;
-  padding: 6px 0;
+  gap: 12px;
+  min-height: 66px;
+  margin: 0 -8px;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--rule);
   font-size: var(--t-sm);
+  transition: background var(--dur) var(--ease);
 }
 
-.row + .row {
-  border-top: 1px solid var(--rule);
+.entry:hover {
+  background: var(--paper-sunken);
 }
 
-.row dt {
-  flex: 0 0 64px;
+.entry.is-editing {
+  background: var(--signal-soft);
+  border-bottom-color: transparent;
+  border-radius: var(--r-md);
+}
+
+.idx {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--muted-soft);
+}
+
+.label {
+  font-size: var(--t-xs);
   color: var(--muted);
 }
 
-.row dd {
-  flex: 1;
+.value {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--ink-soft);
-}
-
-.pad {
-  flex: 1;
-}
-
-.field {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 9px;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-md);
-  font-size: var(--t-sm);
-  color: var(--ink);
-  background: var(--paper);
-}
-
-.field:focus {
-  border-color: var(--rule-strong);
-}
-
-.field.wide {
-  width: 100%;
-}
-
-.pw {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s2);
-  margin-top: var(--s3);
-}
-
-.act {
-  flex: 0 0 auto;
-  padding: 2px 0;
-  font-size: var(--t-xs);
-  color: var(--muted);
-  transition: color var(--dur) var(--ease);
-}
-
-.act:hover:not(:disabled) {
   color: var(--ink);
 }
 
-.act.on {
-  color: var(--signal);
-}
-
-.act.small {
-  margin-top: 2px;
-  font-size: var(--t-xs);
+.value.dim {
   color: var(--muted-soft);
 }
 
-.act:disabled {
+.ops {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* 胶囊小按钮：常态隐去描边，hover 整行才浮出，不让表格显得吵 */
+.mini {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+.entry:hover .mini {
+  border-color: var(--rule);
+}
+
+.mini:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+.mini.solid {
+  color: var(--signal);
+  border-color: var(--signal-line);
+  background: var(--signal-soft);
+}
+
+.mini:disabled {
   color: var(--muted-soft);
   cursor: default;
 }
 
-.note {
-  margin-top: var(--s3);
-  font-size: var(--t-xs);
-  line-height: 1.7;
-  color: var(--muted-soft);
-}
-
-.quit {
-  padding: 2px 0;
+/* 行内输入框沿用细线语言，不上整框 */
+.ip {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 0;
+  border: 0;
+  border-bottom: 1px solid var(--rule-strong);
+  border-radius: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
   font-size: var(--t-sm);
-  color: var(--muted);
-  transition: color var(--dur) var(--ease);
-}
-
-.quit:hover {
-  color: var(--alert);
-}
-
-/* 反馈是「帮忙改好它」的入口，语气比设置轻，所以放在退出登录上面单占一行 */
-.feedback-link {
-  display: block;
-  margin-top: var(--s5);
-  padding: 2px 0;
-  font-size: var(--t-sm);
-  color: var(--muted);
-}
-
-.feedback-link:hover {
   color: var(--ink);
 }
 
-/* 退出登录与注销并排：注销更危险，颜色更淡，不是主按钮 */
-.signout {
-  display: flex;
-  align-items: center;
-  gap: var(--s5);
-  margin-top: var(--s4);
+.ip:focus {
+  border-bottom-color: var(--signal);
 }
 
-.quit.danger {
+.ip.wide {
+  width: 100%;
+}
+
+.ip::placeholder {
   color: var(--muted-soft);
 }
 
-.quit.danger:hover:not(:disabled) {
-  color: var(--alert);
+/* 编辑面板：从档案里抽出的一张表，浅底圆角，和资料行区分开 */
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 24px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  background: var(--paper-sunken);
 }
 
-.quit:disabled {
-  opacity: 0.6;
-}
-
-/* 验证码一行：输入框吃掉剩余宽度，按钮与字段同高 */
 .code-line {
   display: flex;
   align-items: center;
-  gap: var(--s2);
+  gap: 16px;
 }
 
-.code-line .field {
+.code-line .ip {
   flex: 1;
-  min-width: 0;
 }
 
-.code-line .act {
-  padding: 6px 0;
-}
-
-.pw-acts {
+.panel-acts {
   display: flex;
   align-items: center;
-  gap: var(--s3);
-  margin-top: 2px;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 4px;
 }
 
-/* 改密方式：三个词并排，选中压一道线；未绑定的那条淡掉并禁用 */
+/* 改密方式：三个胶囊并排，选中压主色；未绑定的那条淡掉并禁用 */
 .ways {
   display: flex;
-  gap: var(--s4);
-  padding-bottom: var(--s2);
-  border-bottom: 1px solid var(--rule);
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .ways button {
-  padding: 2px 0;
+  padding: 6px 16px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
   font-size: var(--t-xs);
-  color: var(--muted-soft);
-  border-bottom: 1px solid transparent;
+  color: var(--muted);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
 }
 
 .ways button[aria-current='true'] {
-  color: var(--ink);
-  border-bottom-color: var(--ink);
+  color: var(--signal);
+  border-color: var(--signal-line);
+  background: var(--signal-soft);
 }
 
 .ways button:disabled {
@@ -843,18 +982,120 @@ async function pickAvatar(event: Event) {
   cursor: default;
 }
 
+.note {
+  margin-top: var(--s3);
+  font-size: var(--t-xs);
+  line-height: var(--lh-body);
+  color: var(--muted-soft);
+}
+
 .note.warn {
   color: var(--alert);
 }
 
+/* 页脚：意见反馈在左，退出与注销在右，用一条重线收尾 */
+.tail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s5);
+  margin-top: 48px;
+  padding-top: 20px;
+  border-top: 1px solid var(--ink);
+}
+
+.feedback-link {
+  padding: 2px 0;
+  font-size: var(--t-sm);
+  color: var(--muted);
+  transition: color var(--dur) var(--ease);
+}
+
+.feedback-link:hover {
+  color: var(--ink);
+}
+
+.signout {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.quit {
+  padding: 5px 14px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  font-size: var(--t-sm);
+  color: var(--muted);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+
+.quit:hover {
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+/* 退出登录是主操作但不上实心色，注销更危险反而退成裸字 */
+.quit.danger {
+  border-color: transparent;
+  color: var(--muted-soft);
+}
+
+.quit.danger:hover:not(:disabled) {
+  color: var(--alert);
+  border-color: var(--alert);
+}
+
+.quit:disabled {
+  opacity: 0.6;
+}
+
 @media (max-width: 720px) {
   .profile {
-    padding: var(--s5) var(--s4);
+    padding: var(--s5) var(--s4) var(--s6);
   }
 
-  .head {
+  .masthead {
+    margin-top: var(--s5);
+  }
+
+  .identity {
+    gap: 16px;
+    padding: 28px 0;
+  }
+
+  .portrait {
+    width: 72px;
+    height: 72px;
+    font-size: 26px;
+  }
+
+  .watermark {
+    top: -28px;
+    font-size: 140px;
+  }
+
+  .display-name {
+    font-size: 26px;
+  }
+
+  .entry {
+    grid-template-columns: 24px 76px minmax(0, 1fr);
+    row-gap: 6px;
+  }
+
+  .ops {
+    grid-column: 3;
+    justify-content: flex-start;
+  }
+
+  .panel {
+    padding: 16px;
+  }
+
+  .tail {
     flex-direction: column;
-    gap: var(--s3);
+    align-items: flex-start;
   }
 }
 </style>

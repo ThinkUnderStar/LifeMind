@@ -8,16 +8,49 @@
  * 是这类界面最烦人的一处。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
-import { loadOlder, rewrite, send, state, stop, toast, toggleWebSearch } from '../core/store'
+import { loadOlder, rewrite, send, setAgentPermission, setChatMode, state, stop, toast, toggleWebSearch } from '../core/store'
 import type { UiMessage } from '../core/store'
+import type { ChatMode } from '../api/chat'
 import ApprovalCard from '../components/ApprovalCard.vue'
 import TaskList from '../components/TaskList.vue'
+import UiIcon from '../components/UiIcon.vue'
 import brandLogo from '../assets/brand/lifemind-logo.png'
 import { renderMarkdown } from '../core/markdown'
 
 const draft = ref('')
 const streamEl = ref<HTMLElement | null>(null)
 const stick = ref(true)
+/**
+ * 是否已经成功贴到底过。刷新/切会话时历史是异步填进来的：
+ * 内容一瞬间从 0 条撑成几十条，浏览器仍停在 scrollTop=0，会先派发一次 scroll 事件。
+ * 那次不是用户上滑，若按「距底太远」处理会让 stick 永久变 false，之后就再也不贴底了。
+ * 所以在第一次真正滚到底之前，onScroll 一律不改贴底意愿。
+ */
+let pinnedOnce = false
+
+/** 信任程度菜单：只两档，点开即选；点击外部或选中后收起 */
+const permEl = ref<HTMLElement | null>(null)
+const permOpen = ref(false)
+
+function pickPermission(value: 'normal' | 'full') {
+  setAgentPermission(value)
+  permOpen.value = false
+}
+
+/** 运行模式菜单：工作 / 纯对话，同样是点开即选、点外部收起 */
+const modeEl = ref<HTMLElement | null>(null)
+const modeOpen = ref(false)
+
+function pickMode(value: ChatMode) {
+  setChatMode(value)
+  modeOpen.value = false
+}
+
+function onDocPointerDown(event: PointerEvent) {
+  const target = event.target as Node
+  if (permOpen.value && !permEl.value?.contains(target)) permOpen.value = false
+  if (modeOpen.value && !modeEl.value?.contains(target)) modeOpen.value = false
+}
 
 /**
  * 改写一条历史消息（时间回溯）。
@@ -81,7 +114,27 @@ async function submitRewrite() {
 watch(() => state.sessionId, () => {
   rewriting.value = null
   stick.value = true
+  pinnedOnce = false
+  beginSettle(1000)
   void scrollToEnd(true)
+})
+
+// 历史是异步拉回来的：这一刻容器还是空的，上面那次 force 滚了个空。
+// 消息从「没有」变成「有」时再强制贴底一次——刷新后落回最新一条靠的就是这里。
+watch(() => state.messages.length, (len, prev) => {
+  if (len === 0) {
+    pinnedOnce = false
+    return
+  }
+  if (prev) return // 往上翻历史（len 变大）和流式新增都不该抢滚动位置
+  stick.value = true
+  pinnedOnce = false
+  beginSettle(1200)
+  void nextTick(() => {
+    scrollToEnd(true)
+    // markdown 渲染、中文换行、任务行挂载会二次撑高，隔一拍再补一次
+    window.setTimeout(() => scrollToEnd(true), 60)
+  })
 })
 
 /** AI 用品牌标，用户用账号首字母——和顶栏头像同一套口径 */
@@ -160,11 +213,40 @@ function markProgrammatic() {
   programmaticTimer = window.setTimeout(() => { programmatic = false }, 80)
 }
 
+/**
+ * 开场锚定期。刷新恢复时浏览器会把滚动容器的 scrollTop 还原成上次的值（往往是 0），
+ * 这个还原可能晚于我们的任何一次 rAF 补滚，而且不一定派发 scroll 事件——
+ * 光靠「首次贴底前不改 stick」挡不住它。所以在刚挂载 / 刚切会话 / 历史刚到达的一小段时间内，
+ * 定时把位置拉回底部，期间任何「跑到上面去」的滚动都当作浏览器恢复而不是用户操作。
+ */
+let settleUntil = 0
+let settleTimers: number[] = []
+
+function beginSettle(ms = 1400) {
+  settleUntil = Date.now() + ms
+  for (const t of settleTimers) window.clearTimeout(t)
+  // 浏览器恢复的时机不固定（load 之后、字体就绪之后都可能），多补几拍把它压过去
+  settleTimers = [0, 60, 160, 300, 520, 800, 1200].map((d) =>
+    window.setTimeout(() => scrollToEnd(true), d),
+  )
+}
+
 function onScroll() {
   // 自己滚的，不改贴底意愿
   if (programmatic) return
   const el = streamEl.value
   if (!el) return
+  // 开场窗口内：位置突然跑到上面去是浏览器恢复造成的，直接纠正
+  if (Date.now() < settleUntil) {
+    stick.value = true
+    scrollToEnd(true)
+    return
+  }
+  // 首次贴底之前：历史正在填，这类 scroll 一律不当成用户上滑
+  if (!pinnedOnce) {
+    stick.value = true
+    return
+  }
   // 距底 60px 内算「贴着底部」。留一点余量，避免中文换行、任务行出现时抖动误判
   stick.value = el.scrollHeight - el.scrollTop - el.clientHeight < 60
 }
@@ -176,6 +258,18 @@ function scrollToEnd(force = false) {
   if (!force && !stick.value) return
   markProgrammatic()
   el.scrollTop = el.scrollHeight
+  // 内容确实溢出时才算真的贴到了底；空会话滚不动，不能拿它当「已贴底」
+  if (el.scrollHeight > el.clientHeight) pinnedOnce = true
+  // 本帧之后高度还可能再变：中文换行重排、任务行挂载、输入框撑高把视口压矮。
+  // 下一帧补一次即可，不做循环——避免和用户上滑抢控制权。
+  requestAnimationFrame(() => {
+    const box = streamEl.value
+    if (!box) return
+    if (!force && !stick.value) return
+    markProgrammatic()
+    box.scrollTop = box.scrollHeight
+    if (box.scrollHeight > box.clientHeight) pinnedOnce = true
+  })
 }
 
 // 内容高度一变就贴底——这是可靠的关键。
@@ -184,19 +278,46 @@ function scrollToEnd(force = false) {
 // ResizeObserver 观察内容容器的真实高度，任何一次布局增长（文本、换行、任务行）都会回调。
 let ro: ResizeObserver | null = null
 
+// 注意：刷新时 .stream 被 chatLoading 的 v-if 挡着，是不存在的——
+// onMounted 里拿到的 streamEl/bodyEl 都是 null，那时建 RO 会直接落空，
+// 等消息渲染出来就再没人贴底了（表现为刷新后停在最上面）。
+// 所以这里盯元素本身出现：v-if 一放开就装监听并钉到底。
+watch(
+  [streamEl, bodyEl],
+  ([stream, body]) => {
+    ro?.disconnect()
+    ro = null
+    if (!stream || !body) return
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => scrollToEnd())
+      ro.observe(body)
+      // 视口本身变矮时（输入框撑高、操作行换行）也要重新贴底，
+      // 否则内容没变、可视区变小，最后一条会被压在下面露不出来
+      ro.observe(stream)
+    }
+    pinnedOnce = false
+    stick.value = true
+    beginSettle()
+    scrollToEnd(true)
+  },
+  { flush: 'post' },
+)
+
 onMounted(() => {
-  if (typeof ResizeObserver === 'undefined') return
-  const body = bodyEl.value
-  if (!body) return
-  ro = new ResizeObserver(() => scrollToEnd())
-  ro.observe(body)
-  // 首屏：消息在挂载前就位时也要贴到底部
+  document.addEventListener('pointerdown', onDocPointerDown)
+  // 刷新恢复时别让浏览器还原文档滚动，位置由我们自己钉到最新一条
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
+  // 开场锚定：刷新后历史异步到达 + 浏览器延迟还原滚动位置，这一小段时间由我们接管
+  beginSettle()
   scrollToEnd(true)
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onDocPointerDown)
   ro?.disconnect()
   ro = null
+  for (const t of settleTimers) window.clearTimeout(t)
+  settleTimers = []
   if (programmaticTimer !== null) window.clearTimeout(programmaticTimer)
   if (thinkingTimer !== undefined) window.clearInterval(thinkingTimer)
 })
@@ -224,10 +345,13 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+/** 输入框自动长高，超过上限就停住、交给框内滚动（与 CSS 的 max-height 保持一致） */
+const BOX_MAX_HEIGHT = 180
+
 function autoGrow(event: Event) {
   const el = event.target as HTMLTextAreaElement
   el.style.height = 'auto'
-  el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+  el.style.height = `${Math.min(el.scrollHeight, BOX_MAX_HEIGHT)}px`
 }
 </script>
 
@@ -309,10 +433,7 @@ function autoGrow(event: Event) {
                 aria-label="复制这条内容"
                 @click="copyMessage(message)"
               >
-                <svg viewBox="0 0 20 20" aria-hidden="true">
-                  <rect x="7" y="7" width="9" height="10" rx="1.5" />
-                  <path d="M13 4.5H5.5A1.5 1.5 0 0 0 4 6v8" />
-                </svg>
+                <UiIcon name="copy" :size="14" />
               </button>
               <button
                 v-if="message.role === 'user' && message.id !== null && !state.streaming"
@@ -322,9 +443,7 @@ function autoGrow(event: Event) {
                 aria-label="改写这句话"
                 @click="startRewrite(message)"
               >
-                <svg viewBox="0 0 20 20" aria-hidden="true">
-                  <path d="M4 16h4l8-8-4-4-8 8v4ZM11.5 4.5l4 4" />
-                </svg>
+                <UiIcon name="edit" :size="14" />
               </button>
             </div>
           </template>
@@ -344,35 +463,7 @@ function autoGrow(event: Event) {
     </div>
 
     <form class="composer" @submit.prevent="submit">
-      <div class="composer-top">
-        <div class="left-ops">
-          <button
-            class="web-toggle"
-            :class="{ on: state.webSearch }"
-            type="button"
-            :aria-pressed="state.webSearch"
-            :title="state.webSearch ? '联网已开启，本轮可用搜索查最新信息' : '联网已关闭，点一下开启'"
-            @click="toggleWebSearch"
-          >
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <circle cx="10" cy="10" r="6.4" />
-              <path d="M3.6 10h12.8M10 3.6c3.3 3.7 3.3 9 0 12.8M10 3.6c-3.3 3.7-3.3 9 0 12.8" />
-            </svg>
-            <span>联网</span>
-          </button>
-          <button
-            v-if="state.historyHasMore"
-            class="btn btn-text older"
-            type="button"
-            @click="loadOlder"
-          >
-            更早的消息
-          </button>
-        </div>
-
-      </div>
-
-      <!-- 输入框是一整条圆角容器，发送/停止图标收在框内右下角，不再像表单+按钮 -->
+      <!-- 输入框一整条圆角容器：上面留输入空间，操作组与发送钮收在框内底部，不再单独占一行 -->
       <div class="input-shell" :data-streaming="state.streaming">
         <textarea
           v-model="draft"
@@ -384,26 +475,128 @@ function autoGrow(event: Event) {
           @input="autoGrow"
         ></textarea>
 
-        <button
-          v-if="state.streaming"
-          class="send-icon stop"
-          type="button"
-          title="停止生成"
-          aria-label="停止生成"
-          @click="stop"
-        >
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 6.5h7v7h-7z" /></svg>
-        </button>
-        <button
-          v-else
-          class="send-icon"
-          type="submit"
-          title="发送（Enter）"
-          aria-label="发送"
-          :disabled="!draft.trim()"
-        >
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15V5M5.5 9.5 10 5l4.5 4.5" /></svg>
-        </button>
+        <div class="shell-foot">
+          <div class="left-ops">
+            <!-- 运行模式：纯对话下后端不建任务、不动组件，是硬开关，不靠模型自觉 -->
+            <!-- 高亮类名不能用 chat：本文件根容器已有 .chat（带 flex-direction:column），会串样式 -->
+            <div ref="modeEl" class="perm-picker">
+              <button
+                class="mode-toggle"
+                :class="{ 'is-chat': state.chatMode === 'chat' }"
+                type="button"
+                aria-haspopup="menu"
+                :aria-expanded="modeOpen"
+                :title="state.chatMode === 'chat' ? '纯对话模式：只聊天不执行任务' : '工作模式：该建任务就建任务'"
+                @click="modeOpen = !modeOpen"
+              >
+                <UiIcon :name="state.chatMode === 'chat' ? 'feedback' : 'apps'" :size="15" />
+                <span>{{ state.chatMode === 'chat' ? '纯对话' : '工作' }}</span>
+              </button>
+              <div v-if="modeOpen" class="perm-menu" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  :class="{ active: state.chatMode === 'work' }"
+                  @click="pickMode('work')"
+                >
+                  <UiIcon name="apps" :size="13" />
+                  <span>工作模式</span>
+                  <UiIcon v-if="state.chatMode === 'work'" name="check" :size="13" class="perm-mark" />
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  :class="{ active: state.chatMode === 'chat' }"
+                  @click="pickMode('chat')"
+                >
+                  <UiIcon name="feedback" :size="13" />
+                  <span>纯对话模式</span>
+                  <UiIcon v-if="state.chatMode === 'chat'" name="check" :size="13" class="perm-mark" />
+                </button>
+              </div>
+            </div>
+
+            <button
+              class="web-toggle"
+              :class="{ on: state.webSearch }"
+              type="button"
+              :aria-pressed="state.webSearch"
+              :title="state.webSearch ? '本会话联网已开启，可用搜索查最新信息' : '本会话联网已关闭，点一下开启'"
+              @click="toggleWebSearch"
+            >
+              <UiIcon name="globe" :size="15" />
+              <span>联网</span>
+            </button>
+
+            <!-- 信任程度按会话独立；full 下敏感工具不弹确认卡直接执行 -->
+            <div ref="permEl" class="perm-picker">
+              <button
+                class="perm-toggle"
+                :class="{ trust: state.agentPermission === 'full' }"
+                type="button"
+                aria-haspopup="menu"
+                :aria-expanded="permOpen"
+                :title="state.agentPermission === 'full' ? '本会话完全信任，敏感操作直接执行' : '本会话每次敏感操作需确认'"
+                @click="permOpen = !permOpen"
+              >
+                <UiIcon :name="state.agentPermission === 'full' ? 'check' : 'list'" :size="14" />
+                <span>{{ state.agentPermission === 'full' ? '完全信任' : '需确认' }}</span>
+              </button>
+              <div v-if="permOpen" class="perm-menu" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  :class="{ active: state.agentPermission === 'normal' }"
+                  @click="pickPermission('normal')"
+                >
+                  <UiIcon name="list" :size="13" />
+                  <span>每次确认</span>
+                  <UiIcon v-if="state.agentPermission === 'normal'" name="check" :size="13" class="perm-mark" />
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  :class="{ active: state.agentPermission === 'full' }"
+                  @click="pickPermission('full')"
+                >
+                  <UiIcon name="check" :size="13" />
+                  <span>完全信任</span>
+                  <UiIcon v-if="state.agentPermission === 'full'" name="check" :size="13" class="perm-mark" />
+                </button>
+              </div>
+            </div>
+
+            <button
+              v-if="state.historyHasMore"
+              class="btn btn-text older"
+              type="button"
+              @click="loadOlder"
+            >
+              更早的消息
+            </button>
+          </div>
+
+          <button
+            v-if="state.streaming"
+            class="send-icon stop"
+            type="button"
+            title="停止生成"
+            aria-label="停止生成"
+            @click="stop"
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 6.5h7v7h-7z" /></svg>
+          </button>
+          <button
+            v-else
+            class="send-icon"
+            type="submit"
+            title="发送（Enter）"
+            aria-label="发送"
+            :disabled="!draft.trim()"
+          >
+            <UiIcon name="send" :size="16" />
+          </button>
+        </div>
       </div>
     </form>
     </template>
@@ -427,8 +620,9 @@ function autoGrow(event: Event) {
 .stream {
   flex: 1;
   overflow-y: auto;
-  /* 操作组已在中间列顶部单独占一行，这里只留常规上间距 */
-  padding: var(--s6) max(var(--s5), calc((100% - 760px) / 2)) var(--s4);
+  /* 操作组已在中间列顶部单独占一行，这里只留常规上间距；底部留出一段空白，
+     流式输出时最后一行文字和输入框之间始终有呼吸，不会贴着框上沿 */
+  padding: var(--s6) max(var(--s5), calc((100% - 760px) / 2)) calc(var(--s6) + var(--s3));
   overflow-anchor: none;
 }
 
@@ -762,28 +956,22 @@ function autoGrow(event: Event) {
 }
 
 .composer {
-  padding: var(--s4) max(var(--s5), calc((100% - 760px) / 2)) var(--s5);
+  /* 操作组已经收进输入框内部，这里只需要和消息区之间的边距 */
+  padding: var(--s4) max(var(--s5), calc((100% - 760px) / 2)) var(--s4);
   border-top: 1px solid var(--rule);
   background: var(--paper);
 }
 
-.composer-top {
+.left-ops {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--s3);
-  min-height: 22px;
-  margin-bottom: var(--s2);
+  gap: var(--s2) var(--s3);
+  min-width: 0;
 }
 
 .older {
   padding: 0;
-}
-
-.left-ops {
-  display: flex;
-  align-items: center;
-  gap: var(--s3);
 }
 
 .left-ops .btn-text {
@@ -800,25 +988,17 @@ function autoGrow(event: Event) {
 .web-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 9px 2px 7px;
+  gap: 6px;
+  padding: 3px 10px 3px 8px;
   border: 1px solid var(--rule);
   border-radius: var(--r-pill);
   background: transparent;
   color: var(--muted);
-  font-size: var(--t-xs);
+  font-size: var(--t-sm);
   line-height: 1.6;
+  white-space: nowrap;
   transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
     background var(--dur) var(--ease);
-}
-
-.web-toggle svg {
-  width: 13px;
-  height: 13px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.4;
-  stroke-linecap: round;
 }
 
 .web-toggle:hover:not(.on) {
@@ -834,6 +1014,89 @@ function autoGrow(event: Event) {
 
 .web-toggle.on:hover {
   background: var(--signal-deep);
+}
+
+/* 信任程度与运行模式：联网旁边两枚胶囊，都是按会话存的偏好。菜单只两档，点开即选，不写解释小字 */
+.perm-picker {
+  position: relative;
+}
+
+.perm-toggle,
+.mode-toggle {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 8px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--t-sm);
+  line-height: 1.6;
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+.perm-toggle:hover,
+.mode-toggle:hover {
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+.perm-toggle.trust {
+  color: var(--signal);
+  border-color: var(--signal-line);
+  background: var(--signal-soft);
+}
+
+/* 模式只换文字与图标（工作 / 纯对话），高亮只染字色和描边，不铺底色——
+   免得它变成三枚胶囊里唯一一块实心块，抢了输入框的注意力 */
+.mode-toggle.is-chat {
+  color: var(--signal);
+  border-color: var(--signal-line);
+}
+
+.perm-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  min-width: 148px;
+  padding: 4px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  background: var(--paper);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 10%);
+}
+
+.perm-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: var(--t-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.perm-menu button:hover {
+  background: var(--signal-soft);
+}
+
+.perm-menu button.active {
+  color: var(--signal);
+  background: var(--signal-soft);
+}
+
+.perm-menu .perm-mark {
+  margin-left: auto;
 }
 
 /* 消息操作条：悬停才显的小圆钮，收在消息下方各自一侧（AI 靠左、用户靠右），不抢阅读 */
@@ -875,15 +1138,6 @@ function autoGrow(event: Event) {
   background: var(--signal-soft);
 }
 
-.msg-icon svg {
-  width: 13px;
-  height: 13px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.5;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
 
 /* 改写面板：圆角纸面行内展开，两个动作收在右下角，和输入框同一套语言 */
 .rewrite-panel {
@@ -951,13 +1205,15 @@ function autoGrow(event: Event) {
   font-size: var(--t-xs);
 }
 
-/* 输入框是一整条圆角容器，图标按钮贴在框内右下角 */
+/* 输入框是一整条圆角容器：文字在上，操作组与发送钮收在框内底部一行 */
 .input-shell {
   position: relative;
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
+  align-items: stretch;
   border: 1px solid var(--rule);
-  border-radius: var(--r-lg);
+  /* 框体比常规卡片再圆一档，配合更大的内边距，别显得方硬 */
+  border-radius: calc(var(--r-lg) + 4px);
   background: var(--paper-raised);
   transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
@@ -968,16 +1224,29 @@ function autoGrow(event: Event) {
 }
 
 .box {
-  flex: 1;
+  flex: none;
+  width: 100%;
   min-width: 0;
+  min-height: 64px;
   resize: none;
-  /* 右侧留出图标按钮的位置，多行时长文本也不会压到按钮上 */
-  padding: 14px 60px 14px 18px;
+  /* 多行超出 max-height 后就在框内滚动，不再继续长高 */
+  overflow-y: auto;
+  padding: 20px 22px 10px;
   border: 0;
   background: transparent;
   font-size: var(--t-md);
-  line-height: 1.6;
-  max-height: 160px;
+  line-height: var(--lh-body);
+  max-height: 180px;
+}
+
+/* 框内操作行：左边胶囊组、右边发送钮，和输入文字同一个容器里 */
+.shell-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  min-height: 36px;
+  padding: 0 12px 12px 14px;
 }
 
 .box:focus {
@@ -988,16 +1257,14 @@ function autoGrow(event: Event) {
   color: var(--muted);
 }
 
-/* 发送/停止共用一个圆形图标钮，贴在输入条右下角 */
+/* 发送/停止共用一个圆形图标钮，放在操作行最右端 */
 .send-icon {
-  position: absolute;
-  right: 9px;
-  bottom: 9px;
+  flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   border: 0;
   border-radius: 50%;
   background: var(--signal);
@@ -1010,7 +1277,9 @@ function autoGrow(event: Event) {
 }
 
 .send-icon:disabled {
-  opacity: 0.45;
+  /* 空输入时不做半透明幽灵，改成一块安静的浅底——存在感在，但不催人 */
+  background: var(--signal-soft);
+  color: var(--muted-soft);
   cursor: default;
 }
 
@@ -1019,19 +1288,14 @@ function autoGrow(event: Event) {
   color: var(--alert);
 }
 
+/* 发送图标是 UiIcon（fill 风格），停止方块是原生 svg（需显式 fill） */
 .send-icon svg {
   width: 18px;
   height: 18px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
 }
 
 .send-icon.stop svg {
   fill: currentColor;
-  stroke: none;
 }
 
 /* 窄屏靠底部三段开工作区，右上角开关不显示，免得点了看不到面板 */
@@ -1049,11 +1313,6 @@ function autoGrow(event: Event) {
 
   .box {
     min-height: 64px;
-  }
-
-  /* 窄屏图标按钮仍贴在输入条右下角，右侧留白加大，别压到折行的文字 */
-  .box {
-    padding-right: 56px;
   }
 }
 </style>
